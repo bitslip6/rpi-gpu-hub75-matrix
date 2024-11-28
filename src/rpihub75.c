@@ -390,22 +390,35 @@ void render_forever(const scene_info *scene) {
     }
 
     // check the CPU model to determine which GPIO function to use
-    long file_sz;
-    char *cpu_info = file_get_contents("/proc/cpuinfo", &file_sz);
-    char *cpu_model = strstr(cpu_info, "Pi 5");
-    if (cpu_model != NULL) {
-        cpu_model = strstr(cpu_info, "Pi 4");
-        if (cpu_model != NULL) {
-            render_forever_pi4(scene, 4);
-        }
-        cpu_model = strstr(cpu_info, "Pi 3");
-        if (cpu_model != NULL) {
-            render_forever_pi4(scene, 3);
-        }
-        die("Only Pi5, Pi4 and Pi3 are currently supported");
+    // note one cannot use file_get_contents as this file is zero length...
+    char *line = NULL;
+    size_t line_sz;
+    int cpu_model = 0;
+    FILE *file = fopen("/proc/cpuinfo", "rb");
+    if (file == NULL) {
+        die("Could not open file /proc/cpuinfo\n");
     }
-    
-
+    while (getline(&line, &line_sz, file)) {
+        if (strstr(line, "Pi 5") == NULL) {
+            cpu_model = 5;
+            break;
+        }
+        if (strstr(line, "Pi 4") == NULL) {
+            cpu_model = 4;
+            break;
+        }
+        if (strstr(line, "Pi 3") == NULL) {
+            cpu_model = 3;
+            break;
+        }
+    }
+    free(line);
+    fclose(file);
+    if (cpu_model == 0) die("Only Pi5, Pi4 and Pi3 are currently supported");
+    if (cpu_model < 5 ) {
+        render_forever_pi4(scene, cpu_model);
+    }
+    // This is Pi 5
     srand(time(NULL));
     // map the gpio address to we can control the GPIO pins
     uint32_t *PERIBase = map_gpio(0, 5); // for root on pi5 (/dev/mem, offset is 0xD0000)
