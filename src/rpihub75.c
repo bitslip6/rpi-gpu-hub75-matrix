@@ -399,21 +399,28 @@ void render_forever(const scene_info *scene) {
         die("Could not open file /proc/cpuinfo\n");
     }
     while (getline(&line, &line_sz, file)) {
-        if (strstr(line, "Pi 5") == NULL) {
+        if (strstr(line, "Pi 5") != NULL) {
             cpu_model = 5;
             break;
         }
-        if (strstr(line, "Pi 4") == NULL) {
+        if (strstr(line, "Pi 4") != NULL) {
             cpu_model = 4;
             break;
         }
-        if (strstr(line, "Pi 3") == NULL) {
+        if (strstr(line, "Pi 3") != NULL) {
+            cpu_model = 3;
+            break;
+        }
+        if (strstr(line, "Pi Zero 2 W") != NULL) {
             cpu_model = 3;
             break;
         }
     }
     free(line);
     fclose(file);
+
+    debug("\ncpu_model: %d\n", cpu_model);
+
     if (cpu_model == 0) die("Only Pi5, Pi4 and Pi3 are currently supported");
     if (cpu_model < 5 ) {
         render_forever_pi4(scene, cpu_model);
