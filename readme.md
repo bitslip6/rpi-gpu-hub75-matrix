@@ -217,10 +217,10 @@ Minimum Program
 ---------------
 ```c
 #include <pthread.h>
-#include <rpihub74/rpihub75.h>
-#include <rpihub74/util.h>
-#include <rpihub74/gpu.h>
-#include <rpihub74/pixels.h>
+#include <rpihub75/rpihub75.h>
+#include <rpihub75/util.h>
+#include <rpihub75/video.h>
+#include <rpihub75/pixels.h>
 
 void* render_loop(void *arg) {
     // get the current scene info
@@ -235,15 +235,14 @@ void* render_loop(void *arg) {
 	//hub_triangle(scene, x1, y1, x2, y2, x3, y3, color);
 	//hub_triangle_aa(scene, x1, y1, x2, y2, x3, y3, color); // anti-aliased
 	scene->bcm_mapper(scene, NULL); // render image bugger in scene
-	calcualte_fps(scene->fps);
+	calculate_fps(scene->fps, scene->show_fps);
     }
 }
 
 int main(int argc, char **argv) {
-	scene_info *scene = defaulint main(int argc, char **argv)
-	t_scene(argc, argv);
+	scene_info *scene = default_scene(argc, argv);
 	check_scene(scene);
-	pthread update_thread;
+	pthread_t update_thread;
 	pthread_create(&update_thread, NULL, render_loop, scene);
 	render_forever(scene); // does not return
 }
