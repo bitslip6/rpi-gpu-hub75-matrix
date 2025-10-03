@@ -123,6 +123,16 @@ long calculate_fps(const uint16_t target_fps, const bool show_fps);
 uint32_t* map_gpio(uint32_t offset, int version);
 
 /**
+ * @brief remove whitespace from string
+ * @param s 
+ * @return char* 
+ */
+char *str_trim_spaces(char *s);
+
+int parse_float(const char *s, float *out);
+uint8_t math_norm_q8(float x);
+
+/**
  * @brief set the GPIO pins for hub75 operation.  this is based on hzeller's active board pinouts
  * @see https://github.com/hzeller/rpi-rgb-led-matrix
  * 

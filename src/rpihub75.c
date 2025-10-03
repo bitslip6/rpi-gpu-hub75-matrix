@@ -79,6 +79,8 @@ uint32_t row_to_address(const int y, uint8_t half_height) {
  * @param scene 
  */
 void check_scene(const scene_info *scene) {
+    printf("ports: %d, chains: %d, width: %d, height: %d, stride: %d, bit_depth: %d\n", 
+        scene->num_ports, scene->num_chains, scene->width, scene->height, scene->stride, scene->bit_depth);
     if (CONSOLE_DEBUG) {
         printf("ports: %d, chains: %d, width: %d, height: %d, stride: %d, bit_depth: %d\n", 
             scene->num_ports, scene->num_chains, scene->width, scene->height, scene->stride, scene->bit_depth);
@@ -399,22 +401,26 @@ void render_forever(const scene_info *scene) {
         die("Could not open file /proc/cpuinfo\n");
     }
     while (getline(&line, &line_sz, file)) {
-        if (strstr(line, "Pi 5") == NULL) {
+        if (strstr(line, "Pi 5") != NULL) {
             cpu_model = 5;
             break;
         }
-        if (strstr(line, "Pi 4") == NULL) {
+	else if (strstr(line, "Pi 4") != NULL) {
             cpu_model = 4;
             break;
         }
-        if (strstr(line, "Pi 3") == NULL) {
+	else if (strstr(line, "Pi 3") != NULL) {
+            cpu_model = 3;
+            break;
+        } 
+	else if (strstr(line, "Pi Zero 2") != NULL) {
             cpu_model = 3;
             break;
         }
     }
     free(line);
     fclose(file);
-    if (cpu_model == 0) die("Only Pi5, Pi4 and Pi3 are currently supported");
+    if (cpu_model == 0) die("Only Pi5, Pi4, Pi3 and Pi Zero 2 are currently supported");
     if (cpu_model < 5 ) {
         render_forever_pi4(scene, cpu_model);
     }

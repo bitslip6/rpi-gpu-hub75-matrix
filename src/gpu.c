@@ -219,6 +219,61 @@ char *change_file_extension(const char *filename, const char *new_extension) {
 }
 
 
+
+// helpers: fixed-point RGB scaler for an axis-aligned rectangle, RGBA8
+static inline void scale_rect_rgb_q8(uint8_t *__restrict__ pixels,
+                                     int width, int height,
+                                     int x0, int y0, int w, int h,
+                                     uint16_t red_q8, uint16_t green_q8, uint16_t blue_q8) // 256 == 1.0
+{
+    if (x0 < 0) { w += x0; x0 = 0; }
+    if (y0 < 0) { h += y0; y0 = 0; }
+    if (x0 + w > width)  w = width  - x0;
+    if (y0 + h > height) h = height - y0;
+
+    const int row_stride = width * 4;
+    uint8_t *row = pixels + y0 * row_stride + x0 * 4;
+
+    for (int y = 0; y < h; y++) {
+        uint8_t *p = row;
+        for (int x = 0; x < w; x++, p += 4) {
+            // R,G,B scaled, A unchanged
+            p[0] = (uint8_t)((p[0] * red_q8) >> 8);
+            p[1] = (uint8_t)((p[1] * green_q8) >> 8);
+            p[2] = (uint8_t)((p[2] * blue_q8) >> 8);
+        }
+        row += row_stride;
+    }
+}
+
+// apply a 3x3 per-panel brightness table to a 192x192 RGBA image
+// panel_q8[row][col] in Q8, 256 == 1.0, 179 ~ 0.70, etc.
+static inline void apply_panel_brightness_q8(uint8_t *__restrict__ pixels,
+                                             scene_info *scene)
+{
+    for (int py = 0; py < scene->num_ports; py++) {
+        for (int px = 0; px < scene->num_chains; px++) {
+            int idx = (py * scene->num_chains) + px;
+            int panel_type = scene->panel_types[idx] - 1;
+            if (panel_type < 0 || panel_type >= scene->num_panel_types) {
+                continue;
+            }
+
+            uint8_t r = scene->panel_scale[panel_type].red_q8;
+            uint8_t g = scene->panel_scale[panel_type].green_q8;
+            uint8_t b = scene->panel_scale[panel_type].blue_q8;
+
+            scale_rect_rgb_q8(pixels, scene->width, scene->height,
+                              px * scene->panel_width, py * scene->panel_height,
+                              scene->panel_width, scene->panel_height,
+                              r, g, b);
+        }
+    }
+}
+
+
+
+
 /**
  * @brief render the shadertoy compatible shader source code in the 
  * file pointed to at scene->shader_file
@@ -365,11 +420,11 @@ void *render_shader(void *arg) {
 
 
 
-
     //printf("GLSL shader compiled. rendering...\n");
     // loop until do_render is false. most likely never exit...
     clock_gettime(CLOCK_MONOTONIC, &start_time);
     clock_gettime(CLOCK_MONOTONIC, &orig_time);
+    //float level = scene->brightness * 
     while(scene->do_render) {
         frame++;
         clock_gettime(CLOCK_MONOTONIC, &end_time);
@@ -382,7 +437,7 @@ void *render_shader(void *arg) {
             glBindTexture(GL_TEXTURE_2D, texture0);
 
             if (texture1) {
-                glActiveTexture(GL_TEXTURE0);
+                glActiveTexture(GL_TEXTURE1);
                 glBindTexture(GL_TEXTURE_2D, texture1);
             }
         }
@@ -403,6 +458,11 @@ void *render_shader(void *arg) {
         // switch between pixels buffers A-F based on frame number
         pixels = pixelsA + (frame_num * image_buf_sz);
         glReadPixels(0, 0, scene->width, scene->height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+
+        if (scene->panel_types[0] != 0) {
+            apply_panel_brightness_q8(pixels, scene);
+        }
+            
 
         // apply motion blur in the CPU
         if (scene->motion_blur_frames > 0) {

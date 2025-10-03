@@ -77,7 +77,7 @@
 // global OE jitter mask, should be a prime >1031 and <=4093
 // we don't want to make this too large, as it will consume memory
 // and decrease L1-L3 cache locality of other data
-#define JITTER_SIZE 32771 
+#define JITTER_SIZE 65521 
 
 #define JITTER_MAX_RUN_LEN 4
 #define JITTER_PASSES 3
@@ -102,6 +102,9 @@
 #endif
 
 #define MAX_BITS 64
+
+#define MAX_PANEL_TYPES 8
+#define MAX_PANELS     24
 
 
     #define PERI3_BASE   0x3F000000
@@ -324,6 +327,12 @@ typedef uint8_t *(*func_image_mapper_t)( uint8_t *image_in, uint8_t *image_out, 
 typedef uint8_t *(image_mapper_t)(uint8_t *image_in, uint8_t *image_out, const struct scene_info *scene);
 
 
+typedef struct panel_rgb_scale {
+    uint8_t red_q8;
+    uint8_t green_q8;
+    uint8_t blue_q8;
+} panel_rgb_scale;
+
 /**
  * @brief everything to define the scene and panel configuration 
  * This is a kind of global configuration for the entire system 
@@ -353,6 +362,15 @@ typedef struct scene_info {
 
     /** @brief brightness level (0-255) */
     uint8_t brightness;
+
+    /** @brief array of red fractional brightness, panel type 0, type 1, ... */
+    panel_rgb_scale panel_scale[MAX_PANEL_TYPES];
+
+    /** @brief array panel types for each output */
+    uint8_t panel_types[MAX_PANELS];
+    uint8_t num_panel_types;
+
+
     /** @brief dithering strength. (0-10) 0 is off, improves simulated color in dark areas but reduces image sharpness */
     float dither;
 
