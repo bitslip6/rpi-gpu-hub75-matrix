@@ -103,7 +103,7 @@ vec3 GetRayDir(vec2 uv, vec3 p, vec3 l, float z) {
 
 float t(float time){
     float t = 3.+time*.5;
-    return t += sin(time*.5)*.3;
+    return t += sin(time*.5)*.6;
 }
 
 vec3 Transform(vec3 p, float t){

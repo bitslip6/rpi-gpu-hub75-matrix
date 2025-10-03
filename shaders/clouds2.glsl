@@ -22,6 +22,8 @@
 
 */
 
+precision mediump float;
+
 mat2 rot(in float a){float c = cos(a), s = sin(a);return mat2(c,s,-s,c);}
 const mat3 m3 = mat3(0.33338, 0.56034, -0.71817, -0.87887, 0.32651, -0.15323, 0.15162, 0.69596, 0.61339)*1.93;
 float mag2(vec2 p){return dot(p,p);}
@@ -42,7 +44,7 @@ vec2 map(vec3 p)
     float z = 1.;
     float trk = 1.;
     float dspAmp = 0.1 + prm1*0.2;
-    for(int i = 0; i < 5; i++)
+    for(int i = 0; i < 3; i++)
     {
 		p += sin(p.zxy*0.75*trk + iTime*trk*.8)*dspAmp;
         d -= abs(dot(cos(p), sin(p.yzx))*z);
@@ -61,7 +63,7 @@ vec4 render( in vec3 ro, in vec3 rd, float time )
 	vec3 lpos = vec3(disp(time + ldst)*0.5, time + ldst);
 	float t = 1.5;
 	float fogT = 0.;
-	for(int i=0; i<130; i++)
+	for(int i=0; i<72; i++)
 	{
 		if(rez.a > 0.99)break;
 
