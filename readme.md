@@ -320,45 +320,23 @@ brightness levels even when using 64 bits of BCM data. This feature is primarly 
 
 
 The mapping from 24bpp (or 32bpp) RGB data to BCM data is very optimized. It uses 128-bit SIMD vectors for the innermost
-loop. All 3 output ports are mapped in a single line of code, allowing the compiler to compute the value of all pins
-and then update memory in 1 atomic operation.
-
+loop. All 3 output ports are mapped in a single line of code outputing a single byte containing 6 bits to output (2 outputs
+per port (*upper and lower display halfs*) * 3 output ports)
 
 ```c
 for (int j=0; j<bit_depth; j++) {
         // mask off just this bit plane's data
         uint64_t mask = 1L << j;
-
         bcm_signal[bcm_offset++] =
-            // PORT 0, top pixel
-            (!!(bits[image[0]] & mask)) << ADDRESS_P0_R1 |
-            (!!(bits[image[1]] & mask)) << ADDRESS_P0_G1 |
-            (!!(bits[image[2]] & mask)) << ADDRESS_P0_B1 |
+            (BIT1(r0,  k) << ADDRESS_P0_R1) | (BIT1(g0,  k) << ADDRESS_P0_G1) | (BIT1(b0,  k) << ADDRESS_P0_B1) |
+            (BIT1(r0b, k) << ADDRESS_P0_R2) | (BIT1(g0b, k) << ADDRESS_P0_G2) | (BIT1(b0b, k) << ADDRESS_P0_B2) |
 
-            // PORT 0, bottom pixel
-            (!!(bits[image[p0b+0]] & mask)) << ADDRESS_P0_R2 |
-            (!!(bits[image[p0b+1]] & mask)) << ADDRESS_P0_G2 |
-            (!!(bits[image[p0b+2]] & mask)) << ADDRESS_P0_B2 |
+            (BIT1(r1t, k) << ADDRESS_P1_R1) | (BIT1(g1t, k) << ADDRESS_P1_G1) | (BIT1(b1t, k) << ADDRESS_P1_B1) |
+            (BIT1(r1b, k) << ADDRESS_P1_R2) | (BIT1(g1b, k) << ADDRESS_P1_G2) | (BIT1(b1b, k) << ADDRESS_P1_B2) |
 
-            // PORT 1, bottom pixel
-            (!!(bits[image[p1t+0]] & mask)) << ADDRESS_P1_R1 |
-            (!!(bits[image[p1t+1]] & mask)) << ADDRESS_P1_G1 |
-            (!!(bits[image[p1t+2]] & mask)) << ADDRESS_P1_B1 |
+            (BIT1(r2t, k) << ADDRESS_P2_R1) | (BIT1(g2t, k) << ADDRESS_P2_G1) | (BIT1(b2t, k) << ADDRESS_P2_B1) |
+            (BIT1(r2b, k) << ADDRESS_P2_R2) | (BIT1(g2b, k) << ADDRESS_P2_G2) | (BIT1(b2b, k) << ADDRESS_P2_B2);
 
-            // PORT 1, bottom pixel
-            (!!(bits[image[p1b+0]] & mask)) << ADDRESS_P1_R2 |
-            (!!(bits[image[p1b+1]] & mask)) << ADDRESS_P1_G2 |
-            (!!(bits[image[p1b+2]] & mask)) << ADDRESS_P1_B2 |
-
-            // PORT 2, bottom pixel
-            (!!(bits[image[p2t+0]] & mask)) << ADDRESS_P1_R1 |
-            (!!(bits[image[p2t+1]] & mask)) << ADDRESS_P1_G1 |
-            (!!(bits[image[p2t+2]] & mask)) << ADDRESS_P1_B1 |
-
-            // PORT 2, bottom pixel
-            (!!(bits[image[p2b+0]] & mask)) << ADDRESS_P2_R2 |
-            (!!(bits[image[p2b+1]] & mask)) << ADDRESS_P2_G2 |
-            (!!(bits[image[p2b+2]] & mask)) << ADDRESS_P2_B2;
     }
 ```
 
@@ -522,14 +500,7 @@ pwm_mapping function for the scene. (see func_bcm_mapper_t)
 
 Odds and Ends
 -------------
-
-I have considered adding image dithering. Since we are going from 8-bit data (24bpp) down to 5 or 6-bit data (32 - 64 bit
-pwm values) we are losing 2-3 bits of data per pixel. What we lose in temporal data (value) we can reintroduce to the image
-spatially. Those 2-3 bits of information can be added to the neighboring pixels using ordered dithering or floyd Steinberg 
-dithering by slightly increasing or decreasing the RGB values of the neighboring pixels based on this loss of information.
-There is some code to achieve this but I have not had the results I would like to see so this is still a work in progress.
-If this is something you are interested in, drop me a line, send me a link to relevant information implementations or send
-a PR.
+* quantization dithering has been added
 
 I am currently investigating chaining multiple rp2040 chips to multiple chains of HUB75 panels to improve the image 
 stability and the number of supported chained panels. Current thinking is rpi5 has 2 spi lines which are capable of 50Mhz
