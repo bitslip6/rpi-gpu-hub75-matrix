@@ -405,22 +405,26 @@ void render_forever(const scene_info *scene) {
             cpu_model = 5;
             break;
         }
-	else if (strstr(line, "Pi 4") != NULL) {
+        else if (strstr(line, "Pi 4") != NULL) {
             cpu_model = 4;
             break;
         }
-	else if (strstr(line, "Pi 3") != NULL) {
+	      else if (strstr(line, "Pi 3") != NULL) {
             cpu_model = 3;
             break;
         } 
-	else if (strstr(line, "Pi Zero 2") != NULL) {
+	      else if (strstr(line, "Pi Zero 2") != {
             cpu_model = 3;
             break;
         }
     }
     free(line);
     fclose(file);
+
+    debug("\ncpu_model: %d\n", cpu_model);
+
     if (cpu_model == 0) die("Only Pi5, Pi4, Pi3 and Pi Zero 2 are currently supported");
+
     if (cpu_model < 5 ) {
         render_forever_pi4(scene, cpu_model);
     }
