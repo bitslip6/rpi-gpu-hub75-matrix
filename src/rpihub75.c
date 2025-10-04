@@ -413,7 +413,7 @@ void render_forever(const scene_info *scene) {
             cpu_model = 3;
             break;
         } 
-	      else if (strstr(line, "Pi Zero 2") != {
+	      else if (strstr(line, "Pi Zero 2") != NULL) {
             cpu_model = 3;
             break;
         }
