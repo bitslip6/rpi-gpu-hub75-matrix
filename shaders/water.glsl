@@ -1,3 +1,4 @@
+// https://www.shadertoy.com/view/MdlXz8
 // Found this on GLSL sandbox. I really liked it, changed a few things and made it tileable.
 // :)
 // by David Hoskins.

@@ -1027,9 +1027,9 @@ void update_bcm_signal_64_rgb(
             (!!(bits[image[p1b+2]] & mask)) << ADDRESS_P1_B2 |
 
             // PORT 2, bottom pixel
-            (!!(bits[image[p2t+0]] & mask)) << ADDRESS_P1_R1 |
-            (!!(bits[image[p2t+1]] & mask)) << ADDRESS_P1_G1 |
-            (!!(bits[image[p2t+2]] & mask)) << ADDRESS_P1_B1 |
+            (!!(bits[image[p2t+0]] & mask)) << ADDRESS_P2_R1 |
+            (!!(bits[image[p2t+1]] & mask)) << ADDRESS_P2_G1 |
+            (!!(bits[image[p2t+2]] & mask)) << ADDRESS_P2_B1 |
 
             // PORT 2, bottom pixel
             (!!(bits[image[p2b+0]] & mask)) << ADDRESS_P2_R2 |
@@ -1110,9 +1110,9 @@ void update_bcm_signal_64_rbg(
             (!!(bits[image[p1b+2]] & mask)) << ADDRESS_P1_G2 |
 
             // PORT 2, bottom pixel
-            (!!(bits[image[p2t+0]] & mask)) << ADDRESS_P1_R1 |
-            (!!(bits[image[p2t+1]] & mask)) << ADDRESS_P1_B1 |
-            (!!(bits[image[p2t+2]] & mask)) << ADDRESS_P1_G1 |
+            (!!(bits[image[p2t+0]] & mask)) << ADDRESS_P2_R1 |
+            (!!(bits[image[p2t+1]] & mask)) << ADDRESS_P2_B1 |
+            (!!(bits[image[p2t+2]] & mask)) << ADDRESS_P2_G1 |
 
             // PORT 2, bottom pixel
             (!!(bits[image[p2b+0]] & mask)) << ADDRESS_P2_R2 |
@@ -1193,9 +1193,9 @@ void update_bcm_signal_64_bgr(
             (!!(bits[image[p1b+2]] & mask)) << ADDRESS_P1_R2 |
 
             // PORT 2, bottom pixel
-            (!!(bits[image[p2t+0]] & mask)) << ADDRESS_P1_B1 |
-            (!!(bits[image[p2t+1]] & mask)) << ADDRESS_P1_G1 |
-            (!!(bits[image[p2t+2]] & mask)) << ADDRESS_P1_R1 |
+            (!!(bits[image[p2t+0]] & mask)) << ADDRESS_P2_B1 |
+            (!!(bits[image[p2t+1]] & mask)) << ADDRESS_P2_G1 |
+            (!!(bits[image[p2t+2]] & mask)) << ADDRESS_P2_R1 |
 
             // PORT 2, bottom pixel
             (!!(bits[image[p2b+0]] & mask)) << ADDRESS_P2_B2 |

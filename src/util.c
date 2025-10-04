@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <stdarg.h>
 #include <math.h>
+#include <ctype.h>
 #include <sys/mman.h>
 #include <sys/param.h>
 #include <netinet/in.h>
@@ -160,7 +161,7 @@ void binary32(FILE *fd, const uint32_t number) {
 void binary64(FILE *fd, const uint64_t number) {
     // Print the number in binary format, ensure it only shows 11 bits
     for (int i = 63; i >= 0; i--) {
-        fprintf(fd, "%lld", (number >> i) & 1);
+        fprintf(fd, "%ld", (number >> i) & 1);
     }
 }
 
@@ -318,7 +319,7 @@ uint32_t* map_gpio(uint32_t offset, int version) {
     }
 
     if (CONSOLE_DEBUG) {
-        printf("peripheral address: %llx\n", peri);
+        printf("peripheral address: %lx\n", peri);
     }
     asm volatile ("" : : : "memory");  // Prevents optimization
     uint32_t *map = (uint32_t *)mmap(
@@ -342,6 +343,14 @@ uint32_t* map_gpio(uint32_t offset, int version) {
     return map;
 }
 
+// convert normalized float 0.0-1.0 to q8 1-255
+uint8_t math_norm_q8(float x) {
+    if (x <= 0) return 0;
+    if (x >= 1) return 255;
+    return (uint8_t)((x * 253.0f) + 1.0f);
+}
+
+
 
 // Function to get a character without needing Enter
 char getch() {
@@ -355,6 +364,153 @@ char getch() {
     tcsetattr(STDIN_FILENO, TCSANOW, &oldt);  // Restore old attributes
     return ch;
 }
+
+
+/**
+ * @brief remove whitespace from string
+ * @param s 
+ * @return char* 
+ */
+char *str_trim_spaces(char *s) {
+    while (*s && isspace((unsigned char)*s)) s++;
+    if (*s == '\0') return s;
+    char *e = s + strlen(s) - 1;
+    while (e > s && isspace((unsigned char)*e)) *e-- = '\0';
+    return s;
+}
+
+
+/**
+ * @brief parse a string to a float, return -1 on error
+ * @param s the string to parse into a float
+ * @param out pointer to the float to parse into
+ * @return int 
+ */
+int parse_float(const char *s, float *out) {
+    errno = 0;
+    char *end = NULL;
+    double v = strtod(s, &end);
+    if (end == s || errno == ERANGE) return -1;
+    // ignore trailing spaces
+    while (*end && isspace((unsigned char)*end)) end++;
+    if (*end != '\0') return -1;
+    *out = (float)v;
+    return 0;
+}
+
+
+/* Parse optarg like "1:1:1,2:1:3" into dst[0..*out_count-1].
+Missing panels default to 1. Returns 0 on success, -1 on error.
+@param max_out maximum panel type number (can not exceed number of defined panel types)
+*/
+int parse_panel_types(const char *arg,
+                       uint8_t *dst,
+                       size_t max_out,
+                       uint8_t *out_count)
+{
+    if (!arg || !dst || max_out == 0) {
+        return -1;
+    }
+
+    char *buf = strdup(arg);
+    if (!buf) {
+        return -1;
+    }
+
+
+    size_t count = 0;
+    size_t max_type = 0;
+    char *save_outer = NULL;
+    for (char *tok = strtok_r(buf, ",", &save_outer);
+         tok;
+         tok = strtok_r(NULL, ",", &save_outer))
+    {
+        char *panel = str_trim_spaces(tok);
+
+        // split r:g:b
+        int idx = 0;
+        char *save_inner = NULL;
+        for (char *ctok = strtok_r(panel, ":", &save_inner);
+             ctok;
+             ctok = strtok_r(NULL, ":", &save_inner), idx++)
+        {
+            if (count >= MAX_PANELS) {
+                break;
+            }
+            int v;
+            v = atoi(str_trim_spaces(ctok));
+            if (v > max_type) {
+                max_type = v;
+            }
+            dst[count++] = v;
+        }
+
+    }
+
+    // output the maximum panel type number
+    if (out_count) {
+        *out_count = max_type;
+    }
+    return 0;
+}
+
+
+/* Parse optarg like "1:1:1,1:.79:.89" into dst[0..*out_count-1].
+   Missing channels default to 1.0. Returns 0 on success, -1 on error. */
+int parse_panel_scales(const char *arg,
+                       panel_rgb_scale *dst,
+                       size_t max_out,
+                       int *out_count)
+{
+    if (!arg || !dst || max_out == 0) {
+        return -1;
+    }
+
+    char *buf = strdup(arg);
+    if (!buf) {
+        return -1;
+    }
+
+
+    size_t count = 0;
+    char *save_outer = NULL;
+    for (char *tok = strtok_r(buf, ",", &save_outer);
+         tok && count < max_out;
+         tok = strtok_r(NULL, ",", &save_outer))
+    {
+        char *panel = str_trim_spaces(tok);
+
+        // defaults
+        panel_rgb_scale s = {1.0f, 1.0f, 1.0f};
+
+        // split r:g:b
+        int idx = 0;
+        char *save_inner = NULL;
+        for (char *ctok = strtok_r(panel, ":", &save_inner);
+             ctok && idx < 3;
+             ctok = strtok_r(NULL, ":", &save_inner), idx++)
+        {
+            float v;
+            if (parse_float(str_trim_spaces(ctok), &v) != 0) {
+                free(buf);
+                return -1;
+            }
+            if      (idx == 0) s.red_q8   = math_norm_q8(v);
+            else if (idx == 1) s.green_q8 = math_norm_q8(v);
+            else               s.blue_q8  = math_norm_q8(v);
+        }
+
+        dst[count++] = s;
+    }
+
+    free(buf);
+    if (out_count) {
+        *out_count = count;
+    }
+    return 0;
+}
+
+
  
 void configure_gpio_4(uint32_t *PERIBase, int version) {
 
@@ -465,6 +621,10 @@ void usage(int argc, char **argv) {
         "     -z                run LED calibration script\n"
         "     -n                display data from UDP server on port %d (untested)\n"
         "     -o                display current FPS and Panel refresh Hz\n"
+        "     -T <r:g:b,r:g:b>  panel color correction, 0.0-1.0 for each color, comma delimited\n"
+        "                       for each panel type. panel types are numbered 0-7\n"
+        "     -P <T:T:T,T:T:T>  panel type mapping, each T is a panel type number (0-7).\n"
+        "                       columns are : sepearted, rows are , separated (0:0:0,0:1:1,1:1:1)\n"
         "     -?                this help\n", argv[0], SERVER_PORT);
 }
 
@@ -521,7 +681,7 @@ scene_info *default_scene(int argc, char **argv) {
     scene->height = IMG_HEIGHT;
     scene->panel_height = PANEL_HEIGHT;
     scene->panel_width = PANEL_WIDTH;
-    scene->num_chains = 4;
+    scene->num_chains = 1;
     scene->num_ports = 1;
     scene->buffer_ptr = 0;
     scene->stride = 3;
@@ -542,6 +702,14 @@ scene_info *default_scene(int argc, char **argv) {
     scene->motion_blur_frames = 0;
     scene->do_render = TRUE;
     scene->dither = 0.0f;
+    scene->panel_types[0] = 0;
+    scene->num_panel_types = 0;
+
+    /*
+    scene->red_scale   = (float*)malloc(32 * sizeof(float));
+    scene->green_scale = (float*)malloc(32 * sizeof(float));
+    scene->blue_scale  = (float*)malloc(32 * sizeof(float));
+    */
 
     // default to 60 fps
     scene->fps = 60;
@@ -554,7 +722,8 @@ scene_info *default_scene(int argc, char **argv) {
 
     // Parse command-line options
     int opt;
-    while ((opt = getopt(argc, argv, "O:x:y:w:h:s:f:p:c:g:d:m:b:t:l:i:jzo?")) != -1) {
+    int num_scales = 0;
+    while ((opt = getopt(argc, argv, "O:T:P:x:y:w:h:s:f:p:c:g:d:m:b:t:l:i:jzo?")) != -1) {
         switch (opt) {
         case 's':
             scene->shader_file = optarg;
@@ -582,7 +751,7 @@ scene_info *default_scene(int argc, char **argv) {
             scene->num_ports = atoi(optarg);
             break;
         case 'c':
-            scene->num_chains = atoi(optarg);
+            scene->num_chains = (uint8_t)atoi(optarg);
             break;
         case 'g':
             scene->gamma = atof(optarg);
@@ -601,6 +770,18 @@ scene_info *default_scene(int argc, char **argv) {
             scene->dither = MIN(MAX(scene->dither, 0.0f), 10.0f);
         case 'j':
             scene->jitter_brightness = false;
+            break;
+        case 'T':
+            if (parse_panel_scales(optarg, scene->panel_scale, MAX_PANEL_TYPES, &num_scales) != 0) {
+                fprintf(stderr, "invalid -T format: %s\n", optarg);
+                exit(1);
+            }
+            break;
+        case 'P':
+            if (parse_panel_types(optarg, scene->panel_types, MAX_PANEL_TYPES, &scene->num_panel_types) != 0) {
+                fprintf(stderr, "invalid -T format: %s\n", optarg);
+                exit(1);
+            }
             break;
         case 'z':
             scene->gamma = -99.0f;
@@ -677,6 +858,17 @@ scene_info *default_scene(int argc, char **argv) {
         default:
             usage(argc, argv);
         }
+    }
+
+    if (num_scales != 0 && num_scales != scene->num_panel_types) {
+        fprintf(stderr, "-T does not match -P !!\n\n");
+        fprintf(stderr, "each R:G:B comma 'pair' passed to -T represents a single panel type scaling for RGB planes\n");
+        fprintf(stderr, "each output port has it's panel type defined in -P\n");
+        fprintf(stderr, "seperate panel types for each port with a colon, separate ports with a comma\n\n");
+        fprintf(stderr, "to define 2 output ports of 3 panels each with the second row scaled to 80%% brightness, type:\n");
+        fprintf(stderr, "  define 2 panel 'types': -T 1:1:1,.8:.8:.8\n");
+        fprintf(stderr, "  map the 6 panels to their 'types': -P 0:0:0,1:1:1\n\n");
+        exit(1);
     }
 
     // create 
