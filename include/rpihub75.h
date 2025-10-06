@@ -418,6 +418,9 @@ typedef struct scene_info {
 
     atomic_bool bcm_ptr;
 
+    //atomic_bool frame_swap;
+    _Atomic(unsigned) frame_ready;
+
     /** * @brief see buffer_ptr for usage */
     //uint8_t *image __attribute__((aligned(16)));
     uint8_t *image;
