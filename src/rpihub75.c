@@ -56,7 +56,7 @@
 uint32_t row_to_address(const int y, uint8_t half_height) {
 
     // if they pass in image y not panel y, convert to panel y
-    uint16_t row = (y-1) % half_height;
+    uint16_t row = (y) % half_height;
     uint32_t bitmask = 0;
 
     // Map each bit from the input to the corresponding bit position in the bitmask
@@ -695,8 +695,9 @@ void render_forever(const scene_info *scene) {
     const uint32_t guard_px = 4;   /* do not change OE in first/last N pixels of a row */
 
 
+    const uint32_t js = scene->width * 32;
 
-    uint8_t phase = 1;
+    uint16_t phase = 1;
     while (scene->do_render) {
         phase++;
         for (uint8_t pwm = 0; pwm < bit_depth; pwm++) {
@@ -704,12 +705,13 @@ void render_forever(const scene_info *scene) {
 
 
             frame_count++;
+        jitter_idx = phase;
             for (uint16_t y = 0; y < half_height; y++) {
 
                 /* optional: inhibit jitter on first couple of pixels to avoid latch-adjacent OE flips */
                 uint32_t inhibit = 2; /* set 0..2 as needed */
                 const uint32_t addr_bits = addr_map[y];
-                jitter_idx = ((y * 1315423911u) + phase) % JITTER_SIZE; // decorrelate rows
+                //jitter_idx = ((y * 1315423911u) + phase) % JITTER_SIZE; // decorrelate rows
 
 
 
@@ -718,8 +720,9 @@ void render_forever(const scene_info *scene) {
                     /* hard guard: data must never drive control pins */
                     const uint32_t data = bcm_signal[offset] & MASK_DATA;
 
-                    const int guard = (x < guard_px) || ((width - 1 - x) < guard_px);
-                    const uint32_t oe_mask = (guard) ? 0u : jitter_mask[jitter_idx];
+                    //const int guard = (x < guard_px) || ((width - 1 - x) < guard_px);
+                    //const uint32_t oe_mask = (guard) ? 0u : jitter_mask[jitter_idx];
+                    const uint32_t oe_mask = jitter_mask[jitter_idx];
 
 
                     /* absolute OUT twice, preserves order without fences */
@@ -732,28 +735,26 @@ void render_forever(const scene_info *scene) {
                     /* advance after full edge */
                     jitter_idx = (jitter_idx + 1) % JITTER_SIZE;
                     offset += stride;
-                    if (inhibit) inhibit--;
                }
 
                 /* safe latch with OE asserted high and address held */
                 *reg_set = PIN_OE;                 /* display off */
                 io_write_barrier();
 
-                *reg_out = addr_bits | PIN_OE;   /* make address + OE explicit on OUT bus */
-                io_write_barrier();
+                //*reg_out = addr_bits | PIN_OE;   /* make address + OE explicit on OUT bus */
+                //io_write_barrier();
 
-                *reg_set = PIN_LATCH;              /* latch high */
-                SLOW2;
+                *reg_set = PIN_LATCH | PIN_OE;              /* latch high */
+                io_write_barrier();
                 *reg_clr = PIN_LATCH;              /* latch low */
-                io_write_barrier();
 
-                /* do not drop OE here, first pixel write of next row will set OE per jitter */
-            }
 
-            // swap the buffers on vsync
-            if (UNLIKELY(scene->bcm_ptr != last_pointer)) {
-                last_pointer = scene->bcm_ptr;
-                bcm_signal = (last_pointer) ? scene->bcm_signalB : scene->bcm_signalA;
+		// swap the buffer when it changes
+		unsigned before = atomic_load_explicit(&scene->frame_ready, memory_order_acquire);
+		if (before & 1u) {
+			last_pointer = scene->bcm_ptr;
+			bcm_signal = (last_pointer) ? scene->bcm_signalB : scene->bcm_signalA;
+		}
             }
         }
         if (frame_count % 128 == 0) {
