@@ -56,7 +56,7 @@
 uint32_t row_to_address(const int y, uint8_t half_height) {
 
     // if they pass in image y not panel y, convert to panel y
-    uint16_t row = (y) % half_height;
+    uint16_t row = (y-1) % half_height;
     uint32_t bitmask = 0;
 
     // Map each bit from the input to the corresponding bit position in the bitmask
@@ -692,10 +692,10 @@ void render_forever(const scene_info *scene) {
 
 
 
-    const uint32_t guard_px = 4;   /* do not change OE in first/last N pixels of a row */
+    //const uint32_t guard_px = 4;   /* do not change OE in first/last N pixels of a row */
 
 
-    const uint32_t js = scene->width * 32;
+    // const uint32_t js = scene->width * 32;
 
     uint16_t phase = 1;
     while (scene->do_render) {
@@ -705,11 +705,11 @@ void render_forever(const scene_info *scene) {
 
 
             frame_count++;
-        jitter_idx = phase;
+            jitter_idx = phase;
             for (uint16_t y = 0; y < half_height; y++) {
 
                 /* optional: inhibit jitter on first couple of pixels to avoid latch-adjacent OE flips */
-                uint32_t inhibit = 2; /* set 0..2 as needed */
+                //uint32_t inhibit = 2; /* set 0..2 as needed */
                 const uint32_t addr_bits = addr_map[y];
                 //jitter_idx = ((y * 1315423911u) + phase) % JITTER_SIZE; // decorrelate rows
 
@@ -749,14 +749,14 @@ void render_forever(const scene_info *scene) {
                 *reg_clr = PIN_LATCH;              /* latch low */
 
 
-		// swap the buffer when it changes
-		unsigned before = atomic_load_explicit(&scene->frame_ready, memory_order_acquire);
-		if (before & 1u) {
-			last_pointer = scene->bcm_ptr;
-			bcm_signal = (last_pointer) ? scene->bcm_signalB : scene->bcm_signalA;
-		}
             }
         }
+	// swap the buffer when it changes
+	unsigned before = atomic_load_explicit(&scene->frame_ready, memory_order_acquire);
+	if (!(before & 1u)) {
+		last_pointer = scene->bcm_ptr;
+		bcm_signal = (last_pointer) ? scene->bcm_signalB : scene->bcm_signalA;
+	}
         if (frame_count % 128 == 0) {
             time_t current_time_s = time(NULL);
             if (UNLIKELY(current_time_s >= last_time_s + 5)) {
