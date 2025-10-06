@@ -305,7 +305,16 @@ static void *mapper_thread_main(void *arg) {
             sched_yield();
             continue;
         }
+        unsigned old = atomic_load_explicit(&ctx->scene->frame_ready, memory_order_relaxed);
+        atomic_store_explicit(&ctx->scene->frame_ready, old | 1u, memory_order_relaxed);
+
         ctx->scene->bcm_mapper(ctx->scene, pixels);
+
+
+	// publish: bump seq to next even with release
+        atomic_store_explicit(&ctx->scene->frame_ready, (old + 2u) & ~1u, memory_order_release);
+
+	//ctx->secen->frame_swap = true;
         if (ctx->q_free) {
             (void)spsc_try_push(ctx->q_free, pixels);
         }
