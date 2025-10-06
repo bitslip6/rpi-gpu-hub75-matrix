@@ -23,10 +23,10 @@ typedef struct{
  */
 typedef struct
 {
-    uint32_t Out;
-    uint32_t OE;
-    uint32_t In;
-    uint32_t InSync;
+    volatile uint32_t Out;
+    volatile uint32_t OE;
+    volatile uint32_t In;
+    volatile uint32_t InSync;
 } rioregs;
 
 

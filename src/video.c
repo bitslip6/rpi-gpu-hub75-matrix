@@ -32,145 +32,104 @@ void* render_video_fn(void *arg) {
     return NULL;
 }
 
-/**
- * @brief pass this function to your pthread_create() call to render a video file
- * will render the video file pointed to by scene->shader_file until
- * scene->do_render is false; returns once the video is done rendering
- * 
- * @param arg 
- * @return void* 
- */
+#define FAIL(MSG) do { fprintf(stderr, "%s\n", MSG); ok = false; goto cleanup; } while (0)
+
+
+
 bool hub_render_video(scene_info *scene, const char *filename) {
     AVFormatContext *format_ctx = NULL;
-    AVCodecContext *codec_ctx = NULL;
-    //AVCodec *codec = NULL;
-    AVFrame *frame = NULL;
-    AVFrame *frame_rgb = NULL;
-    AVPacket packet;
+    AVCodecContext  *codec_ctx  = NULL;
+    AVCodec   *codec      = NULL;
+    AVFrame *frame = NULL, *frame_rgb = NULL;
+    AVPacket *packet = NULL;
     struct SwsContext *sws_ctx = NULL;
+    uint8_t *rgb_tight = NULL;
+    bool ok = true;
 
     int video_stream_index = -1;
     scene->stride = 3;
 
-    // Register all formats and codecs
-    // av_register_all();
+    if (avformat_open_input(&format_ctx, filename, NULL, NULL) != 0) { FAIL("Could not open video file"); }
+    if (avformat_find_stream_info(format_ctx, NULL) < 0) { FAIL("Could not find stream information"); }
 
-    // Open video file
-    if (avformat_open_input(&format_ctx, filename, NULL, NULL) != 0) {
-        fprintf(stderr, "Could not open video file\n");
-        return false;
-    }
+    // best stream selection
+    codec = NULL;
+    video_stream_index = av_find_best_stream(format_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
+    if (video_stream_index < 0 || !codec) { FAIL("No video stream found"); }
 
-    // Retrieve stream information
-    if (avformat_find_stream_info(format_ctx, NULL) < 0) {
-        fprintf(stderr, "Could not find stream information\n");
-        return false;
-    }
-
-    // Find the first video stream
-    for (int i = 0; i < format_ctx->nb_streams; i++) {
-        if (format_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            video_stream_index = i;
-            break;
-        }
-    }
-    if (video_stream_index == -1) {
-        fprintf(stderr, "No video stream found\n");
-        return false;
-    }
-
-    AVStream *video_stream = format_ctx->streams[video_stream_index];
-    AVRational frame_rate = video_stream->avg_frame_rate; // Use avg_frame_rate for variable frame rate videos
-    float fps = (float)av_q2d(frame_rate);
-
-    // Get codec parameters and find the decoder for the video stream
-    AVCodecParameters *codec_params = format_ctx->streams[video_stream_index]->codecpar;
-    const AVCodec *codec = avcodec_find_decoder(codec_params->codec_id);
-    if (codec == NULL) {
-        fprintf(stderr, "Unsupported codec\n");
-        return false;
-    }
-
-    // Allocate codec context
+    // codec ctx
     codec_ctx = avcodec_alloc_context3(codec);
-    if (!codec_ctx) {
-        fprintf(stderr, "Failed to allocate codec context\n");
-        return false;
+    if (!codec_ctx) { FAIL("Failed to allocate codec context"); }
+    if (avcodec_parameters_to_context(codec_ctx, format_ctx->streams[video_stream_index]->codecpar) < 0) {
+        FAIL("avcodec_parameters_to_context failed");
     }
-    avcodec_parameters_to_context(codec_ctx, codec_params);
+    codec_ctx->thread_type  = FF_THREAD_FRAME;
+    codec_ctx->thread_count = 2;
+    if (avcodec_open2(codec_ctx, codec, NULL) < 0) { FAIL("Could not open codec"); }
 
-    // Open codec
-    if (avcodec_open2(codec_ctx, codec, NULL) < 0) {
-        fprintf(stderr, "Could not open codec\n");
-        return false;
-    }
-
-    // Allocate frames
+    // frames and packet
     frame = av_frame_alloc();
     frame_rgb = av_frame_alloc();
-    if (!frame || !frame_rgb) {
-        fprintf(stderr, "Could not allocate frame memory\n");
-        return false;
-    }
+    packet = av_packet_alloc();
+    if (!frame || !frame_rgb || !packet) { FAIL("Could not allocate frame/packet"); }
 
-    //AVStream *video_stream = format_ctx->streams[video_stream_index];
-    //AVRational frame_rate = video_stream->avg_frame_rate; // Use avg_frame_rate for variable frame rate videos
-    //int fps = (int)av_q2d(frame_rate);
+    // tightly packed RGB24 dest
+    int tight_row_bytes = scene->width * 3;
+    rgb_tight = av_malloc((size_t)scene->height * tight_row_bytes);
+    if (!rgb_tight) { FAIL("rgb_tight alloc failed"); }
+    frame_rgb->data[0] = rgb_tight;
+    frame_rgb->linesize[0] = tight_row_bytes;
 
-    // Set up RGB frame buffer
-    int num_bytes = av_image_get_buffer_size(AV_PIX_FMT_RGB24, scene->width, scene->height, 1);
-    uint8_t *buffer = (uint8_t *)av_malloc(num_bytes * sizeof(uint8_t)*2);
-    av_image_fill_arrays(frame_rgb->data, frame_rgb->linesize, buffer, AV_PIX_FMT_RGB24, scene->width, scene->height, 1);
-
-    // Set up scaling context
+    // scaler
+    int sws_flags = SWS_POINT; // or SWS_FAST_BILINEAR
     sws_ctx = sws_getContext(codec_ctx->width, codec_ctx->height, codec_ctx->pix_fmt,
                              scene->width, scene->height, AV_PIX_FMT_RGB24,
-                             SWS_BILINEAR, NULL, NULL, NULL);
+                             sws_flags, NULL, NULL, NULL);
+    if (!sws_ctx) { FAIL("sws_getContext failed"); }
 
-    // Read frames
-    while (av_read_frame(format_ctx, &packet) >= 0) {
-        if (!scene->do_render) {
-            break;
-        }
-        // Is this packet from the video stream?
-        if (packet.stream_index == video_stream_index) {
-            // Decode video frame
-            int response = avcodec_send_packet(codec_ctx, &packet);
-            if (response < 0) {
-                fprintf(stderr, "Error sending packet for decoding\n");
-                break;
-            }
+    // proper colorspace setup (no bogus casts)
+    const int *src_mat = sws_getCoefficients(SWS_CS_ITU601);
+    const int *dst_mat = sws_getCoefficients(SWS_CS_DEFAULT);
+    // srcRange=0, dstRange=0 (limited), brightness=0, contrast=1.0, saturation=1.0
+    if (sws_setColorspaceDetails(sws_ctx, src_mat, 0, dst_mat, 0, 0, 1<<16, 1<<16) < 0) {
+        // not fatal, continue
+    }
+
+    while (av_read_frame(format_ctx, packet) >= 0) {   // NOTE: packet (not &packet)
+        if (!scene->do_render) break;
+
+        if (packet->stream_index == video_stream_index) {
+            int response = avcodec_send_packet(codec_ctx, packet); // NOTE: packet (not &packet)
+            if (response < 0) { FAIL("Error sending packet for decoding"); }
+
             while (response >= 0) {
                 response = avcodec_receive_frame(codec_ctx, frame);
-                if (response == AVERROR(EAGAIN) || response == AVERROR_EOF)
-                    break;
-                else if (response < 0) {
-                    fprintf(stderr, "Error during decoding\n");
-                    return false;
-                }
+                if (response == AVERROR(EAGAIN) || response == AVERROR_EOF) break;
+                if (response < 0) { FAIL("Error during decoding"); }
 
-                // Convert the image from its native format to RGB
-                sws_scale(sws_ctx, (uint8_t const * const *)frame->data,
-                          frame->linesize, 0, codec_ctx->height,
+                sws_scale(sws_ctx,
+                          (const uint8_t * const*)frame->data, frame->linesize,
+                          0, codec_ctx->height,
                           frame_rgb->data, frame_rgb->linesize);
-
 
                 map_byte_image_to_bcm(scene, frame_rgb->data[0]);
 
-		calculate_fps(fps, scene->show_fps);
+                // optional: show fps
+                AVRational fr = format_ctx->streams[video_stream_index]->avg_frame_rate;
+                float fps = (float)av_q2d(fr);
+                calculate_fps(fps > 1e-3f ? fps : 30.0f, scene->show_fps);
             }
         }
-        av_packet_unref(&packet);
+        av_packet_unref(packet); // NOTE: packet (not &packet)
     }
 
-    // Clean up
-    av_free(buffer);
-    av_frame_free(&frame);
-    av_frame_free(&frame_rgb);
-    avcodec_free_context(&codec_ctx);
-    avformat_close_input(&format_ctx);
-    sws_freeContext(sws_ctx);
-
-    return true;
+cleanup:
+    if (packet) av_packet_free(&packet);    // expects &packet
+    if (sws_ctx) sws_freeContext(sws_ctx);
+    if (rgb_tight) av_free(rgb_tight);
+    if (frame_rgb) av_frame_free(&frame_rgb);
+    if (frame) av_frame_free(&frame);
+    if (codec_ctx) avcodec_free_context(&codec_ctx);
+    if (format_ctx) avformat_close_input(&format_ctx);
+    return ok;
 }
-

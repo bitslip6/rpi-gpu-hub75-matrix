@@ -137,6 +137,8 @@
 
 #define SLOW for (volatile int s=0;s<40;s++) { asm volatile ("" : : : "memory"); asm(""); }
 #define SLOW2 for (volatile int s=0;s<8;s++) { asm volatile ("" : : : "memory"); asm(""); }
+#define CLK_SETUP_DELAY() asm volatile("nop; nop;")
+
 
 // helpers for timing things...
 #define PRE_TIME struct timeval start, end; gettimeofday(&start, NULL);
@@ -215,13 +217,18 @@
 
 #endif
 
-#define ADDRESS_MASK  1 << ADDRESS_A | 1 << ADDRESS_B | 1 << ADDRESS_C | 1 << ADDRESS_D | 1 << ADDRESS_E
-
 // control pins bit masks
 #define PIN_OE (1 << ADDRESS_OE)
 #define PIN_LATCH (1 << ADDRESS_STROBE)
 #define PIN_CLK (1 << ADDRESS_CLK)
 
+
+
+#define MASK_DATA  (1 << ADDRESS_P0_R1 | 1 << ADDRESS_P0_R2 | 1 << ADDRESS_P0_G1 | 1 << ADDRESS_P0_G2 | 1 << ADDRESS_P0_B1 | 1 << ADDRESS_P0_B2 | \
+                   1 << ADDRESS_P1_R1 | 1 << ADDRESS_P1_R2 | 1 << ADDRESS_P1_G1 | 1 << ADDRESS_P1_G2 | 1 << ADDRESS_P1_B1 | 1 << ADDRESS_P1_B2 | \
+                   1 << ADDRESS_P2_R1 | 1 << ADDRESS_P2_R2 | 1 << ADDRESS_P2_G1 | 1 << ADDRESS_P2_G2 | 1 << ADDRESS_P2_B1 | 1 << ADDRESS_P2_B2)
+#define MASK_ADDRESS  (1 << ADDRESS_A | 1 << ADDRESS_B | 1 << ADDRESS_C | 1 << ADDRESS_D | 1 << ADDRESS_E)
+#define MASK_CTRL  (PIN_CLK | PIN_LATCH | PIN_OE)
 
 // helpers for "boolean"
 #define TRUE 1
@@ -317,6 +324,12 @@ enum pixel_order_e {
     PIXEL_ORDER_BGR
 };
 
+// panel order describes which logical color drives panel wires R,G,B respectively
+typedef enum {
+    PANEL_RGB = 0, PANEL_RBG, PANEL_GRB, PANEL_GBR, PANEL_BRG, PANEL_BGR
+} panel_order_t;
+
+
 // self referencing function pointers need this defined first
 struct scene_info;
 
@@ -333,6 +346,14 @@ typedef struct panel_rgb_scale {
     uint8_t blue_q8;
 } panel_rgb_scale;
 
+typedef struct panel_rgb_offset {
+    int8_t red_q8;
+    int8_t green_q8;
+    int8_t blue_q8;
+} panel_rgb_offset;
+
+
+
 /**
  * @brief everything to define the scene and panel configuration 
  * This is a kind of global configuration for the entire system 
@@ -347,6 +368,8 @@ typedef struct scene_info {
 
     /** @brief the order of pixels on panel */
     enum pixel_order_e pixel_order;
+
+    panel_order_t panel_order;
     
     /** @brief single panel width in pixels */
     uint16_t panel_width;
@@ -365,6 +388,7 @@ typedef struct scene_info {
 
     /** @brief array of red fractional brightness, panel type 0, type 1, ... */
     panel_rgb_scale panel_scale[MAX_PANEL_TYPES];
+    panel_rgb_offset panel_offset[MAX_PANEL_TYPES];
 
     /** @brief array panel types for each output */
     uint8_t panel_types[MAX_PANELS];
@@ -373,6 +397,7 @@ typedef struct scene_info {
 
     /** @brief dithering strength. (0-10) 0 is off, improves simulated color in dark areas but reduces image sharpness */
     float dither;
+    bool quant_dither;
 
     /** 
      * @brief number of panels connected to each chain on the port (1-8)
@@ -424,6 +449,7 @@ typedef struct scene_info {
      * maximum frame rate is: 9600 / bpp / (panel_width / 16)
      */
     uint16_t fps;
+    bool auto_fps;
 
 	/**
      * @brief gamma correction value to use for pwm scaling. if 0 - no gamma is applied
@@ -449,12 +475,17 @@ typedef struct scene_info {
     /**
      * @brief boolean flag to indicate that render_forever should exit.
      */
-    bool do_render;
+    _Atomic bool do_render;
 
     /**
      * set to true to show the FPS on the screen
      */
     bool show_fps;
+
+    /**
+     * @brief current frame index, increments every frame rendered
+     */
+    uint32_t frame_index;
     
 } scene_info;
 
@@ -483,7 +514,7 @@ typedef struct scene_info {
  */
 // void map_byte_image_to_pwm_dithered(uint8_t *image, const scene_info *scene, const uint8_t do_fps_sync);
 void aces_inplace(RGB *in);
-Normal normalize8(const uint8_t in);
+Normal normalize_8(const uint8_t in);
 
 /*
 void aces_tone_mapper(const RGB *in, RGB *out);
@@ -497,21 +528,12 @@ void reinhard_tone_mapperF(const RGBF *in, RGBF *out);
 
 Normal hable_tone_map(const Normal color);
 void hable_inplace(RGB *in);
-void adjust_contrast_saturation_inplace(RGBF *__restrict__ in, const float contrast, const float saturation);
+void adjust_contrast_saturation(RGBF *__restrict__ in, const float contrast, const float saturation);
 uint8_t* u_mapper(uint8_t *image, uint8_t *output_image, const scene_info *scene);
 uint8_t *flip_mapper(uint8_t *image, uint8_t *image_out, const struct scene_info *scene);
 uint8_t *mirror_mapper(uint8_t *image, uint8_t *image_out, const struct scene_info *scene);
 uint8_t *mirror_flip_mapper(uint8_t *image, uint8_t *image_out, const struct scene_info *scene);
 
-
-/**
- * @brief linear interpolation between two floats 
- * 
- * @param float x  value 1
- * @param float y  value 2
- * @param float a  amount to interpolate between (0-1)
- */
-float mixf(const float x, const float y, const Normal a);
 
 
 void *render_shader(void *arg);

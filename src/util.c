@@ -17,6 +17,7 @@
 #include "util.h"
 #include "rpihub75.h"
 #include "pixels.h"
+#include "mymath.h"
 
 
 extern char *optarg;
@@ -192,6 +193,111 @@ int rnd(unsigned char *buffer, const size_t size) {
     return 0;
 }
 
+
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* rnd(void *buf, size_t n) must fill buf with cryptographic random bytes from /dev/urandom */
+
+#ifndef PIN_OE
+#define PIN_OE  (1u << 0)   /* adjust to your actual OE bit mask */
+#endif
+
+/* rotate array in place by rot elements, 0 <= rot < n */
+static void rotate_u32(uint32_t *a, size_t n, size_t rot) {
+    if (!n || !rot) return;
+    rot %= n;
+    size_t m = 0;
+    for (size_t start = 0; m < n; ++start) {
+        uint32_t prev = a[start];
+        size_t i = start;
+        do {
+            size_t next = i + rot;
+            if (next >= n) next -= n;
+            uint32_t tmp = a[next];
+            a[next] = prev;
+            prev = tmp;
+            i = next;
+            ++m;
+        } while (i != start);
+    }
+}
+
+/**
+ * Create a jitter mask of length jitter_size, where each entry is either 0 or PIN_OE.
+ * We choose exactly K entries to be the "rare" state and distribute them nearly evenly.
+ * This reduces long runs and visible flicker at low brightness.
+ *
+ * brightness: 0..255, higher means brighter, so fewer PIN_OE blanks.
+ *
+ * Returns malloc()'d array of uint32_t, caller must free().
+ */
+uint32_t *create_jitter_mask(const uint16_t jitter_size, const uint8_t brightness) {
+    const size_t n = (size_t)jitter_size;
+    uint32_t *jitter = (uint32_t*)malloc(n * sizeof(uint32_t));
+    if (!jitter) return NULL;
+
+    /* Probability that a given frame is blanked by OE:
+       p_blank = (255 - brightness) / 256.0
+       Choose K = floor(p_blank * n) exactly, to reduce variance and clumping. */
+    const uint32_t blanks_k = ((uint32_t)(255 - brightness) * n) >> 8; /* matches threshold behavior */
+    const uint32_t ons_k    = n - blanks_k;
+
+    /* Decide which state is rare and should be stratified */
+    const int rare_is_blank = (blanks_k <= ons_k);
+
+    const uint32_t rare_value     = rare_is_blank ? PIN_OE : 0u;
+    const uint32_t default_value  = rare_is_blank ? 0u     : PIN_OE; /* flip these two if OE polarity is opposite */
+
+    const uint32_t rare_k = rare_is_blank ? blanks_k : ons_k;
+
+    /* Fast fill with the default state */
+    for (size_t i = 0; i < n; ++i) jitter[i] = default_value;
+
+    if (rare_k == 0) {
+        /* all default, no flicker possible */
+        return jitter;
+    }
+    if (rare_k >= n) {
+        /* all rare, degenerate but valid */
+        for (size_t i = 0; i < n; ++i) jitter[i] = rare_value;
+        return jitter;
+    }
+
+    /* Stratified placement:
+       Partition the sequence into rare_k contiguous spans whose sizes differ by at most 1.
+       In each span, place exactly one rare element at a random offset within the span.
+       This guarantees spacing and avoids long runs. */
+    const size_t base_span = n / rare_k;          /* floor */
+    const size_t extra     = n % rare_k;          /* first 'extra' spans have size base_span+1 */
+
+    size_t cursor = 0;
+    for (uint32_t r = 0; r < rare_k; ++r) {
+        size_t span = base_span + (r < extra ? 1 : 0);
+
+        /* draw one byte for offset, keep inside span */
+        uint8_t rnd_byte = 0;
+        if (span > 1) rnd(&rnd_byte, 1);
+        size_t off = (span > 1) ? (rnd_byte % span) : 0;
+
+        size_t pos = cursor + off;     /* guaranteed pos < n and unique */
+        jitter[pos] = rare_value;
+        cursor += span;
+    }
+
+    /* Optional: rotate by a random offset so multiple rows are out of phase */
+    {
+        uint16_t rot16 = 0;
+        rnd((uint8_t*)&rot16, sizeof(rot16));
+        size_t rot = (size_t)(rot16 % n);
+        rotate_u32(jitter, n, rot);
+    }
+
+    return jitter;
+}
+
 /**
  * @brief  calculate a jitter mask for the OE pin that should randomly toggle the OE pin on/off acording to brightness
  * TODO: look for rows of > 3 bits that are all the same and spread these bits out. this will reduce flicker on the display
@@ -200,7 +306,7 @@ int rnd(unsigned char *buffer, const size_t size) {
  * @param brightness   larger values produce brighter output, max 255
  * @return uint32_t*   a pointer to the jitter mask. caller must release memory
  */
-uint32_t *create_jitter_mask(const uint16_t jitter_size, const uint8_t brightness) {
+uint32_t *create_jitter_mask2(const uint16_t jitter_size, const uint8_t brightness) {
     srand(time(NULL));
     uint32_t *jitter  = (uint32_t*)malloc(jitter_size*sizeof(uint32_t));
     uint8_t *raw_data = (uint8_t*) malloc(jitter_size);
@@ -279,16 +385,17 @@ long calculate_fps(const uint16_t target_fps, const bool show_fps) {
     frame_count++;
 
     // If one second has passed
-    if (current_time_s != last_time_s) {
+    if (current_time_s != last_time_s && last_time_s != 0) {
         // Output FPS
         if (show_fps) {
-            printf("FPS: %d, micro second sleep per frame: %ld\n", frame_count, sleep_time);
+            double percent = 100-(double)((double)sleep_time / (double)target_frame_time_us)*100;
+            printf("FPS: %d, micro second sleep per frame: %ld, CPU: %.1f%%\n", frame_count, sleep_time, percent);
         }
 
         // Reset frame count and update last_time
         frame_count = 0;
-        last_time_s = current_time_s;
     } 
+    last_time_s = current_time_s;
 
     clock_gettime(CLOCK_MONOTONIC, &last_time);
     return sleep_time;
@@ -454,7 +561,6 @@ int parse_panel_types(const char *arg,
     return 0;
 }
 
-
 /* Parse optarg like "1:1:1,1:.79:.89" into dst[0..*out_count-1].
    Missing channels default to 1.0. Returns 0 on success, -1 on error. */
 int parse_panel_scales(const char *arg,
@@ -481,7 +587,7 @@ int parse_panel_scales(const char *arg,
         char *panel = str_trim_spaces(tok);
 
         // defaults
-        panel_rgb_scale s = {1.0f, 1.0f, 1.0f};
+        panel_rgb_scale s = {255, 255, 255};
 
         // split r:g:b
         int idx = 0;
@@ -509,6 +615,59 @@ int parse_panel_scales(const char *arg,
     }
     return 0;
 }
+
+
+/* Parse optarg like "-12:24:22,-30:-32:45" into dst[0..*out_count-1].
+   Missing channels default to 0. Returns 0 on success, -1 on error. */
+int parse_panel_offsets(const char *arg,
+                       panel_rgb_offset *dst,
+                       size_t max_out,
+                       int *out_count)
+{
+    if (!arg || !dst || max_out == 0) {
+        return -1;
+    }
+
+    char *buf = strdup(arg);
+    if (!buf) {
+        return -1;
+    }
+
+
+    size_t count = 0;
+    char *save_outer = NULL;
+    for (char *tok = strtok_r(buf, ",", &save_outer);
+         tok && count < max_out;
+         tok = strtok_r(NULL, ",", &save_outer))
+    {
+        char *panel = str_trim_spaces(tok);
+
+        // defaults
+        panel_rgb_offset s = {0, 0, 0};
+
+        // split r:g:b
+        int idx = 0;
+        char *save_inner = NULL;
+        for (char *ctok = strtok_r(panel, ":", &save_inner);
+             ctok && idx < 3;
+             ctok = strtok_r(NULL, ":", &save_inner), idx++)
+        {
+            int v = atoi(str_trim_spaces(ctok));
+            if      (idx == 0) s.red_q8   = MAX(-127, MIN(v, 127));
+            else if (idx == 1) s.green_q8 = MAX(-127, MIN(v, 127));
+            else               s.blue_q8  = MAX(-127, MIN(v, 127));
+        }
+
+        dst[count++] = s;
+    }
+
+    free(buf);
+    if (out_count) {
+        *out_count = count;
+    }
+    return 0;
+}
+
 
 
  
@@ -578,17 +737,15 @@ void configure_gpio(uint32_t *PERIBase, int version) {
         uint32_t *GPIOBase = PERIBase + gpio_off;
         uint32_t *RIOBase = PERIBase + rio_off;
 
-        if (CONSOLE_DEBUG) {
-            printf("configure pin %d\n", pin_num);
-        }
         GPIO[pin_num].ctrl = 5;
-        pad[pin_num] = 0x15;
+        uint8_t slew_rate = 0x15;
+        if (pin_num == PIN_CLK || pin_num == PIN_LATCH) {
+            slew_rate = 0x01; // slower slew rate for clock and latch
+        }
+        pad[pin_num] = slew_rate;
 
         rioSET->OE = 0x01<<pin_num;     // these 2 lines actually set the pin to output mode
         rioSET->Out = 0x01<<pin_num;
-        if (CONSOLE_DEBUG) {
-            printf("configured pin %d, ctrl [%d], pad [%x]\n", pin_num, GPIO[pin_num].ctrl, pad[pin_num]);
-        }
     }
 }
 
@@ -602,30 +759,35 @@ void usage(int argc, char **argv) {
     die(
         "Usage: %s\n"
         "     -s <file>         GPU fragment shader, or mp4 file to render\n"
-        "     -x <width>        total pixel width         (16-512)\n"
-        "     -y <height>       total pixel height        (16-512)\n"
-        "     -w <width>        panel width               (16/32/64/128)\n"
-        "     -h <height>       panel height              (16/32/64)\n"
-        "     -O <RGB>          panel pixel order         (RGB, RBG, BGR)\n"
-        "     -f <fps>          target frames per second  (1-255)\n"
+        "     -x <width>        total image width         (16-512)\n"
+        "     -y <height>       total image height        (16-512)\n"
+        "     -w <width>        panel width               (16/32/64/128) default 64\n"
+        "     -h <height>       panel height              (16/32/64) default 64\n"
+        "     -o <RGB>          panel pixel order         (RGB, RBG, BGR, BRG, GRB, GBR)\n"
+        "     -f <fps>          target frames per second  (1-255) - omit to auto scale fps to 95%% CPU\n"
         "     -p <num ports>    number of ports           (1-3)\n"
         "     -c <num chains>   number of panels chained  (1-16)\n"
         "     -g <gamma>        gamma correction          (1.0-2.8)\n"
-        "     -d <bit depth>    bit depth                 (2-64)\n"
-        "     -b <brightness>   overall brightness level  (0-254)\n"
-        "     -l <dither>       dithering intensity level (0-10)\n"
+        "     -d <bit depth>    bit depth                 (8-64)\n"
+        "     -b <brightness>   overall brightness level  (1-254)\n"
+        "     -q                enable quantization dithering\n"
+        "     -l <dither>       spatial dithering intensity level (0-10)\n"
         "     -m <frames>       motion blur frames        (0-32)\n"
         "     -i <mapper>       image mapper (mirror, flip, mirror_flip)\n"
         "     -t <tone_mapper>  (aces, reinhard, none, saturation, sigmoid, hable)\n"
         "     -j                adjust brightness in pixel BCM, only for Pi3-4\n"
         "     -z                run LED calibration script\n"
         "     -n                display data from UDP server on port %d (untested)\n"
-        "     -o                display current FPS and Panel refresh Hz\n"
-        "     -T <r:g:b,r:g:b>  panel color correction, 0.0-1.0 for each color, comma delimited\n"
-        "                       for each panel type. panel types are numbered 0-7\n"
+        "     -v                display current FPS and Panel refresh Hz\n"
+        "     -O <r:g:b,r:g:b>  panel color correction offset ammount, +-128 for each color, comma delimited\n"
+        "                       add or subtract this ammount to each panels rgb channels\n"
+        "     -T <r:g:b,r:g:b>  panel color correction multiple factor, 0.0-1.0 for each color, comma delimited\n"
+        "                       multiply this ammount to each panels rgb channels\n"
         "     -P <T:T:T,T:T:T>  panel type mapping, each T is a panel type number (0-7).\n"
         "                       columns are : sepearted, rows are , separated (0:0:0,0:1:1,1:1:1)\n"
-        "     -?                this help\n", argv[0], SERVER_PORT);
+        "     -?                this help\n"
+        "     NOTE: if runing as root, it will automatically use the real-time scheduler which reduces flicker\n"
+        , argv[0], SERVER_PORT);
 }
 
 
@@ -681,8 +843,8 @@ scene_info *default_scene(int argc, char **argv) {
     scene->height = IMG_HEIGHT;
     scene->panel_height = PANEL_HEIGHT;
     scene->panel_width = PANEL_WIDTH;
-    scene->num_chains = 1;
-    scene->num_ports = 1;
+    scene->num_chains = 0;
+    scene->num_ports = 0;
     scene->buffer_ptr = 0;
     scene->stride = 3;
     scene->gamma = GAMMA;
@@ -694,16 +856,20 @@ scene_info *default_scene(int argc, char **argv) {
     scene->blue_linear = BLUE_SCALE;
     scene->jitter_brightness = true;
 
-    scene->bit_depth = 32;
+    scene->bit_depth = 64;
     scene->pixel_order = PIXEL_ORDER_RGB;
+    scene->panel_order = PANEL_RGB;
     scene->bcm_mapper = map_byte_image_to_bcm;
     scene->tone_mapper = copy_tone_mapperF;
     scene->brightness = 200;
     scene->motion_blur_frames = 0;
     scene->do_render = TRUE;
     scene->dither = 0.0f;
+    scene->quant_dither = false;
     scene->panel_types[0] = 0;
     scene->num_panel_types = 0;
+    scene->frame_index = 0;
+    scene->auto_fps = true;
 
     /*
     scene->red_scale   = (float*)malloc(32 * sizeof(float));
@@ -721,9 +887,9 @@ scene_info *default_scene(int argc, char **argv) {
     }
 
     // Parse command-line options
-    int opt;
+    int opt = 0;
     int num_scales = 0;
-    while ((opt = getopt(argc, argv, "O:T:P:x:y:w:h:s:f:p:c:g:d:m:b:t:l:i:jzo?")) != -1) {
+    while ((opt = getopt(argc, argv, "O:T:P:o:x:y:w:h:s:f:p:c:g:d:m:b:t:l:i:jzvq?")) != -1) {
         switch (opt) {
         case 's':
             scene->shader_file = optarg;
@@ -746,12 +912,15 @@ scene_info *default_scene(int argc, char **argv) {
             break;
         case 'f':
             scene->fps = atoi(optarg);
+            scene->auto_fps = false;
             break;
         case 'p':
             scene->num_ports = atoi(optarg);
             break;
         case 'c':
-            scene->num_chains = (uint8_t)atoi(optarg);
+            uint8_t t = (uint8_t)atoi(optarg);
+            printf("set chains to %d\n", t);
+            scene->num_chains = t;
             break;
         case 'g':
             scene->gamma = atof(optarg);
@@ -767,13 +936,23 @@ scene_info *default_scene(int argc, char **argv) {
             break;
         case 'l':
             scene->dither = atof(optarg);
-            scene->dither = MIN(MAX(scene->dither, 0.0f), 10.0f);
+            scene->dither = clampf(scene->dither, 0.0f, 10.0f);
+            break;
+        case 'q':
+            scene->quant_dither = true;
+            break;
         case 'j':
             scene->jitter_brightness = false;
             break;
         case 'T':
             if (parse_panel_scales(optarg, scene->panel_scale, MAX_PANEL_TYPES, &num_scales) != 0) {
                 fprintf(stderr, "invalid -T format: %s\n", optarg);
+                exit(1);
+            }
+            break;
+        case 'O':
+            if (parse_panel_offsets(optarg, scene->panel_offset, MAX_PANEL_TYPES, &num_scales) != 0) {
+                fprintf(stderr, "invalid -O format: %s\n", optarg);
                 exit(1);
             }
             break;
@@ -786,7 +965,7 @@ scene_info *default_scene(int argc, char **argv) {
         case 'z':
             scene->gamma = -99.0f;
             break;
-        case 'o':
+        case 'v':
             scene->show_fps = TRUE;
             break;
         case 't':
@@ -841,17 +1020,27 @@ scene_info *default_scene(int argc, char **argv) {
                 die("Unknown image mapper: %s, must be one of (u, mirror, flip, mirror_flip)\n", optarg);
             }
             break;
-        case 'O':
+        case 'o':
             if (strcasecmp(optarg, "RGB") == 0) {
-                scene->pixel_order = PIXEL_ORDER_RGB;
+                scene->panel_order = PANEL_RGB;  
             }
             else if (strcasecmp(optarg, "RBG") == 0) {
-                scene->pixel_order = PIXEL_ORDER_RBG;
+                scene->panel_order = PANEL_RBG;  
             }
             else if (strcasecmp(optarg, "BGR") == 0) {
-                scene->pixel_order = PIXEL_ORDER_BGR;
-            } else {
-                die("Unknown panel pixel order: %s, must be one of (RGB, RBG, BGR)\n", optarg);
+                scene->panel_order = PANEL_BGR;  
+            }
+            else if (strcasecmp(optarg, "BRG") == 0) {
+                scene->panel_order = PANEL_BRG;  
+            }
+            else if (strcasecmp(optarg, "GRB") == 0) {
+                scene->panel_order = PANEL_GRB;  
+            }
+            else if (strcasecmp(optarg, "GBR") == 0) {
+                scene->panel_order = PANEL_GBR;  
+            }
+            else {
+                die("Unknown panel pixel order: %s, must be one of (RGB, RBG, BGR, BRG, GRB, GBR)\n", optarg);
             }
             break;
 
@@ -859,6 +1048,23 @@ scene_info *default_scene(int argc, char **argv) {
             usage(argc, argv);
         }
     }
+    if (opt == 0) {
+        usage(argc, argv);
+    }
+
+    if (scene->num_chains == 0) {
+        int calcualted_chains = ceil(scene->width / scene->panel_width);
+        printf("calculated: %d chains\n", calcualted_chains);
+        scene->num_chains = MAX(scene->num_chains, calcualted_chains);
+    }
+
+    if (scene->num_ports == 0) {
+        int calcualted_ports = MIN(3, ceil(scene->width / scene->panel_width));
+        printf("calculated: %d ports\n", calcualted_ports);
+        scene->num_ports = MAX(scene->num_ports, calcualted_ports);
+    }
+
+
 
     if (num_scales != 0 && num_scales != scene->num_panel_types) {
         fprintf(stderr, "-T does not match -P !!\n\n");

@@ -36,9 +36,8 @@ typedef void (*update_bcm_signal_fn)(
     const scene_info *scene,
     const void *bits,  // Use void* to handle both uint32_t* and uint64_t*
     uint32_t *bcm_signal,
-    const uint8_t *image);
-    // XXX FIX
-    //const uint8_t *image);
+    const uint8_t *image,
+    const uint16_t *quant_err);
 
 /**
  * @brief update_bcm_signal_fn implementation for up to 64 bit BCM data
@@ -54,9 +53,6 @@ void update_bcm_signal_64(
     const void *__restrict__ void_bits,
     uint32_t *__restrict__ bcm_signal,
     const uint8_t *__restrict__ images);
-    // XXX fix
-    //const uint8_t *__restrict__ image,
-    //const uint32_t offset);
 
 
 /**
@@ -86,40 +82,6 @@ void update_bcm_signal_32(
  */
 void map_byte_image_to_bcm(scene_info *scene, uint8_t *image);
 
-/**
- * @brief convert linear RGB to normalized CIE1931 XYZ color space
- * https://en.wikipedia.org/wiki/CIE_1931_color_space
- * 
- * @param r 
- * @param g 
- * @param b 
- * @param X 
- * @param Y 
- * @param Z 
- */
-void linear_rgb_to_cie1931(const uint8_t r, const uint8_t g, const uint8_t b, float *X, float *Y, float *Z);
-
-/**
- * @brief linear interpolate between two floats
- * 
- * @param x value A
- * @param y value B
- * @param a Normal 0-1 interpolation amount
- * @return float 
- */
-__attribute__((pure))
-float mixf(const float x, const float y, const Normal a);
-
-/**
- * @brief  clamp a value between >= lower and <= upper
- * 
- * @param x value to clamp
- * @param lower  lower bound inclusive
- * @param upper  upper bound inclusive
- * @return float 
- */
-__attribute__((pure))
-float clampf(const float x, const float lower, const float upper);
 
 /**
  * @brief normalize a uint8_t (0-255) to a float (0-1)
@@ -128,7 +90,7 @@ float clampf(const float x, const float lower, const float upper);
  * @return Normal a floating point value between 0-1
  */
 __attribute__((pure))
-Normal normalize8(const uint8_t in);
+Normal normalize_8(const uint8_t in);
 
 /**
  * @brief take a normalized RGB value and return luminance as a Normal
@@ -146,7 +108,7 @@ Normal luminance(const RGBF *__restrict__ in);
  * @param contrast - contrast value 0-1
  * @param saturation - saturation value 0-1
  */
-void adjust_contrast_saturation_inplace(RGBF *__restrict__ in, const Normal contrast, const Normal saturation);
+void adjust_contrast_saturation(RGBF *__restrict__ in, const Normal contrast, const Normal saturation);
 
 
 /**
@@ -273,7 +235,7 @@ void copy_tone_mapperF(const RGBF *__restrict__ in, RGBF *__restrict__ out, cons
  * 
  */
 __attribute__((cold))
-void *tone_map_rgb_bits(const scene_info *scene, const int num_bits, float *quant_errors);
+void *tone_map_rgb_bits(const scene_info *scene, const int num_bits, uint16_t *quant_errors);
 
 
 

@@ -1,10 +1,14 @@
+CFLAGS_BASE := -O3 -g -pipe -fno-math-errno -ffast-math
+CFLAGS_CPU  ?= $(shell sh detect_flags.sh)
+CFLAGS      := $(CFLAGS_BASE) $(CFLAGS_CPU)
 
 # Compiler and flags
 CC = gcc
 #CFLAGS = -DNDEBUG=1 -std=gnu2x -fPIC -ffast-math -fopt-info-vec -funroll-loops -ftree-vectorize -mtune=native -O3 -Wall -Wpedantic -Wdouble-promotion -Iinclude
-CFLAGS = -DNDEBUG=1 -std=gnu2x -fPIC -ffast-math -fopt-info-vec -funroll-loops -ftree-vectorize -mtune=native -O3 -Wall -Wpedantic -Iinclude
+CFLAGS = -DNDEBUG=1 -std=gnu2x -fPIC -funroll-loops -ftree-vectorize -Wall -Wpedantic -Iinclude
 LDFLAGS = -lpthread -lrt -lm -lc -lavformat -lavcodec -lswscale -lavutil
 CFLAGS += $(DEF)
+CFLAGS += $(CFLAGS_BASE)
 CFLAGS += `pkg-config --cflags libavcodec` 
 
 # Directories
@@ -72,15 +76,19 @@ endif
 
 # No-GPU library (without gpu.c, no OpenGL)
 $(LIB_NO_GPU): $(OBJ_COMMON) | $(BUILDDIR)
-	$(CC) $(CFLAGS) -shared -o $@ $(OBJ_COMMON)  $(LDFLAGS)
+	$(CC) $(CFLAGS) $(CFLAGS_CPU) -shared -o $@ $(OBJ_COMMON)  $(LDFLAGS)
 
 # GPU-enabled library (with gpu.c, linked to OpenGL)
 $(LIB_GPU): $(OBJ_COMMON) $(OBJ_GPU) | $(BUILDDIR)
-	$(CC) $(CFLAGS) -shared -o $@ $(OBJ_COMMON) $(OBJ_GPU) $(LDFLAGS) `pkg-config --libs glesv2 gbm egl`
+	$(CC) $(CFLAGS) $(CFLAGS_CPU) -shared -o $@ $(OBJ_COMMON) $(OBJ_GPU) $(LDFLAGS) `pkg-config --libs glesv2 gbm egl`
 
 # New example target to compile example.c
 example: example.c $(LIB_GPU)
 	$(CC) example.c -Wall -O3 -lrpihub75_gpu -o example
+
+# New example target to compile scratch.c
+scratch: tests/scratch.c $(LIB_GPU)
+	$(CC) tests/scratch.c -Wall -O3 -lrpihub75_gpu -o scratch
 
 
 # Install target
@@ -108,7 +116,7 @@ clean:
 
 # Object file compilation rules
 $(BUILDDIR)/%.o: src/%.c | $(BUILDDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(CFLAGS_CPU) -c $< -o $@
 
 # Dependencies (optional)
 $(BUILDDIR)/util.o: src/util.c include/util.h

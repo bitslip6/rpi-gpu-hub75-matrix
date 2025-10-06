@@ -86,7 +86,7 @@ void check_scene(const scene_info *scene) {
             scene->num_ports, scene->num_chains, scene->width, scene->height, scene->stride, scene->bit_depth);
     }
     if (scene->num_ports > 3) {
-        die("Only 3 port supported at this time\n");
+        die("Only 3 port supported at this time [%d]\n", scene->num_ports);
     }
     if (scene->num_ports < 1) {
         die("Require at last 1 port\n");
@@ -182,29 +182,142 @@ uint8_t *u_mapper_impl(uint8_t *image_in, uint8_t *image_out, const struct scene
 
 
 
-image_mapper_t flip_mapper;
-uint8_t *flip_mapper(uint8_t *image, uint8_t *image_out, const struct scene_info *scene) {
 
-    uint16_t row_sz = scene->width * scene->stride;
+/**
+ * @brief invert the image vertically
+ */
+__attribute__((hot, flatten))
+uint8_t *flip_mapper(uint8_t *__restrict image,
+                             uint8_t *__restrict image_out,
+                             const scene_info *__restrict scene)
+{
+    const size_t row_sz   = (size_t)scene->width * (size_t)scene->stride;
+    const size_t height   = (size_t)scene->height;
 
-    uint8_t *temp_row = malloc(row_sz);
+    if (UNLIKELY(row_sz == 0 || height == 0)) return image_out ? image_out : image;
 
-    for (uint16_t y=0; y < scene->height / 2; y++) {
-        uint8_t *top_row = image + y * row_sz;
-        uint8_t *bottom_row = image + (scene->height - y - 1) * row_sz;
+    // Fast path, out-of-place: one memcpy per row, sequential IO, best for bandwidth
+    if (image_out && image_out != image) {
+        uint8_t *__restrict dst = image_out;
+        const uint8_t *__restrict src = image;
+        // iterate top->bottom on dst, read bottom->top on src
+        for (size_t y = 0; y < height; ++y) {
+            const uint8_t *src_row = src + (height - 1 - y) * row_sz;
+            uint8_t       *dst_row = dst + y * row_sz;
 
-        // Swap the rows using the temp_row buffer
-        memcpy(temp_row, top_row, row_sz);        // Copy top row to temp buffer
-        memcpy(top_row, bottom_row, row_sz);      // Copy bottom row to top row
-        memcpy(bottom_row, temp_row, row_sz);     // Copy temp buffer (original top row) to bottom row
+            // prefetch next rows to hide latency on A72/A76
+            __builtin_prefetch(src_row - row_sz, 0, 3);
+            __builtin_prefetch(dst_row + row_sz, 1, 3);
+
+            memcpy(dst_row, src_row, row_sz);
+        }
+        return image_out;
     }
 
-    return image;
+    printf("nom flip\n");
+
+    return image_out ? image_out : image;
 }
 
 
-image_mapper_t u_mirror_impl;
-uint8_t *mirror_mapper(uint8_t *image, uint8_t *image_out, const struct scene_info *scene) {
+
+
+#if defined(__ARM_NEON) || defined(__aarch64__)
+#include <arm_neon.h>
+static inline uint8x16_t reverse16_u8(uint8x16_t v) {
+    // reverse bytes within 64-bit lanes, then swap halves
+    uint8x16_t r = vrev64q_u8(v);
+    return vextq_u8(r, r, 8);
+}
+#endif
+
+
+__attribute__((hot, flatten))
+uint8_t *mirror_mapper(uint8_t *__restrict image,
+                       uint8_t *__restrict image_out,
+                       const struct scene_info *__restrict scene)
+{
+    const size_t w   = (size_t)scene->width;
+    const size_t h   = (size_t)scene->height;
+    const size_t bpp = (size_t)scene->stride;   // RGB => 3
+    const size_t row_sz = w * bpp;
+
+    if (UNLIKELY(!image || !image_out || w == 0 || h == 0 || bpp == 0)) {
+        return image_out;
+    }
+
+    for (size_t y = 0; y < h; ++y) {
+        const uint8_t *src_row = image     + y * row_sz;
+        uint8_t       *dst_row = image_out + y * row_sz;
+
+#if (defined(__ARM_NEON) || defined(__aarch64__))
+        if (LIKELY(bpp == 3)) {
+            // NEON path: process 16 RGB pixels (48 bytes) per chunk
+            const size_t px_block = 16;
+            const size_t blk_bytes = px_block * 3;   // 48
+            const size_t blocks = w / px_block;
+            const size_t tail_px = w - blocks * px_block;
+
+            // write blocks into destination from left after reserving space for tail
+            // first fill the vectorized part: dest base after tail
+            uint8_t *dst_blocks_base = dst_row + tail_px * 3;
+
+            for (size_t i = 0; i < blocks; ++i) {
+                const uint8_t *s = src_row + i * blk_bytes;
+
+                // deinterleave 16 RGB pixels
+                uint8x16x3_t rgb = vld3q_u8(s);
+
+                // reverse pixel order within each channel
+                rgb.val[0] = reverse16_u8(rgb.val[0]);
+                rgb.val[1] = reverse16_u8(rgb.val[1]);
+                rgb.val[2] = reverse16_u8(rgb.val[2]);
+
+                // destination block position (mirror): place from right to left
+                uint8_t *d = dst_blocks_base + (blocks - 1 - i) * blk_bytes;
+
+                // interleaved store
+                vst3q_u8(d, rgb);
+            }
+
+            // tail pixels (remaining leftmost in dest): scalar copy, mirrored
+            for (size_t t = 0; t < tail_px; ++t) {
+                const size_t src_x  = w - 1 - t;        // rightmost going left
+                const size_t dst_x  = t;                // leftmost going right
+                const uint8_t *sp = src_row + src_x * 3;
+                uint8_t       *dp = dst_row + dst_x * 3;
+                dp[0] = sp[0]; dp[1] = sp[1]; dp[2] = sp[2];
+            }
+            continue;
+        }
+#endif
+        // Scalar fallback (any bpp), still cache-friendly
+        // Copy each row reversed in pixels, preserving per-pixel byte order
+        size_t left  = 0;
+        size_t right = w - 1;
+        while (left < right) {
+            uint8_t *dl = dst_row + left  * bpp;
+            uint8_t *dr = dst_row + right * bpp;
+            const uint8_t *sl = src_row + (w - 1 - left)  * bpp;
+            const uint8_t *sr = src_row + (w - 1 - right) * bpp;
+
+            // write two pixels per iteration to reduce loop overhead
+            memcpy(dl, sr, bpp);
+            memcpy(dr, sl, bpp);
+
+            ++left;
+            --right;
+        }
+        if (left == right) {
+            memcpy(dst_row + left * bpp, src_row + (w - 1 - left) * bpp, bpp);
+        }
+    }
+
+    return image_out;
+}
+
+
+uint8_t *mirror_mapper_old(uint8_t *image, uint8_t *image_out, const struct scene_info *scene) {
 
     uint16_t row_sz = scene->width * scene->stride;
 
@@ -229,29 +342,95 @@ uint8_t *mirror_mapper(uint8_t *image, uint8_t *image_out, const struct scene_in
     return image;
 }
 
-uint8_t *mirror_flip_mapper(uint8_t *image, uint8_t *image_out, const struct scene_info *scene) {
 
-    int row_size = scene->width * scene->stride; // Each row has 'width' pixels, 3 bytes per pixel (R, G, B)
-    uint8_t temp_pixel[3];    // Temporary storage for a single pixel (3 bytes: R, G, B)
 
-    // Iterate through the top half of the image
-    for (int y = 0; y < scene->height / 2; y++) {
-        uint8_t *top_row = image + y * row_size;
-        uint8_t *bottom_row = image + (scene->height - y - 1) * row_size;
+__attribute__((hot, flatten))
+uint8_t *mirror_flip_mapper(uint8_t *__restrict image,
+                            uint8_t *__restrict image_out,
+                            const struct scene_info *__restrict scene)
+{
+    const size_t w   = (size_t)scene->width;
+    const size_t h   = (size_t)scene->height;
+    const size_t bpp = (size_t)scene->stride;         // RGB => 3
+    const size_t row_sz = w * bpp;
 
-        // Swap pixels from left to right within both the top and bottom rows
-        for (int x = 0; x < scene->width; x++) {
-            int left_index = x * scene->stride;
-            int right_index = (scene->width - x - 1) * scene->stride;
+    if (UNLIKELY(!image || !image_out || w == 0 || h == 0 || bpp == 0)) {
+        return image_out;
+    }
 
-            // Swap top-left pixel with bottom-right pixel (3 bytes: R, G, B)
-            memcpy(temp_pixel, &top_row[left_index], scene->stride);                  // Store top-left pixel
-            memcpy(&top_row[left_index], &bottom_row[right_index], scene->stride);    // Move bottom-right to top-left
-            memcpy(&bottom_row[right_index], temp_pixel, scene->stride);              // Move temp (top-left) to bottom-right
+    for (size_t y = 0; y < h; ++y) {
+        // vertical flip selects source row from bottom
+        const uint8_t *src_row = image     + (h - 1 - y) * row_sz;
+        uint8_t       *dst_row = image_out + y * row_sz;
+
+#if (defined(__ARM_NEON) || defined(__aarch64__))
+        if (LIKELY(bpp == 3)) {
+            // process 16 RGB pixels (48 bytes) per block with deinterleave/reverse/interleave
+            const size_t px_block  = 16;
+            const size_t blk_bytes = px_block * 3;  // 48
+            const size_t blocks    = w / px_block;
+            const size_t tail_px   = w - blocks * px_block;
+
+            // vectorized blocks: dst left→right, src right→left in block-sized chunks
+            for (size_t i = 0; i < blocks; ++i) {
+                // source block starts px_block pixels from the right edge, moving left
+                const size_t src_px   = w - (i + 1) * px_block;
+                const uint8_t *s      = src_row + src_px * 3;
+                uint8_t       *d      = dst_row + i * blk_bytes;
+
+                __builtin_prefetch(s - 96, 0, 3);
+                __builtin_prefetch(d + 96, 1, 3);
+
+                // deinterleave 16 pixels of RGB
+                uint8x16x3_t rgb = vld3q_u8(s);
+
+                // reverse pixel order within each channel to mirror horizontally
+                rgb.val[0] = reverse16_u8(rgb.val[0]);
+                rgb.val[1] = reverse16_u8(rgb.val[1]);
+                rgb.val[2] = reverse16_u8(rgb.val[2]);
+
+                // interleaved store to destination
+                vst3q_u8(d, rgb);
+            }
+
+            // tail pixels at the left of dst, sourced from the left of src but reversed
+            for (size_t t = 0; t < tail_px; ++t) {
+                const size_t src_x = tail_px - 1 - t; // right-to-left within the remaining tail
+                const uint8_t *sp  = src_row + src_x * 3;
+                uint8_t       *dp  = dst_row + (blocks * px_block + t) * 3;
+                dp[0] = sp[0]; dp[1] = sp[1]; dp[2] = sp[2];
+            }
+            continue;
+        }
+#endif
+        // scalar fallback: generic bpp, still sequential writes and reads
+        const uint8_t *sp = src_row + (w - 1) * bpp; // start at rightmost pixel of source row
+        uint8_t       *dp = dst_row;                 // start at leftmost pixel of dest row
+
+        // copy w pixels, mirrored horizontally
+        for (size_t x = 0; x < w; ++x) {
+            __builtin_prefetch(sp - 3 * bpp, 0, 1);
+            // copy one pixel of bpp bytes
+            switch (bpp) {
+                case 3:
+                    dp[0] = sp[0]; dp[1] = sp[1]; dp[2] = sp[2];
+                    break;
+                case 4:
+                    // common case for RGBA buffers
+                    ((uint32_t *)dp)[0] = ((const uint32_t *)sp)[0];
+                    break;
+                default:
+                    memcpy(dp, sp, bpp);
+                    break;
+            }
+            dp += bpp;
+            sp -= bpp;
         }
     }
-    return image;
+
+    return image_out;
 }
+
 
 
 /**
@@ -306,11 +485,10 @@ void render_forever_pi4(const scene_info *scene, int version) {
     uint32_t color_pins    = 0;
 
     // uint8_t bright = scene->brightness;
-    while(scene->do_render) {
+    while(atomic_load(&scene->do_render)) {
 
         // iterate over the bit plane
         for (uint8_t pwm=0; pwm<bit_depth; pwm++) {
-            time_t current_time_s = time(NULL);
             frame_count++;
             // for the current bit plane, render the entire frame
             uint32_t offset = pwm;
@@ -360,36 +538,67 @@ void render_forever_pi4(const scene_info *scene, int version) {
                 last_pointer = scene->bcm_ptr;
                 bcm_signal = (last_pointer) ? scene->bcm_signalB : scene->bcm_signalA;
             }
+        }
 
-            if (UNLIKELY(current_time_s >= last_time_s + 5)) {
+        time_t current_time_s = time(NULL);
+        if (UNLIKELY(current_time_s >= last_time_s + 5)) {
 
-                if (scene->show_fps) {
-                    printf("Panel Refresh Rate: %dHz\n", frame_count / 5);
-                }
-                frame_count = 0;
-                last_time_s = current_time_s;
+            if (scene->show_fps) {
+                printf("Panel Refresh Rate: %dHz\n", frame_count / 5);
             }
+            frame_count = 0;
+            last_time_s = current_time_s;
         }
     }
 }
 
 
-/**
- * @brief you can cause render_forever to exit by updating the value of do_hub65_render pointer
- * EG:
- * 
- * 
- */
-void render_forever(const scene_info *scene) {
+static inline void io_write_barrier(void) {
+#if defined(__arm__) || defined(__aarch64__)
+    __asm__ __volatile__("dsb sy" ::: "memory"); /* ARMv8 device write fence */
+#endif
+}
 
+/* light store barrier for device stores */
+static inline void io_store_barrier(void) {
+#if defined(__arm__) || defined(__aarch64__)
+    __asm__ __volatile__("dmb ishst" ::: "memory"); /* much cheaper than dsb */
+#endif
+}
+
+
+static void enable_rt_and_lock_mem(void) {
     pid_t pid = getpid();
+    struct sched_param sp = { .sched_priority = 80 }; /* 1..99 */
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(3, &cpuset);
 
+
+    if (sched_setscheduler(0, SCHED_FIFO, &sp) != 0) {
+        fprintf(stderr, " * Try running as root to enable real-time scheduling\n");
+    } else {
+        debug(" * Real-time scheduling enabled\n");
+    }
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+        die("mlockall failed\n");
+    }
     if (sched_setaffinity(pid, sizeof(cpuset), &cpuset) != 0) {
 	    die("unable to set CPU affinity to 3\n");
     }
+}
+
+
+/**
+ * @brief you can cause render_forever to exit by updating the value of do_render pointer
+ * EG:
+ * scene->do_render = false; // will cause render_forever to exit from another thread
+ * 
+ */
+void render_forever(const scene_info *scene) {
+
+        
+    enable_rt_and_lock_mem();
 
     // check the CPU model to determine which GPIO function to use
     // note one cannot use file_get_contents as this file is zero length...
@@ -417,6 +626,9 @@ void render_forever(const scene_info *scene) {
             cpu_model = 3;
             break;
         }
+    }
+    if (cpu_model == 0) {
+        die("Unsupported CPU model detected %s\n", line);
     }
     free(line);
     fclose(file);
@@ -457,7 +669,7 @@ void render_forever(const scene_info *scene) {
     // if we are using BCM brightness, then set OE to 0 (0 is display on ironically)
     uint32_t *jitter_mask = create_jitter_mask(JITTER_SIZE, scene->brightness);
     if (scene->jitter_brightness == false) {
-        memset(jitter_mask, 0, JITTER_SIZE);
+        memset(jitter_mask, 0, JITTER_SIZE * sizeof(*jitter_mask));
     }
 
     // store the row to address mapping in an array for faster access
@@ -466,20 +678,109 @@ void render_forever(const scene_info *scene) {
         addr_map[i] = row_to_address(i, half_height);
     }
 
+    struct   timeval end_time, start_time;
+    time_t   last_time_s = time(NULL);
+    uint32_t frame_count = 0;
+    gettimeofday(&start_time, NULL);
 
-    time_t last_time_s     = time(NULL);
-    uint32_t frame_count   = 0;
-    // uint32_t addr_pins     = 0;
-    // uint32_t color_pins    = 0;
+
+    /* cache local aliases to MMIO regs, keep them volatile */
+    volatile uint32_t * const reg_out   = &rio->Out;
+    volatile uint32_t * const reg_set   = &rioSET->Out;
+    volatile uint32_t * const reg_clr   = &rioCLR->Out;
+    const uint32_t stride      = (uint32_t)bit_depth + 1;  /* next-pixel offset */
+
+
+
+    const uint32_t guard_px = 4;   /* do not change OE in first/last N pixels of a row */
+
+
+
+    uint8_t phase = 1;
+    while (scene->do_render) {
+        phase++;
+        for (uint8_t pwm = 0; pwm < bit_depth; pwm++) {
+            uint32_t offset = pwm;
+
+
+            frame_count++;
+            for (uint16_t y = 0; y < half_height; y++) {
+
+                /* optional: inhibit jitter on first couple of pixels to avoid latch-adjacent OE flips */
+                uint32_t inhibit = 2; /* set 0..2 as needed */
+                const uint32_t addr_bits = addr_map[y];
+                jitter_idx = ((y * 1315423911u) + phase) % JITTER_SIZE; // decorrelate rows
+
+
+
+                for (uint16_t x = 0; x < width; x++) {
+
+                    /* hard guard: data must never drive control pins */
+                    const uint32_t data = bcm_signal[offset] & MASK_DATA;
+
+                    const int guard = (x < guard_px) || ((width - 1 - x) < guard_px);
+                    const uint32_t oe_mask = (guard) ? 0u : jitter_mask[jitter_idx];
+
+
+                    /* absolute OUT twice, preserves order without fences */
+                    uint32_t v = data | addr_bits | oe_mask;   /* CLK low state */
+                    *reg_out = v;                 /* data + addr + oe, clk low */
+                    CLK_SETUP_DELAY();
+                    *reg_out = v | PIN_CLK;       /* clk high */
+                    CLK_SETUP_DELAY();
+
+                    /* advance after full edge */
+                    jitter_idx = (jitter_idx + 1) % JITTER_SIZE;
+                    offset += stride;
+                    if (inhibit) inhibit--;
+               }
+
+                /* safe latch with OE asserted high and address held */
+                *reg_set = PIN_OE;                 /* display off */
+                io_write_barrier();
+
+                *reg_out = addr_bits | PIN_OE;   /* make address + OE explicit on OUT bus */
+                io_write_barrier();
+
+                *reg_set = PIN_LATCH;              /* latch high */
+                SLOW2;
+                *reg_clr = PIN_LATCH;              /* latch low */
+                io_write_barrier();
+
+                /* do not drop OE here, first pixel write of next row will set OE per jitter */
+            }
+
+            // swap the buffers on vsync
+            if (UNLIKELY(scene->bcm_ptr != last_pointer)) {
+                last_pointer = scene->bcm_ptr;
+                bcm_signal = (last_pointer) ? scene->bcm_signalB : scene->bcm_signalA;
+            }
+        }
+        if (frame_count % 128 == 0) {
+            time_t current_time_s = time(NULL);
+            if (UNLIKELY(current_time_s >= last_time_s + 5)) {
+
+                if (scene->show_fps) {
+                    gettimeofday(&end_time, NULL);
+                    double elapsed = (double)(end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_usec - start_time.tv_usec) * 1e-6;
+                    printf("Panel Refresh Rate (%f): %.4fHz\n", elapsed, (frame_count / elapsed));
+                    gettimeofday(&start_time, NULL);
+                }
+                frame_count = 0;
+                last_time_s = current_time_s;
+            }
+        }
+    }
+
 
 
     // uint8_t bright = scene->brightness;
     while(scene->do_render) {
 
-        // iterate over the bit plane
-        //PRE_TIME;
+        // iterate over the bit plane, It takes about 6ms to iterate over 64 bits of BCM data per panel
+        // so 3 chained panels at 64 bit depth is about 18ms or 55Hz complete refresh rate
+        // new input frame data is updated instantly, over 3,000 times per second
         for (uint8_t pwm=0; pwm<bit_depth; pwm++) {
-            time_t current_time_s = time(NULL);
             frame_count++;
             // for the current bit plane, render the entire frame
             uint32_t offset = pwm;
@@ -487,16 +788,15 @@ void render_forever(const scene_info *scene) {
                 asm volatile ("" : : : "memory");  // Prevents optimization
 
                 // compute the bcm row start address for y
-                // uint32_t offset = ((y * scene->width ) * bit_depth) + pwm;
 
                 for (uint16_t x=0; x<width; x++) {
                     asm volatile ("" : : : "memory");  // Prevents optimization
-                    // set all bits in 1 op. RGB data, current row address and the OE jitter mask (brightness control)
-                    rio->Out = bcm_signal[offset] | addr_map[y] | jitter_mask[jitter_idx];
-
-                    // SLOW2
-                    // toggle clock pin high
-                    rioSET->Out = PIN_CLK;
+                    
+                    uint32_t v = bcm_signal[offset] | addr_map[y] | jitter_mask[jitter_idx];
+                    io_write_barrier();
+                    rio->Out = v;                     // clk low 
+                    io_write_barrier();
+                    rio->Out = PIN_CLK;               // this will only set the pin clock, not clear any other pins
 
                     // advance the global OE jitter mask 1 frame
                     jitter_idx = (jitter_idx + 1) % JITTER_SIZE;
@@ -506,8 +806,10 @@ void render_forever(const scene_info *scene) {
                 }
                 // make sure enable pin is high (display off) while we are latching data
                 // latch the data for the entire row
+                io_write_barrier();
                 rioSET->Out = PIN_OE | PIN_LATCH;
-                SLOW2
+                io_write_barrier();
+                SLOW2         // 8 asm cycles
                 rioCLR->Out = PIN_LATCH;
             }
 
@@ -516,16 +818,22 @@ void render_forever(const scene_info *scene) {
                 last_pointer = scene->bcm_ptr;
                 bcm_signal = (last_pointer) ? scene->bcm_signalB : scene->bcm_signalA;
             }
-
+        }
+        
+        if (frame_count % 128 == 0) {
+            time_t current_time_s = time(NULL);
             if (UNLIKELY(current_time_s >= last_time_s + 5)) {
+
                 if (scene->show_fps) {
-                    printf("Panel Refresh Rate: %dHz\n", frame_count / 5);
+                    gettimeofday(&end_time, NULL);
+                    double elapsed = (double)(end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_usec - start_time.tv_usec) * 1e-6;
+                    printf("Panel Refresh Rate (%f): %.4fHz\n", elapsed, (frame_count / elapsed));
+                    gettimeofday(&start_time, NULL);
                 }
                 frame_count = 0;
                 last_time_s = current_time_s;
             }
         }
-
     }
 }
 
