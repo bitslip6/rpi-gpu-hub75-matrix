@@ -100,6 +100,9 @@ Build & Install - Raspbian Lite
 # Raspbian Desktop will produce flicker on the display. Use raspbian lite or dietpi os for best response
 # isolate cpu 3 from kernel irqs - we use cpu3 for realtime pin control
 echo " isolcpus=3 nohz_full=3" | sudo tee -a /boot/firmware/cmdline.txt
+
+echo "performance" | sudo tee /sys/devices/system/cpu/cpufreq/policy0/scaling_governor
+
 sudo apt update
 sudo apt upgrade
 # build dependencies for rpi-gpu-hub75-matrix
