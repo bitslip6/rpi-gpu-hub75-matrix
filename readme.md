@@ -112,11 +112,14 @@ git clone https://github.com/bitslip6/rpi-gpu-hub75-matrix
 cd rpi-gpu-hub75-matrix
 
 # NOTE: you cannot compile for multiple boards. pin configuration is defined at compile time
-# compile with supports for hzeller's 3 port board (default):
+# compile with support for hzeller's 3 port board (default):
+# https://www.electrodragon.com/product/rgb-matrix-panel-drive-board-raspberry-pi/
 make DEF="-DHZELLER=1"
-# OR compile with support for ada fruit hub75 hat:
+# OR compile with support for ADAFruit single port: https://www.adafruit.com/product/3211
 make DEF="-DADA_HAT=1"
-# OR edit include/rpihub75.h and edit teh #define for pin mapping if using a different board or pin configuration
+# OR ADAFruit Tripple Port: https://www.adafruit.com/product/6358
+make DEF="-DADA_3HAT=1"
+# OR edit include/rpihub75.h and edit the #define for pin mapping if using a different board or pin configuration
 
 # install the library in /usr/local
 sudo make install
