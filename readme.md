@@ -369,6 +369,10 @@ to build and install library and header files to /usr/local run:
 
 
 ```bash
+# make sure to add " isolcpus=3 nohz_full=3" to /boot/firmware/cmdline.txt. If you run your program as root
+# The library will attempt to set real-time scheduling priority on CPU 3, which will cause your
+# kernel IRQs on CPU3 not to fire - making all other programs stop responding, including sshd.
+
 # compile version without GPU support
 make lib
 # compile version with GPU support
@@ -377,7 +381,7 @@ make libgpu
 make 
 # install headers and libraries in /usr/local
 sudo make install
-# you may need to manullay run "sudo ldconfig" depending on your OS environment
+# you may need to manually run "sudo ldconfig" depending on your OS environment
 
 # to compile the example app without GPU support:
 gcc -O3 -Wall -lrpihub75 example.c -o example 
