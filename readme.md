@@ -97,6 +97,9 @@ your scene. Reference: https://www.cl.cam.ac.uk/teaching/2122/AGIP/07_HDR_and_to
 Build & Install - Raspbian Lite
 -------------------------------
 ``` bash
+# Raspbian Desktop will produce flicker on the display. Use raspbian lite or dietpi os for best response
+# isolate cpu 3 from kernel irqs - we use cpu3 for realtime pin control
+echo " isolcpus=3 nohz_full=3" | sudo tee -a /boot/firmware/cmdline.txt
 sudo apt update
 sudo apt upgrade
 # build dependencies for rpi-gpu-hub75-matrix
@@ -134,13 +137,12 @@ make example
 # render a shader to 1 64x64 panel, bit depth 32, 120 fps, gamma 1.6, 50% brightness
 ./example -x 64 -y 64 -d 32 -f 120 -g 1.6 -b 128 -s shaders/cartoon.glsl
 # render a IQ's "happy jumping" shader to 128x128 panel, bit depth 64, 2 ports, 2 panels, 60 fps, 
-# mirrored and flipped, 255 brightness (100%), gamma 2.4, saturation tone mapping level 1.8
-./example -x 128 -y 128 -d 64 -p 2 -c 2 -f 60 -i mirror_flip -b 255 -g 2.4 -t saturation:1.8 -s shaders/happy_jump.glsl
-# render the triangle demo on the CPU, see example.c for basic library usage.
-./example -x 128 -y 128 -d 64 -f 60
-# render the lines gpu shader, 24 bit, with strong Floyd Steinberg dithering (-l 1-254), gamma 2.2
-./example -x 128 -y 128 -d 24 -f 60 -l 250 -g 2.2 -s shaders/lines.glsl
-# coming soon, mp4 drawing, network drawing, improved dithering
+# mirrored and flipped, 64bit color, 255 brightness (100%), gamma 2.4, saturation tone mapping level 1.8, quant dithering, spatial dithering level 2
+./example -x 192 -y 192 -p 3 -c 3 -i mirror_flip -b 255 -g 2.4 -t saturation:1.8 -q -l 2 -s shaders/happy_jump.glsl
+# render the triangle demo on the CPU, 3 ports with 3 panels each (192x192), see example.c for basic library usage.
+./example -x 192 -y 192
+# render movie 
+./example -x 128 -y 128 -d 24 -f 60  -g 2.2 -s shaders/lines.glsl
 ``` 
 
 Compile RealTime Kernel
@@ -179,20 +181,20 @@ sudo reboot
 
 Hub75 Operation
 ---------------
-All documentation reefers to 64x64 panels. Your Mileage May Vary.
-Pins: r1,r2,g1,g2,b1,b2, this is the color data. each LED is actually 3 leds (red, green and blue). The LED can be
+All documentation refers to 64x64 panels. Your Mileage May Vary.
+Pins: r1,r2,g1,g2,b1,b2, this is the color data. Each LED is actually 3 LEDs (red, green, and blue). The LED can be
 on or off. We will be pulsing them on/off very quickly to achieve the illusion of different color values. Color data
-is sent 2 pixels at a time beginning on column 0. r1,g1,b1 is the pixel in the upper 32 rows, r2,g2,b2 is the pixel
+is sent 2 pixels at a time, beginning on column 0. r1,g1,b1 is the pixel in the upper 32 rows, r2,g2,b2 is the pixel
 in the lower 32 rows.
 
-A,B,C,D,E are the address lines. These 5 pins represent the row address. 2^5 = 32 so depending on which bitmask is
-set on the address lines, the 2 corresponding led rows will be addressed for shifting in data. Data is shifted in on
-the falling edge of CLK. so after setting the address line, we set pixel value for column 0 along with clock, and then
+A,B,C,D,E are the address lines. These 5 pins represent the row address. 2^5 = 32, so depending on which bitmask is
+set on the address lines, the 2 corresponding LED rows will be addressed for shifting in data. Data is shifted in on
+the falling edge of CLK. After setting the address line, we set the pixel value for column 0 along with the clock, and then
 we pull the clock low. That is pixel 0. We now shift in the next pixel and so on 64 times. If we have multiple panels we
 simply continue shifting in data (in 64-column chunks) for as many panels as we have.
 
 To actually update the panel, we must bring OE (output enable) line high (to disable to display) and toggle the latch
-pin. data for one row is now latched. we advance the address row lines drop the enable pin low (turn the display on)
+pin. data for one row is now latched. We advance the address row lines, drop the enable pin low (turn the display on)
 and begin the process again.
 
 
