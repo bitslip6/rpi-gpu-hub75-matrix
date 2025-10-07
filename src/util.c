@@ -18,6 +18,7 @@
 #include "rpihub75.h"
 #include "pixels.h"
 #include "mymath.h"
+#include "spsc.h"
 
 
 extern char *optarg;
@@ -359,12 +360,12 @@ uint32_t *create_jitter_mask2(const uint16_t jitter_size, const uint8_t brightne
  * @param target_fps - target a sleep time to achieve this fps
  * @return long - returns sleep time in microseconds
  */
-long calculate_fps(const uint16_t target_fps, const bool show_fps) {
+long calculate_fps(scene_info *scene) {
     // Variables to track FPS
     static unsigned int frame_count = 0;
     static time_t       last_time_s = 0;
     long                sleep_time  = 0;
-    uint32_t target_frame_time_us   = (1000000 / target_fps);
+    uint32_t target_frame_time_us   = (1000000 / scene->fps);
     time_t current_time_s           = time(NULL);
     struct timespec this_time;
     static struct timespec last_time;
@@ -387,7 +388,7 @@ long calculate_fps(const uint16_t target_fps, const bool show_fps) {
     // If one second has passed
     if (current_time_s != last_time_s && last_time_s != 0) {
         // Output FPS
-        if (show_fps) {
+        if (scene->show_fps) {
             double percent = 100-(double)((double)sleep_time / (double)target_frame_time_us)*100;
             printf("FPS: %d, micro second sleep per frame: %ld, CPU: %.1f%%\n", frame_count, sleep_time, percent);
         }
@@ -398,6 +399,17 @@ long calculate_fps(const uint16_t target_fps, const bool show_fps) {
     last_time_s = current_time_s;
 
     clock_gettime(CLOCK_MONOTONIC, &last_time);
+    if (scene->auto_fps) {
+        long single_time = 1000000 / scene->fps;
+        float percent = 100.0f - (float)sleep_time / (float)single_time * 100.0f;
+        if (percent < 94.0f && scene->fps < 240) {
+            scene->fps++;
+        }
+        else if (percent > 97.0f) {
+            scene->fps--;
+        }
+    }
+
     return sleep_time;
 }
 
@@ -827,15 +839,9 @@ char *get_nth_token(const char *str, char delimiter, int position) {
 }
 
 /**
- * @brief create a default scene setup using the #DEFINE values
- * parse command line options to override. This is a great way
- * to test your setup easily from command line
- * 
- * @param argc 
- * @param argv 
- * @return scene_info* 
+ * @brief creae a new scene with default values
  */
-scene_info *default_scene(int argc, char **argv) {
+scene_info *new_scene() {
     // setup all scene configuration info
     scene_info *scene = (scene_info*)malloc(sizeof(scene_info));
     memset(scene, 0, sizeof(scene_info));
@@ -845,7 +851,7 @@ scene_info *default_scene(int argc, char **argv) {
     scene->panel_width = PANEL_WIDTH;
     scene->num_chains = 0;
     scene->num_ports = 0;
-    scene->buffer_ptr = 0;
+    // scene->buffer_ptr = 0;
     scene->stride = 3;
     scene->gamma = GAMMA;
     scene->red_gamma = RED_GAMMA_SCALE;
@@ -859,7 +865,6 @@ scene_info *default_scene(int argc, char **argv) {
     scene->bit_depth = 64;
     scene->pixel_order = PIXEL_ORDER_RGB;
     scene->panel_order = PANEL_RGB;
-    scene->bcm_mapper = map_byte_image_to_bcm;
     scene->tone_mapper = copy_tone_mapperF;
     scene->brightness = 200;
     scene->motion_blur_frames = 0;
@@ -871,15 +876,26 @@ scene_info *default_scene(int argc, char **argv) {
     scene->frame_index = 0;
     scene->auto_fps = true;
 
-    /*
-    scene->red_scale   = (float*)malloc(32 * sizeof(float));
-    scene->green_scale = (float*)malloc(32 * sizeof(float));
-    scene->blue_scale  = (float*)malloc(32 * sizeof(float));
-    */
-
     // default to 60 fps
     scene->fps = 60;
     scene->show_fps = FALSE;
+
+    return scene;
+}
+
+/**
+ * @brief create a default scene setup using the #DEFINE values
+ * parse command line options to override. This is a great way
+ * to test your setup easily from command line
+ * 
+ * @param argc 
+ * @param argv 
+ * @return scene_info* 
+ */
+scene_info *default_scene(int argc, char **argv) {
+
+    // initialize the new scene
+    scene_info *scene = new_scene();
 
     // print usage if no arguments
     if (argc < 2) { 
@@ -1077,13 +1093,6 @@ scene_info *default_scene(int argc, char **argv) {
         exit(1);
     }
 
-    // create 
-    size_t buffer_size = (scene->width + 1) * (scene->height + 1) * 3 * scene->bit_depth;
-    // force the buffers to be 16 byte aligned to improve auto vectorization
-    scene->bcm_signalA = aligned_alloc(16, buffer_size * 4);
-    scene->bcm_signalB = aligned_alloc(16, buffer_size * 4);
-    scene->image = aligned_alloc(16, scene->width * scene->height * 4); // make sure we always have enough for RGBA
-
     return scene;
 }
 
@@ -1277,7 +1286,7 @@ void* receive_udp_data(void *arg) {
         memcpy(image_data + ((frame_num * max_frame_sz) + frame_off), packet.data, PACKET_SIZE - 10);
         if (packet_id == total_packets) {
             // map to pwm data
-            scene->bcm_mapper(scene, image_data + (frame_num * max_frame_sz));
+            map_byte_image_to_bcm(scene, image_data + (frame_num * max_frame_sz));
         }
 
     }

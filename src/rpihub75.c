@@ -47,6 +47,8 @@
 #include "util.h"
 
 
+
+
 /**
  * @brief calculate an address line pin mask for row y
  * not used outside this file
@@ -78,8 +80,8 @@ uint32_t row_to_address(const int y, uint8_t half_height) {
  * will die() if invalid configuration is found
  * @param scene 
  */
-void check_scene(const scene_info *scene) {
-    printf("ports: %d, chains: %d, width: %d, height: %d, stride: %d, bit_depth: %d\n", 
+void check_scene(scene_info *scene) {
+    debug("ports: %d, chains: %d, width: %d, height: %d, stride: %d, bit_depth: %d\n", 
         scene->num_ports, scene->num_chains, scene->width, scene->height, scene->stride, scene->bit_depth);
     if (CONSOLE_DEBUG) {
         printf("ports: %d, chains: %d, width: %d, height: %d, stride: %d, bit_depth: %d\n", 
@@ -128,6 +130,18 @@ void check_scene(const scene_info *scene) {
             "least common denominator of %d\n", 
             scene->bit_depth, scene->bit_depth, BIT_DEPTH_ALIGNMENT);
     }
+
+    // create  buffers
+    const size_t buffer_size = (scene->width + 1) * (scene->height + 1) * 3 * scene->bit_depth;
+    scene->bcm_frame_size = buffer_size;
+
+    // force the buffers to be 16 byte aligned to improve auto vectorization
+    scene->bcm_signalA = aligned_alloc(16, buffer_size * 4);
+    scene->bcm_signalB = aligned_alloc(16, buffer_size * 4);
+    scene->bcm_buffers = aligned_alloc(16, buffer_size * 4 * BCM_BUFFERS);
+    scene->image = aligned_alloc(16, scene->width * scene->height * 4); // make sure we always have enough for RGBA
+
+
 }
 
 /**
@@ -213,8 +227,6 @@ uint8_t *flip_mapper(uint8_t *__restrict image,
         }
         return image_out;
     }
-
-    printf("nom flip\n");
 
     return image_out ? image_out : image;
 }
@@ -576,7 +588,7 @@ static void enable_rt_and_lock_mem(void) {
 
 
     if (sched_setscheduler(0, SCHED_FIFO, &sp) != 0) {
-        fprintf(stderr, " * Try running as root to enable real-time scheduling\n");
+        debug(" * Try running as root to enable real-time scheduling\n");
     } else {
         debug(" * Real-time scheduling enabled\n");
     }
@@ -588,6 +600,36 @@ static void enable_rt_and_lock_mem(void) {
     }
 }
 
+
+
+/**
+ * @brief this thread maps frame linear RGB or RGBA frame data from the GPU into the common BCM buffers
+ */
+void *mapper_thread_main(void *arg) {
+    debug("BCM mapper thread started\n");
+    mapper_ctx_t *ctx = (mapper_ctx_t*)arg;
+    while(ctx->run) {
+        uint8_t *pixels = (uint8_t*)spsc_pop(ctx->q_filled);
+        if (!pixels) {
+            sched_yield();
+            continue;
+        }
+        unsigned old = atomic_load_explicit(&ctx->scene->frame_ready, memory_order_relaxed);
+        atomic_store_explicit(&ctx->scene->frame_ready, old | 1u, memory_order_relaxed);
+
+        ctx->scene->bcm_mapper(ctx->scene, pixels);
+
+
+	// publish: bump seq to next even with release
+        atomic_store_explicit(&ctx->scene->frame_ready, (old + 2u) & ~1u, memory_order_release);
+
+	//ctx->secen->frame_swap = true;
+        if (ctx->q_free) {
+            (void)spsc_try_push(ctx->q_free, pixels);
+        }
+    }
+    return NULL;
+}
 
 /**
  * @brief you can cause render_forever to exit by updating the value of do_render pointer
@@ -750,13 +792,18 @@ void render_forever(const scene_info *scene) {
 
 
             }
+        unsigned v = atomic_load_explicit(&scene->bcm_frame, memory_order_relaxed);
+        const uint32_t index_offset = ((v-1) % BCM_BUFFERS) * scene->bcm_frame_size;
+        bcm_signal = scene->bcm_buffers[index_offset];
         }
-	// swap the buffer when it changes
-	unsigned before = atomic_load_explicit(&scene->frame_ready, memory_order_acquire);
-	if (!(before & 1u)) {
-		last_pointer = scene->bcm_ptr;
-		bcm_signal = (last_pointer) ? scene->bcm_signalB : scene->bcm_signalA;
-	}
+        // swap the buffer when it changes
+        /*
+        unsigned before = atomic_load_explicit(&scene->frame_ready, memory_order_acquire);
+        if (!(before & 1u)) {
+            last_pointer = scene->bcm_ptr;
+            bcm_signal = (last_pointer) ? scene->bcm_signalB : scene->bcm_signalA;
+        }
+        */
         if (frame_count % 128 == 0) {
             time_t current_time_s = time(NULL);
             if (UNLIKELY(current_time_s >= last_time_s + 5)) {

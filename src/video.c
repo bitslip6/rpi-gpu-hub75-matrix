@@ -39,7 +39,7 @@ void* render_video_fn(void *arg) {
 bool hub_render_video(scene_info *scene, const char *filename) {
     AVFormatContext *format_ctx = NULL;
     AVCodecContext  *codec_ctx  = NULL;
-    AVCodec   *codec      = NULL;
+    const AVCodec   *codec      = NULL;
     AVFrame *frame = NULL, *frame_rgb = NULL;
     AVPacket *packet = NULL;
     struct SwsContext *sws_ctx = NULL;
@@ -117,7 +117,8 @@ bool hub_render_video(scene_info *scene, const char *filename) {
                 // optional: show fps
                 AVRational fr = format_ctx->streams[video_stream_index]->avg_frame_rate;
                 float fps = (float)av_q2d(fr);
-                calculate_fps(fps > 1e-3f ? fps : 30.0f, scene->show_fps);
+                printf("read FPS: %.2f\n", fps);
+                calculate_fps(scene);
             }
         }
         av_packet_unref(packet); // NOTE: packet (not &packet)

@@ -7,11 +7,17 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <stdatomic.h>
 
+#ifdef RENDER_USE_PBO
+#include <GLES3/gl3.h>
+#endif
+#include "spsc.h"
 
-#ifndef _GPIO_H
-#define _GPIO_H 1
+
+#ifndef _RPIHUB75_H
+#define _RPIHUB75_H 1
 
 #define LIKELY(x)   __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
@@ -78,6 +84,9 @@
 // we don't want to make this too large, as it will consume memory
 // and decrease L1-L3 cache locality of other data
 #define JITTER_SIZE 65521 
+
+// number of bcm buffers to allocate
+#define BCM_BUFFERS 3 
 
 #define JITTER_MAX_RUN_LEN 4
 #define JITTER_PASSES 3
@@ -239,6 +248,7 @@
 #define ADDRESS_COLOR_MASK (0 | 1 << ADDRESS_P0_B1 | 1 << ADDRESS_P0_B2 | 1 << ADDRESS_P0_G1 | 1 << ADDRESS_P0_G2 | 1 << ADDRESS_P0_R1 | 1 << ADDRESS_P0_R2)
 
 
+
 /**
  * @brief just a float, should be normalized to 0-1
  */
@@ -330,11 +340,47 @@ typedef enum {
 } panel_order_t;
 
 
+typedef struct {
+    spsc_frame_ring ring;
+    // 4 frames of width*height*bitdepth bytes 
+    uint8_t *storage;
+} frame_ctx;
+
 // self referencing function pointers need this defined first
-struct scene_info;
+typedef struct scene_info scene_info;
+
+
+
+// --------- jobs handed from render -> mapper ---------
+typedef enum { JOB_CPU_PIXELS = 1, JOB_PBO, JOB_QUIT = 255 } job_kind_t;
+
+typedef struct {
+    job_kind_t kind;
+    scene_info *scene;
+    size_t size_bytes;
+    union {
+        struct { uint8_t *pixels; } cpu;
+#ifdef RENDER_USE_PBO
+        struct { GLuint pbo; GLsync fence; } pbo;
+#endif
+    } u;
+} map_job_t;
+
+// mapper thread state
+typedef struct {
+    spsc_ring_t *q_in;
+    spsc_ring_t *q_filled;
+    spsc_ring_t *q_free;
+    scene_info *scene;
+    volatile int run;
+} mapper_ctx_t;
+
+
+
+
 
 // void map_byte_image_to_pwm(uint8_t *image, const scene_info *scene, uint8_t fps_sync) {
-typedef void (*func_bcm_mapper_t)(struct scene_info *scene, uint8_t *image);
+// typedef void (*func_bcm_mapper_t)(struct scene_info *scene, uint8_t *image);
 typedef void (*func_tone_mapper_t)(const RGBF *in, RGBF *out, const float level);
 typedef uint8_t *(*func_image_mapper_t)( uint8_t *image_in, uint8_t *image_out, const struct scene_info *scene);
 typedef uint8_t *(image_mapper_t)(uint8_t *image_in, uint8_t *image_out, const struct scene_info *scene);
@@ -410,30 +456,34 @@ typedef struct scene_info {
      * in update code use this to select the pwm buffer to render to: 
      * (scene->buffer_ptr == 1)? scene->bcm_signalA : scene->bcm_signalB; 
      */
-    uint8_t buffer_ptr;
+    //uint8_t buffer_ptr;
 
     /** * @brief see buffer_ptr for usage */
+    /*
     uint32_t *restrict bcm_signalA __attribute__((aligned(16)));
     uint32_t *restrict bcm_signalB __attribute__((aligned(16)));
+    */
 
-    atomic_bool bcm_ptr;
+    // storage for our spsc ring buffers
+    uint32_t *restrict bcm_buffers __attribute__((aligned(16)));
+
+    // size of a single bcm frame buffer
+    size_t bcm_frame_size;
+
+    //atomic_bool bcm_ptr;
+    //atomic_uint bcm_frame;
 
     //atomic_bool frame_swap;
-    _Atomic(unsigned) frame_ready;
+    //_Atomic(unsigned) frame_ready;
+
+    spsc_frame_ring dst_ctx;
+    mapper_ctx_t src_ctx;
 
     /** * @brief see buffer_ptr for usage */
-    //uint8_t *image __attribute__((aligned(16)));
     uint8_t *image;
 
     /** @brief a shader file to render on the GPU */
     char *shader_file;
-
-    /** 
-     * @brief the pwm mapping function to use
-     * @see map_byte_image_to_pwm
-     * @see map_byte_image_to_pwm_dithered
-     */
-    func_bcm_mapper_t bcm_mapper;
 
 	/** 
      * @brief the tone mapping function to use, if null no tone mapping applied
@@ -494,6 +544,7 @@ typedef struct scene_info {
 
 
 
+
 /**
  * @brief map an image of RGB or RGBA pixels to a pwm signal
  * handles double buffering and tone mapping for you
@@ -538,6 +589,7 @@ uint8_t *mirror_mapper(uint8_t *image, uint8_t *image_out, const struct scene_in
 uint8_t *mirror_flip_mapper(uint8_t *image, uint8_t *image_out, const struct scene_info *scene);
 
 
+void *mapper_thread_main(void *arg);
 
 void *render_shader(void *arg);
 void dither_image(uint8_t *image, int width, int height);
@@ -548,7 +600,7 @@ void apply_noise_dithering(uint8_t *image, int width, int height);
  * will die() if invalid configuration is found
  * @param scene 
  */
-void check_scene(const scene_info *scene);
+pthread_t start_scene(scene_info *scene);
 
 
 uint8_t *u_mapper_impl(uint8_t *image_in, uint8_t *image_out, const struct scene_info *scene);
@@ -559,6 +611,6 @@ uint8_t *flip_mapper_impl(const uint8_t *image_in, uint8_t *image_out, const str
  * 
  * @param scene 
  */
-void render_forever(const scene_info *scene);
+void* render_forever(void *arg);
 
 #endif

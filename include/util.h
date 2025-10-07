@@ -107,12 +107,12 @@ int rnd(unsigned char *buffer, const size_t size);
 /**
  * @brief count number of times this function is called, 1 every second output
  * the number of times called and reset the counter. This function can not
- * be called from multiple locations. It is not thread safe.
+ * be called from multiple locations. Not thread safe. Call from main drawing code
  * 
- * @param target_fps - target a sleep time to achieve this fps
+ * @param scene - compute frame rate, and adjust as necessary if auto_fps is true
  * @return long - returns sleep time in microseconds
  */
-long calculate_fps(const uint16_t target_fps, const bool show_fps);
+long calculate_fps(scene_info *scene);
 
 /**
  * @brief map the gpio pins to memory

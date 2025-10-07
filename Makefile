@@ -103,6 +103,7 @@ install: all
 	cp include/gpu.h $(INCLUDEDIR)
 	cp include/pixels.h $(INCLUDEDIR)
 	cp include/video.h $(INCLUDEDIR)
+	cp include/spsc.h $(INCLUDEDIR)
 	# Copy libraries
 	cp $(LIB_NO_GPU) $(LIB_GPU) $(LIBDIR)
 	ldconfig

@@ -15,6 +15,7 @@
 #include <math.h>
 #include <string.h>
 #include <assert.h>
+#include <sched.h>
 
 
 #include "rpihub75.h"
@@ -681,23 +682,11 @@ void update_bcm_signal_64_rgb(
 
     static int32_t *accum = NULL;
     static int32_t cached_w = -1, cached_h = -1, cached_stride = -1;
-    //static int32_t panel_stride = 0;
-    //static uint32_t p0t = 0, p0b = 0, p1t = 0, p1b = 0, p2t = 0, p2b = 0;
-    //const uint64_t *bits = (const uint64_t*)void_bits;
 
     if (UNLIKELY(scene->width != cached_w || scene->panel_height != cached_h || scene->stride != cached_stride)) {
         cached_w = scene->width;
         cached_h = scene->panel_height;
         cached_stride = scene->stride;
-        /*
-        panel_stride = scene->width * (scene->panel_height / 2) * scene->stride;
-        p0t = 0;
-        p0b = p0t + panel_stride;
-        p1t = p0b + panel_stride;
-        p1b = p1t + panel_stride;
-        p2t = p1b + panel_stride;
-        p2b = p2t + panel_stride;
-        */
         if (accum != NULL) {
             free(accum);
         }
@@ -1215,10 +1204,14 @@ void map_byte_image_to_bcm(scene_info *scene, uint8_t *image) {
     ASSERT(half_height % 16 == 0);
     ASSERT(width % 32 == 0);                        // Ensure length is a multiple of 32
 
-    // which buffer we are rendering to
-    uint32_t *bcm_signal = (scene->bcm_ptr)
-        ? (scene->bcm_signalA)
-        : (scene->bcm_signalB);
+
+    // try and acquire a buffer to render to
+    void *frame_pointer = NULL;
+    while(!spsc_frame_try_acquire(&scene->dst_ctx, &frame_pointer)) {
+        // wait until we get one...
+        sched_yield();
+    }
+    uint32_t *bcm_signal = (uint32_t *)frame_pointer;
 
     // convenience variables
     const uint16_t stride     = scene->stride;
@@ -1238,9 +1231,10 @@ void map_byte_image_to_bcm(scene_info *scene, uint8_t *image) {
         }
     }
 
-    // flip the double buffer. render_forever will detect this on next vsync and switch the buffers
-    scene->bcm_ptr = !scene->bcm_ptr;
     scene->frame_index++;
+
+    // publish the frame we just rendered to the display thread
+    spsc_frame_produce(&scene->dst_ctx);
 }
 
 
