@@ -1,18 +1,22 @@
-#include <stdio.h>
 #include <termios.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <fcntl.h>
 #include <stdlib.h>
-#include <time.h>
 #include <string.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <math.h>
 #include <ctype.h>
+#include <stdio.h>
 #include <sys/mman.h>
 #include <sys/param.h>
 #include <netinet/in.h>
+
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC			1
+#endif
+
 
 #include "util.h"
 #include "rpihub75.h"
@@ -194,11 +198,6 @@ int rnd(unsigned char *buffer, const size_t size) {
 }
 
 
-
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-#include <linux/time.h>
 
 /* rnd(void *buf, size_t n) must fill buf with cryptographic random bytes from /dev/urandom */
 
