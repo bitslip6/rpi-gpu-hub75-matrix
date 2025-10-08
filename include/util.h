@@ -187,4 +187,12 @@ void* receive_udp_data(void *arg);
  */
 bool has_extension(const char *filename, const char *extension);
 
+/**
+ * @brief get the cpu model (3,4,5)
+ * will die with error message if unsupported chip is found
+ * 
+ * @return int 0 = unsupported, 3 = pi3, 4 = pi4, 5 =
+ */
+int get_cpu_model();
+
 #endif

@@ -1,6 +1,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifndef _SPSC_H
 #define _SPSC_H 1
@@ -121,13 +122,13 @@ static inline bool spsc_frame_peek_offset(spsc_frame_ring *r, size_t *out_off) {
 }
 
 // helpers to query pending depth, and whether a newer frame exists
-static inline unsigned spsc_frame_pending(const spsc_frame_ring *r) {
+static inline unsigned spsc_frame_pending(spsc_frame_ring *r) {
     unsigned head = atomic_load_explicit(&r->head, memory_order_acquire);
     unsigned tail = atomic_load_explicit(&r->tail, memory_order_relaxed);
     return (head - tail) & (unsigned)r->mask;   // 0..mask
 }
 
-static inline bool spsc_frame_has_newer(const spsc_frame_ring *r) {
+static inline bool spsc_frame_has_newer(spsc_frame_ring *r) {
     // >= 2 means one frame is active at tail, and at least one newer frame after it
     return spsc_frame_pending(r) >= 2u;
 }

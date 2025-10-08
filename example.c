@@ -126,6 +126,12 @@ int main(int argc, char **argv)
     // Wait for the rendering thread to complete or for shutdown signal
     printf("Press Ctrl-C to exit gracefully...\n");
     pthread_join(update_thread, NULL);
+    printf("joined thread\n");
+
+    // wait...
+    while(scene->do_render) {
+        usleep(100000);
+    }
     
     printf("Program terminated successfully.\n");
     return 0;

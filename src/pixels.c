@@ -774,6 +774,7 @@ void update_bcm_signal_64_rgb(
 
     const uint8_t *restrict remap = get_idx_remap(scene->panel_order);
 
+    //memset(bcm_signal, 0, sizeof(uint32_t) * bit_depth);
 
     // unroll by 2 to cut loop overhead, requires bit_depth even, which it is
     #pragma GCC ivdep
@@ -1090,7 +1091,7 @@ static inline void copy_rect_rgb(const uint8_t *pixels, uint8_t *mapped_pixels,
 }
 
 
-static inline void apply_panel_brightness_q8(uint8_t * pixels, uint8_t *mapped_pixels, scene_info *scene) {
+static inline void apply_panel_brightness_q8(uint8_t * pixels, uint8_t *mapped_pixels, const scene_info *scene) {
     for (int py = 0; py < scene->num_ports; ++py) {
         for (int px = 0; px < scene->num_chains; ++px) {
             const int idx = py * scene->num_chains + px;
@@ -1128,6 +1129,30 @@ static inline void apply_panel_brightness_q8(uint8_t * pixels, uint8_t *mapped_p
 }
 
 
+void remap_interleaved_to_plane_major(const scene_info *scene,
+                                      const uint32_t *restrict src,
+                                      uint32_t *restrict dst,
+                                    const size_t dst_bytes)
+{
+    const unsigned bit_planes   = scene->bit_depth;
+    const size_t   half_height  = (size_t)scene->panel_height / 2;   /* or scene->half_height */
+    const size_t   pixels       = (size_t)scene->width * half_height;
+    const size_t   plane_stride = pixels;
+
+    /* if the interleaved blocks include padding, keep +1, else set to bit_planes */
+    const size_t   stride_words = (size_t)bit_planes + 1;
+
+    assert(src != NULL && dst != NULL);
+
+    for (size_t p = 0; p < pixels; ++p) {
+        const uint32_t *block = src + p * stride_words;   /* block[0..bit_planes-1] are planes */
+        for (unsigned b = 0; b < bit_planes; ++b) {
+            const uint32_t sval = block[b];
+            const uint32_t dst_off = b * plane_stride + p;
+            dst[dst_off] = sval;
+        }
+    }
+}
 
 /**
  * @brief this function takes the image data and maps it to the bcm signal.
@@ -1138,7 +1163,7 @@ static inline void apply_panel_brightness_q8(uint8_t * pixels, uint8_t *mapped_p
  * @param image the image to map to the scene bcm data. if NULL scene->image will be used
  */
 __attribute__((hot))
-void map_byte_image_to_bcm(scene_info *scene, uint8_t *image) {
+void map_byte_image_to_bcm(const scene_info *scene, uint8_t *image) {
 
     // tone map the bits for the current scene, update if the lookup table if scene tone mapping changes....
     // TODO: create per panel tone mapping tables if panels have different characteristics
@@ -1146,6 +1171,7 @@ void map_byte_image_to_bcm(scene_info *scene, uint8_t *image) {
     static uint16_t *quant_errors = NULL;
     static uint8_t  *mapped_image = NULL;
     static uint8_t  *mapped_image2 = NULL;
+    static uint32_t *tmp_bcm = NULL;
     static uint8_t  phase = 1;
     phase = phase + 1 % 64;
 
@@ -1154,7 +1180,10 @@ void map_byte_image_to_bcm(scene_info *scene, uint8_t *image) {
             mapped_image = (uint8_t*)calloc(scene->width * scene->height * scene->stride, sizeof(uint8_t));
         }
         if (mapped_image2 == NULL) {
-            mapped_image2 = (uint8_t*)calloc(scene->width * scene->height * scene->stride, sizeof(uint8_t));
+            mapped_image2 = (uint8_t*)calloc(scene->width * (scene->height +1)* scene->stride, sizeof(uint8_t));
+        }
+        if (tmp_bcm == NULL) {
+            tmp_bcm = (uint32_t*)calloc(scene->width * scene->height * scene->stride * scene->bit_depth, sizeof(uint8_t));
         }
         if (quant_errors == NULL) {
             quant_errors = (uint16_t*)calloc(768*2, sizeof(uint16_t));
@@ -1206,8 +1235,9 @@ void map_byte_image_to_bcm(scene_info *scene, uint8_t *image) {
 
 
     // try and acquire a buffer to render to
+    scene_info *mutable_scene = (scene_info *)scene;
     void *frame_pointer = NULL;
-    while(!spsc_frame_try_acquire(&scene->dst_ctx, &frame_pointer)) {
+    while(!spsc_frame_try_acquire(&mutable_scene->dst_ctx, &frame_pointer)) {
         // wait until we get one...
         sched_yield();
     }
@@ -1219,22 +1249,27 @@ void map_byte_image_to_bcm(scene_info *scene, uint8_t *image) {
 
     // we only need to process half the height of the first panel, since we are clocking in
     // 2 rows at a time (upper and lower) aand 3 ports at a time
+    uint32_t *tmp_dst_ptr = tmp_bcm;
     for (uint16_t y=0; y < half_height; y ++) {
         for (uint16_t x=0; x < width; x++) {
 
             // create the bcm signal for the current pixel, 
             // writes bit_depth *(sizeof(uint32_t)) bytes to bcm_signal
-            update_bcm_signal_64_rgb(scene, bits, bcm_signal, image_ptr, quant_errors, phase);
+            //update_bcm_signal_64_rgb(scene, bits, bcm_signal, image_ptr, quant_errors, phase);
+            update_bcm_signal_64_rgb(scene, bits, tmp_dst_ptr, image_ptr, quant_errors, phase);
 
-            bcm_signal += bit_depth + 1;
+            //bcm_signal += bit_depth + 1;
+            tmp_dst_ptr += bit_depth + 1;
             image_ptr += stride;
         }
     }
 
-    scene->frame_index++;
+    const size_t max_size = scene->width * half_height * bit_depth;
 
+    remap_interleaved_to_plane_major(scene, (const uint32_t *)tmp_bcm, bcm_signal, max_size);
+    //spsc_frame_ring *dst = &mutable_scene->dst_ctx;
     // publish the frame we just rendered to the display thread
-    spsc_frame_produce(&scene->dst_ctx);
+    spsc_frame_produce(&mutable_scene->dst_ctx);
 }
 
 

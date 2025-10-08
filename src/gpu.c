@@ -240,6 +240,8 @@ void *render_shader(void *arg) {
     scene_info *scene = (scene_info*)arg;
     debug("render shader starting %s, %dx%d depth: %d\n", scene->shader_file, scene->width, scene->height, scene->bit_depth);
 
+    cpu_set_affinity(1); // run this thread on CPU 2
+
     // DRM / GBM
     int fd = open("/dev/dri/card0", O_RDWR);
     if (fd < 0) die("Failed to open DRM device /dev/dri/card0\n");
@@ -273,6 +275,8 @@ void *render_shader(void *arg) {
     // program and quad
     GLuint program = create_shadertoy_program(scene->shader_file);
     glUseProgram(program);
+
+    debug(" + shader program %d compiles\n", program);
 
     static const GLfloat verts[] = {
         -1.f,  1.f, 0.f,   -1.f, -1.f, 0.f,
@@ -313,6 +317,7 @@ void *render_shader(void *arg) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
+    debug(" + textures loaded\n", program);
 
     // uniforms
     GLint time_loc  = glGetUniformLocation(program, "iTime");
@@ -330,6 +335,7 @@ void *render_shader(void *arg) {
     glDisable(GL_DITHER);
     glDisable(GL_BLEND);
     glViewport(0, 0, scene->width, scene->height);
+    debug(" + uniforms loaded\n", program);
 
     // timing
     struct timespec start_time, end_time, orig_time;
@@ -344,6 +350,7 @@ void *render_shader(void *arg) {
     void *ring_filled_storage[RING_SIZE];
     spsc_ring_t ring_filled;
     spsc_init(&ring_filled, ring_filled_storage, RING_SIZE);
+    debug(" + ring buffer created\n", program);
 
 #if RENDER_USE_PBO
     // triple PBOs
@@ -374,15 +381,18 @@ void *render_shader(void *arg) {
     spsc_init(&ring_free, ring_free_storage, CPU_POOL);
     for (int i = 0; i < CPU_POOL; ++i) (void)spsc_push(&ring_free, cpu_pool[i]);
 
-    scene->src_ctx.q_filled = &ring_filled;
-    scene->src_ctx.q_free = &ring_free;
-    scene->src_ctx.scene = scene;
-    scene->src_ctx.run = 1;
+    mapper_ctx_t *src = &scene->src_ctx;
+    src->q_filled = &ring_filled;
+    src->q_free = &ring_free;
+    src->scene = scene;
+    src->run = 1;
+    debug(" + PBO created\n", program);
 #else
-    scene->src_ctx.q_filled = &ring_filled;
-    scene->src_ctx.q_free = NULL;
-    scene->src_ctx.scene = scene;
-    scene->src_ctx.run = 1;
+    src->q_filled = &ring_filled;
+    src->q_free = NULL;
+    src->scene = scene;
+    src->run = 1;
+    debug(" + System Buffers created\n", program);
 #endif
 
     pthread_t mapper_th;
@@ -390,8 +400,10 @@ void *render_shader(void *arg) {
         die("failed to start mapper thread\n");
     }
 
+    debug(" + Mpping thread created\n", program);
     int slot = 0;
 
+    printf("running GPU shader\n");
     // main loop
     while (scene->do_render) {
         frame++;
@@ -465,6 +477,7 @@ void *render_shader(void *arg) {
         (void)calculate_fps(scene);
         
     }
+    printf("GPU shader complete\n");
 
     // stop mapper and join
     scene->src_ctx.run = 0;

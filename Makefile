@@ -1,12 +1,15 @@
 CFLAGS_BASE := -O3 -g -pipe -fno-math-errno -ffast-math
+#CFLAGS_BASE := -O2 -g -pipe 
 CFLAGS_CPU  ?= $(shell sh detect_flags.sh)
 CFLAGS      := $(CFLAGS_BASE) $(CFLAGS_CPU)
+
 
 # Compiler and flags
 CC = gcc
 #CFLAGS = -DNDEBUG=1 -std=gnu2x -fPIC -ffast-math -fopt-info-vec -funroll-loops -ftree-vectorize -mtune=native -O3 -Wall -Wpedantic -Wdouble-promotion -Iinclude
-CFLAGS = -DNDEBUG=1 -std=gnu2x -fPIC -funroll-loops -ftree-vectorize -Wall -Wpedantic -Iinclude
-LDFLAGS = -lpthread -lrt -lm -lc -lavformat -lavcodec -lswscale -lavutil
+CFLAGS = -DNDEBUG=1 -std=gnu2x -fPIC -funroll-loops -ftree-vectorize -Wall -Wpedantic -Iinclude 
+#CFLAGS = -DNDEBUG=1 -std=gnu2x -fPIC -funroll-loops -ftree-vectorize -Wall -Wpedantic -Iinclude -fno-omit-frame-pointer -fsanitize=address,undefined,leak -fno-common -U_FORTIFY_SOURCE
+LDFLAGS = -lpthread -lrt -lm -lc -lavformat -lavcodec -lswscale -lavutil 
 CFLAGS += $(DEF)
 CFLAGS += $(CFLAGS_BASE)
 CFLAGS += `pkg-config --cflags libavcodec` 

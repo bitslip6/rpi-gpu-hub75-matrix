@@ -45,6 +45,7 @@
 
 #include "rpihub75.h"
 #include "util.h"
+#include "pixels.h"
 
 
 
@@ -80,7 +81,7 @@ uint32_t row_to_address(const int y, uint8_t half_height) {
  * will die() if invalid configuration is found
  * @param scene 
  */
-void check_scene(scene_info *scene) {
+void start_scene(scene_info *scene) {
     debug("ports: %d, chains: %d, width: %d, height: %d, stride: %d, bit_depth: %d\n", 
         scene->num_ports, scene->num_chains, scene->width, scene->height, scene->stride, scene->bit_depth);
     if (CONSOLE_DEBUG) {
@@ -99,20 +100,8 @@ void check_scene(scene_info *scene) {
     if (scene->num_chains > 16) {
         die("max 16 panels supported on each chain\n");
     }
-    if (scene->bcm_mapper == NULL) {
-        die("A bcm mapping function is required\n");
-    }
     if (scene->stride != 3 && scene->stride != 4) { 
         die("Only 3 or 4 byte stride supported\n");
-    }
-    if (scene->bcm_signalA == NULL) {
-        die("No bcm signal buffer A defined\n");
-    }
-    if (scene->bcm_signalB == NULL) {
-        die("No bcm signal buffer B defined\n");
-    }
-    if (scene->image == NULL) {
-        die("No RGB image buffer defined\n");
     }
     if (scene->bit_depth < 4 || scene->bit_depth > 64) {
         die("Only 4-64 bit depth supported\n");
@@ -120,7 +109,6 @@ void check_scene(scene_info *scene) {
     if (scene->motion_blur_frames > 32) {
         die("Max motion blur frames is 32\n");
     }
-
     if (scene->brightness > 254) {
         die("Max brightness is 254\n");
     }
@@ -136,12 +124,33 @@ void check_scene(scene_info *scene) {
     scene->bcm_frame_size = buffer_size;
 
     // force the buffers to be 16 byte aligned to improve auto vectorization
-    scene->bcm_signalA = aligned_alloc(16, buffer_size * 4);
-    scene->bcm_signalB = aligned_alloc(16, buffer_size * 4);
     scene->bcm_buffers = aligned_alloc(16, buffer_size * 4 * BCM_BUFFERS);
     scene->image = aligned_alloc(16, scene->width * scene->height * 4); // make sure we always have enough for RGBA
 
+    // ------------------------------------------------------------------
+    // Initialize SPSC frame ring (dst_ctx) used between mapper (producer)
+    // and render_forever() (consumer). The ring capacity MUST be a power
+    // of two. BCM_BUFFERS is 3 (not a power of two) so we pick 4 here.
+    // We over-allocated above ( * 4 * BCM_BUFFERS ) so we have plenty.
+    // ------------------------------------------------------------------
+    const size_t frame_ring_capacity = 4; // power-of-two
+    if (!spsc_frame_init(&scene->dst_ctx,
+                         scene->bcm_buffers,           // base pointer
+                         frame_ring_capacity,
+                         scene->bcm_frame_size)) {
+        die("Failed to init dst_ctx frame ring (capacity=%zu)\n", frame_ring_capacity);
+    }
+    debug("dst_ctx initialized: capacity=%zu frame_size=%zu bytes\n",
+          frame_ring_capacity, scene->bcm_frame_size);
 
+    // create the render thread
+    /*
+    pthread_t *render_thread = malloc(sizeof(pthread_t));
+    if (pthread_create(render_thread, NULL, render_forever, scene) != 0) {
+        die("Failed to create render thread\n");
+    }
+    return render_thread;
+    */
 }
 
 /**
@@ -277,7 +286,7 @@ uint8_t *mirror_mapper(uint8_t *__restrict image,
             for (size_t i = 0; i < blocks; ++i) {
                 const uint8_t *s = src_row + i * blk_bytes;
 
-                // deinterleave 16 RGB pixels
+                // deinterleave 16 RGB pixelr
                 uint8x16x3_t rgb = vld3q_u8(s);
 
                 // reverse pixel order within each channel
@@ -471,12 +480,11 @@ void render_forever_pi4(const scene_info *scene, int version) {
     const uint8_t  bit_depth __attribute__((aligned(BIT_DEPTH_ALIGNMENT))) = scene->bit_depth;
 
     // pointer to the current bcm data to be displayed
-    uint32_t *bcm_signal = scene->bcm_signalA;
+    uint32_t *bcm_signal = NULL;
     ASSERT(width % 16 == 0);
     ASSERT(half_height % 16 == 0);
     ASSERT(bit_depth % BIT_DEPTH_ALIGNMENT == 0);
 
-    bool last_pointer = scene->bcm_ptr;
 
     // create the OE jitter mask to control screen brightness
     // if we are using BCM brightness, then set OE to 0 (0 is display on ironically)
@@ -545,11 +553,6 @@ void render_forever_pi4(const scene_info *scene, int version) {
                 SLOW
             }
 
-            // swap the buffers on vsync
-            if (UNLIKELY(scene->bcm_ptr != last_pointer)) {
-                last_pointer = scene->bcm_ptr;
-                bcm_signal = (last_pointer) ? scene->bcm_signalB : scene->bcm_signalA;
-            }
         }
 
         time_t current_time_s = time(NULL);
@@ -578,25 +581,26 @@ static inline void io_store_barrier(void) {
 #endif
 }
 
-
-static void enable_rt_and_lock_mem(void) {
+void cpu_set_affinity(int cpu_id) {
     pid_t pid = getpid();
-    struct sched_param sp = { .sched_priority = 80 }; /* 1..99 */
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
-    CPU_SET(3, &cpuset);
+    CPU_SET(cpu_id, &cpuset);
+    if (sched_setaffinity(pid, sizeof(cpuset), &cpuset) != 0) {
+        die("unable to set CPU affinity\n");
+    }
+}
 
+static void cpu_rt_and_lock_mem(void) {
+    struct sched_param sp = { .sched_priority = 80 }; /* 1..99 */
 
     if (sched_setscheduler(0, SCHED_FIFO, &sp) != 0) {
         debug(" * Try running as root to enable real-time scheduling\n");
     } else {
         debug(" * Real-time scheduling enabled\n");
     }
-    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
-        die("mlockall failed\n");
-    }
-    if (sched_setaffinity(pid, sizeof(cpuset), &cpuset) != 0) {
-	    die("unable to set CPU affinity to 3\n");
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) == 0) {
+        debug(" * memory locked\n");
     }
 }
 
@@ -607,27 +611,29 @@ static void enable_rt_and_lock_mem(void) {
  */
 void *mapper_thread_main(void *arg) {
     debug("BCM mapper thread started\n");
-    mapper_ctx_t *ctx = (mapper_ctx_t*)arg;
-    while(ctx->run) {
-        uint8_t *pixels = (uint8_t*)spsc_pop(ctx->q_filled);
+    const scene_info *scene = (const scene_info*)arg;
+
+    cpu_set_affinity(2);
+
+    pthread_t render_thread;
+    if (pthread_create(&render_thread, NULL, render_forever, arg) != 0) {
+        die("Failed to create render thread\n");
+    } 
+
+    const mapper_ctx_t *src = &scene->src_ctx;
+    while(scene->do_render) {
+        uint8_t *pixels = (uint8_t*)spsc_pop(src->q_filled);
         if (!pixels) {
             sched_yield();
             continue;
         }
-        unsigned old = atomic_load_explicit(&ctx->scene->frame_ready, memory_order_relaxed);
-        atomic_store_explicit(&ctx->scene->frame_ready, old | 1u, memory_order_relaxed);
+        map_byte_image_to_bcm(scene, pixels);
 
-        ctx->scene->bcm_mapper(ctx->scene, pixels);
-
-
-	// publish: bump seq to next even with release
-        atomic_store_explicit(&ctx->scene->frame_ready, (old + 2u) & ~1u, memory_order_release);
-
-	//ctx->secen->frame_swap = true;
-        if (ctx->q_free) {
-            (void)spsc_try_push(ctx->q_free, pixels);
+        if (src->q_free) {
+            (void)spsc_try_push(src->q_free, pixels);
         }
     }
+    debug(" - mapper thread exiting\n");
     return NULL;
 }
 
@@ -637,44 +643,14 @@ void *mapper_thread_main(void *arg) {
  * scene->do_render = false; // will cause render_forever to exit from another thread
  * 
  */
-void render_forever(const scene_info *scene) {
+void* render_forever(void *arg) {
 
-        
-    enable_rt_and_lock_mem();
+    scene_info *scene = (scene_info*)arg;
+    //  
+    cpu_set_affinity(3);
+    cpu_rt_and_lock_mem();
 
-    // check the CPU model to determine which GPIO function to use
-    // note one cannot use file_get_contents as this file is zero length...
-    char *line = NULL;
-    size_t line_sz;
-    int cpu_model = 0;
-    FILE *file = fopen("/proc/cpuinfo", "rb");
-    if (file == NULL) {
-        die("Could not open file /proc/cpuinfo\n");
-    }
-    while (getline(&line, &line_sz, file)) {
-        if (strstr(line, "Pi 5") != NULL) {
-            cpu_model = 5;
-            break;
-        }
-        else if (strstr(line, "Pi 4") != NULL) {
-            cpu_model = 4;
-            break;
-        }
-	      else if (strstr(line, "Pi 3") != NULL) {
-            cpu_model = 3;
-            break;
-        } 
-	      else if (strstr(line, "Pi Zero 2") != NULL) {
-            cpu_model = 3;
-            break;
-        }
-    }
-    if (cpu_model == 0) {
-        die("Unsupported CPU model detected %s\n", line);
-    }
-    free(line);
-    fclose(file);
-
+    int cpu_model = get_cpu_model();
     debug("\ncpu_model: %d\n", cpu_model);
 
     if (cpu_model == 0) die("Only Pi5, Pi4, Pi3 and Pi Zero 2 are currently supported");
@@ -700,12 +676,11 @@ void render_forever(const scene_info *scene) {
     const uint8_t  bit_depth __attribute__((aligned(BIT_DEPTH_ALIGNMENT))) = scene->bit_depth;
 
     // pointer to the current bcm data to be displayed
-    uint32_t *bcm_signal = scene->bcm_signalA;
+    uint32_t *__restrict__ bcm_signal = NULL;
     ASSERT(width % 16 == 0);
     ASSERT(half_height % 16 == 0);
     ASSERT(bit_depth % BIT_DEPTH_ALIGNMENT == 0);
 
-    bool last_pointer = scene->bcm_ptr;
 
     // create the OE jitter mask to control screen brightness
     // if we are using BCM brightness, then set OE to 0 (0 is display on ironically)
@@ -732,157 +707,158 @@ void render_forever(const scene_info *scene) {
     volatile uint32_t * const reg_clr   = &rioCLR->Out;
     const uint32_t stride      = (uint32_t)bit_depth + 1;  /* next-pixel offset */
 
-
-
-    //const uint32_t guard_px = 4;   /* do not change OE in first/last N pixels of a row */
-
-
-    // const uint32_t js = scene->width * 32;
+    // --- SPSC frame-ring consumer bootstrap ---
+    // We treat scene as mutable for consuming from dst_ctx (tail advancement)
+    scene_info *mutable_scene = (scene_info*)scene; /* safe: render thread is the sole consumer */
+    const void *curr_frame_ptr = NULL;
+    printf("waiting for first frame...\n");
+    // Block until at least one frame has been produced by the mapper
+    while (scene->do_render && !spsc_frame_peek(&mutable_scene->dst_ctx, &curr_frame_ptr)) {
+        sched_yield();
+    }
+    if (!scene->do_render) return NULL; // early exit if render flag cleared while waiting
+    bcm_signal = (uint32_t*)curr_frame_ptr;
+    madvise((void*)bcm_signal, scene->bcm_frame_size, MADV_SEQUENTIAL);
+    printf("first frame found at [%lx]\n", bcm_signal);
 
     uint16_t phase = 1;
+    const uint16_t max_phase = JITTER_SIZE - width;;
+
+    const uint32_t plane_stride = width * half_height;
     while (scene->do_render) {
-        phase++;
+        //phase++;
+        //phase %= max_phase;
         for (uint8_t pwm = 0; pwm < bit_depth; pwm++) {
+            frame_count++;
+            const uint32_t *p  = bcm_signal + (pwm * plane_stride);
             uint32_t offset = pwm;
 
-
-            frame_count++;
             jitter_idx = phase;
             for (uint16_t y = 0; y < half_height; y++) {
 
-                /* optional: inhibit jitter on first couple of pixels to avoid latch-adjacent OE flips */
-                //uint32_t inhibit = 2; /* set 0..2 as needed */
                 const uint32_t addr_bits = addr_map[y];
-                //jitter_idx = ((y * 1315423911u) + phase) % JITTER_SIZE; // decorrelate rows
-
-
+                uint32_t *oe_ptr = jitter_mask+jitter_idx;
 
                 for (uint16_t x = 0; x < width; x++) {
-
-                    /* hard guard: data must never drive control pins */
-                    const uint32_t data = bcm_signal[offset] & MASK_DATA;
-
-                    //const int guard = (x < guard_px) || ((width - 1 - x) < guard_px);
-                    //const uint32_t oe_mask = (guard) ? 0u : jitter_mask[jitter_idx];
-                    const uint32_t oe_mask = jitter_mask[jitter_idx];
-
+                    const uint32_t data = *p++;
+                    const uint32_t oe_mask = *oe_ptr++;
 
                     /* absolute OUT twice, preserves order without fences */
                     uint32_t v = data | addr_bits | oe_mask;   /* CLK low state */
                     *reg_out = v;                 /* data + addr + oe, clk low */
                     CLK_SETUP_DELAY();
                     *reg_out = v | PIN_CLK;       /* clk high */
+               }
+
+                /* safe latch with OE asserted high and address held */
+                *reg_set = PIN_LATCH | PIN_OE;              /* latch high */
+                *reg_clr = PIN_LATCH;              /* latch low */
+            }
+            //*reg_clr = PIN_LATCH | PIN_OE | PIN_CLK;              /* latch low */
+            // End of one full frame (all bit planes). Check for newer frames.
+            if (spsc_frame_has_newer(&mutable_scene->dst_ctx)) {
+                // Release the frame we just displayed
+                spsc_frame_consume(&mutable_scene->dst_ctx);
+                // Acquire the newest available (always at tail after consume + peek loop)
+                while (scene->do_render && !spsc_frame_peek(&mutable_scene->dst_ctx, &curr_frame_ptr)) {
+                    sched_yield();
+                }
+                if (!scene->do_render) break;
+                bcm_signal = (uint32_t*)curr_frame_ptr;
+            }
+        }
+        if (frame_count % 128 == 0) {
+            time_t current_time_s = time(NULL);
+            if (UNLIKELY(current_time_s >= last_time_s + 5)) {
+
+                if (scene->show_fps) {
+                    gettimeofday(&end_time, NULL);
+                    double elapsed = (double)(end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_usec - start_time.tv_usec) * 1e-6;
+                    printf("Panel Refresh Rate (%f): %.4fHz\n", elapsed, (frame_count / elapsed));
+                    gettimeofday(&start_time, NULL);
+                }
+                frame_count = 0;
+                last_time_s = current_time_s;
+            }
+        }
+    }
+
+    die("not hit\n");
+
+
+
+
+    while (scene->do_render) {
+        //phase++;
+        //phase %= max_phase;
+        for (uint8_t pwm = 0; pwm < bit_depth; pwm++) {
+            uint32_t offset = pwm;
+            __builtin_prefetch(&bcm_signal[offset + 16], 0, 1);
+
+            frame_count++;
+            jitter_idx = phase;
+
+            for (uint16_t y = 0; y < half_height; y++) {
+
+                const uint32_t addr_bits = addr_map[y];
+
+                for (uint16_t x = 0; x < width; x++) {
+
+                    /* hard guard: data must never drive control pins */
+                    const uint32_t data = bcm_signal[offset] & MASK_DATA;
+
+                    const uint32_t oe_mask = jitter_mask[jitter_idx];
+
+                    /* absolute OUT twice, preserves order without fences */
+                    uint32_t v = data | addr_bits | oe_mask;   /* CLK low state */
+                    *reg_out = v;                 /* data + addr + oe, clk low */
                     CLK_SETUP_DELAY();
+                    *reg_out = v | PIN_CLK;       /* clk high */
 
                     /* advance after full edge */
-                    jitter_idx = (jitter_idx + 1) % JITTER_SIZE;
+                    if (++jitter_idx == JITTER_SIZE) jitter_idx = 0;
                     offset += stride;
                }
 
                 /* safe latch with OE asserted high and address held */
-                *reg_set = PIN_OE;                 /* display off */
-                io_write_barrier();
-
-                //*reg_out = addr_bits | PIN_OE;   /* make address + OE explicit on OUT bus */
-                //io_write_barrier();
-
                 *reg_set = PIN_LATCH | PIN_OE;              /* latch high */
-                io_write_barrier();
                 *reg_clr = PIN_LATCH;              /* latch low */
-
-
             }
-        unsigned v = atomic_load_explicit(&scene->bcm_frame, memory_order_relaxed);
-        const uint32_t index_offset = ((v-1) % BCM_BUFFERS) * scene->bcm_frame_size;
-        bcm_signal = scene->bcm_buffers[index_offset];
+            //*reg_clr = PIN_LATCH | PIN_OE | PIN_CLK;              /* latch low */
+            // End of one full frame (all bit planes). Check for newer frames.
+            if (spsc_frame_has_newer(&mutable_scene->dst_ctx)) {
+                // Release the frame we just displayed
+                spsc_frame_consume(&mutable_scene->dst_ctx);
+                // Acquire the newest available (always at tail after consume + peek loop)
+                while (scene->do_render && !spsc_frame_peek(&mutable_scene->dst_ctx, &curr_frame_ptr)) {
+                    sched_yield();
+                }
+                if (!scene->do_render) break;
+                bcm_signal = (uint32_t*)curr_frame_ptr;
+                madvise((void*)bcm_signal, scene->bcm_frame_size, MADV_SEQUENTIAL);
+            }
         }
-        // swap the buffer when it changes
+        // (Legacy triple-buffer swap removed; now driven solely by dst_ctx frame ring.)
         /*
-        unsigned before = atomic_load_explicit(&scene->frame_ready, memory_order_acquire);
-        if (!(before & 1u)) {
-            last_pointer = scene->bcm_ptr;
-            bcm_signal = (last_pointer) ? scene->bcm_signalB : scene->bcm_signalA;
+        if (frame_count % 128 == 0) {
+            time_t current_time_s = time(NULL);
+            if (UNLIKELY(current_time_s >= last_time_s + 5)) {
+
+                if (scene->show_fps) {
+                    gettimeofday(&end_time, NULL);
+                    double elapsed = (double)(end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_usec - start_time.tv_usec) * 1e-6;
+                    printf("Panel Refresh Rate (%f): %.4fHz\n", elapsed, (frame_count / elapsed));
+                    gettimeofday(&start_time, NULL);
+                }
+                frame_count = 0;
+                last_time_s = current_time_s;
+            }
         }
         */
-        if (frame_count % 128 == 0) {
-            time_t current_time_s = time(NULL);
-            if (UNLIKELY(current_time_s >= last_time_s + 5)) {
-
-                if (scene->show_fps) {
-                    gettimeofday(&end_time, NULL);
-                    double elapsed = (double)(end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_usec - start_time.tv_usec) * 1e-6;
-                    printf("Panel Refresh Rate (%f): %.4fHz\n", elapsed, (frame_count / elapsed));
-                    gettimeofday(&start_time, NULL);
-                }
-                frame_count = 0;
-                last_time_s = current_time_s;
-            }
-        }
     }
 
-
-
-    // uint8_t bright = scene->brightness;
-    while(scene->do_render) {
-
-        // iterate over the bit plane, It takes about 6ms to iterate over 64 bits of BCM data per panel
-        // so 3 chained panels at 64 bit depth is about 18ms or 55Hz complete refresh rate
-        // new input frame data is updated instantly, over 3,000 times per second
-        for (uint8_t pwm=0; pwm<bit_depth; pwm++) {
-            frame_count++;
-            // for the current bit plane, render the entire frame
-            uint32_t offset = pwm;
-            for (uint16_t y=0; y<half_height; y++) {
-                asm volatile ("" : : : "memory");  // Prevents optimization
-
-                // compute the bcm row start address for y
-
-                for (uint16_t x=0; x<width; x++) {
-                    asm volatile ("" : : : "memory");  // Prevents optimization
-                    
-                    uint32_t v = bcm_signal[offset] | addr_map[y] | jitter_mask[jitter_idx];
-                    io_write_barrier();
-                    rio->Out = v;                     // clk low 
-                    io_write_barrier();
-                    rio->Out = PIN_CLK;               // this will only set the pin clock, not clear any other pins
-
-                    // advance the global OE jitter mask 1 frame
-                    jitter_idx = (jitter_idx + 1) % JITTER_SIZE;
-
-                    // advance to the next pixel in the bcm signal
-                    offset += bit_depth + 1;
-                }
-                // make sure enable pin is high (display off) while we are latching data
-                // latch the data for the entire row
-                io_write_barrier();
-                rioSET->Out = PIN_OE | PIN_LATCH;
-                io_write_barrier();
-                SLOW2         // 8 asm cycles
-                rioCLR->Out = PIN_LATCH;
-            }
-
-            // swap the buffers on vsync
-            if (UNLIKELY(scene->bcm_ptr != last_pointer)) {
-                last_pointer = scene->bcm_ptr;
-                bcm_signal = (last_pointer) ? scene->bcm_signalB : scene->bcm_signalA;
-            }
-        }
-        
-        if (frame_count % 128 == 0) {
-            time_t current_time_s = time(NULL);
-            if (UNLIKELY(current_time_s >= last_time_s + 5)) {
-
-                if (scene->show_fps) {
-                    gettimeofday(&end_time, NULL);
-                    double elapsed = (double)(end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_usec - start_time.tv_usec) * 1e-6;
-                    printf("Panel Refresh Rate (%f): %.4fHz\n", elapsed, (frame_count / elapsed));
-                    gettimeofday(&start_time, NULL);
-                }
-                frame_count = 0;
-                last_time_s = current_time_s;
-            }
-        }
-    }
+    debug(" - render thread exiting\n");
+    return NULL;
 }
 
 

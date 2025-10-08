@@ -233,10 +233,10 @@ static void rotate_u32(uint32_t *a, size_t n, size_t rot) {
  *
  * brightness: 0..255, higher means brighter, so fewer PIN_OE blanks.
  *
- * Returns malloc()'d array of uint32_t, caller must free().
+ * Returns malloc()'d array of uint32_t, caller must free(). that is jitter_size * 2 * sizeof(uint32_t)bytes.
  */
 uint32_t *create_jitter_mask(const uint16_t jitter_size, const uint8_t brightness) {
-    const size_t n = (size_t)jitter_size;
+    const size_t n = (size_t)jitter_size * 2;
     uint32_t *jitter = (uint32_t*)malloc(n * sizeof(uint32_t));
     if (!jitter) return NULL;
 
@@ -1294,3 +1294,45 @@ void* receive_udp_data(void *arg) {
     close(sock);
     return NULL;
 }
+
+
+/**
+ * @brief get the cpu model from /proc/cpuinfo
+ */
+int get_cpu_model() {
+    // check the CPU model to determine which GPIO function to use
+    // note one cannot use file_get_contents as this file is zero length...
+    char *line = NULL;
+    size_t line_sz;
+    int cpu_model = 0;
+    FILE *file = fopen("/proc/cpuinfo", "rb");
+    if (file == NULL) {
+        die("Could not open file /proc/cpuinfo\n");
+    }
+    while (getline(&line, &line_sz, file)) {
+        if (strstr(line, "Pi 5") != NULL) {
+            cpu_model = 5;
+            break;
+        }
+        else if (strstr(line, "Pi 4") != NULL) {
+            cpu_model = 4;
+            break;
+        }
+	      else if (strstr(line, "Pi 3") != NULL) {
+            cpu_model = 3;
+            break;
+        } 
+	      else if (strstr(line, "Pi Zero 2") != NULL) {
+            cpu_model = 3;
+            break;
+        }
+    }
+    if (cpu_model == 0) {
+        die("Unsupported CPU model detected %s\n", line);
+    }
+    free(line);
+    fclose(file);
+
+    return cpu_model;
+}
+

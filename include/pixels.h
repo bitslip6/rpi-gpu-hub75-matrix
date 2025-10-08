@@ -80,7 +80,7 @@ void update_bcm_signal_32(
  * @param scene the scene information
  * @param image the image to map to the scene bcm data. if NULL scene->image will be used
  */
-void map_byte_image_to_bcm(scene_info *scene, uint8_t *image);
+void map_byte_image_to_bcm(const scene_info *scene, uint8_t *image);
 
 
 /**

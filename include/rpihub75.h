@@ -83,7 +83,7 @@
 // global OE jitter mask, should be a prime >1031 and <=4093
 // we don't want to make this too large, as it will consume memory
 // and decrease L1-L3 cache locality of other data
-#define JITTER_SIZE 65521 
+#define JITTER_SIZE 2048
 
 // number of bcm buffers to allocate
 #define BCM_BUFFERS 3 
@@ -600,11 +600,13 @@ void apply_noise_dithering(uint8_t *image, int width, int height);
  * will die() if invalid configuration is found
  * @param scene 
  */
-pthread_t start_scene(scene_info *scene);
+void start_scene(scene_info *scene);
 
 
 uint8_t *u_mapper_impl(uint8_t *image_in, uint8_t *image_out, const struct scene_info *scene);
 uint8_t *flip_mapper_impl(const uint8_t *image_in, uint8_t *image_out, const struct scene_info *scene);
+
+void cpu_set_affinity(int cpu_id);
 
 /**
  * @brief render the PWM signal to the GPIO pins forever...
