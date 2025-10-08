@@ -77,7 +77,7 @@ int file_put_contents(const char *filename, const void *data, const size_t size)
  * @param filesize - pointer to the size of the file. will be set after the call. ugly i know
  * @return char* - pointer to read data. NOTE: caller must free
  */
-char *file_get_contents(const char *filename, long *filesize);
+char *file_get_contents(const char *filename, size_t *filesize);
 
 /**
  * @brief print a 32 bit number in binary format to stdout

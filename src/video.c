@@ -39,7 +39,7 @@ void* render_video_fn(void *arg) {
 bool hub_render_video(scene_info *scene, const char *filename) {
     AVFormatContext *format_ctx = NULL;
     AVCodecContext  *codec_ctx  = NULL;
-    AVCodec   *codec      = NULL;
+    const AVCodec *codec  = NULL;  // const per modern FFmpeg API (av_find_best_stream expects const AVCodec**)
     AVFrame *frame = NULL, *frame_rgb = NULL;
     AVPacket *packet = NULL;
     struct SwsContext *sws_ctx = NULL;
@@ -58,7 +58,7 @@ bool hub_render_video(scene_info *scene, const char *filename) {
     if (video_stream_index < 0 || !codec) { FAIL("No video stream found"); }
 
     // codec ctx
-    codec_ctx = avcodec_alloc_context3(codec);
+    codec_ctx = avcodec_alloc_context3((const AVCodec*)codec); // cast for older headers if needed
     if (!codec_ctx) { FAIL("Failed to allocate codec context"); }
     if (avcodec_parameters_to_context(codec_ctx, format_ctx->streams[video_stream_index]->codecpar) < 0) {
         FAIL("avcodec_parameters_to_context failed");
@@ -74,11 +74,11 @@ bool hub_render_video(scene_info *scene, const char *filename) {
     if (!frame || !frame_rgb || !packet) { FAIL("Could not allocate frame/packet"); }
 
     // tightly packed RGB24 dest
-    int tight_row_bytes = scene->width * 3;
+    size_t tight_row_bytes = scene->width * 3;
     rgb_tight = av_malloc((size_t)scene->height * tight_row_bytes);
     if (!rgb_tight) { FAIL("rgb_tight alloc failed"); }
     frame_rgb->data[0] = rgb_tight;
-    frame_rgb->linesize[0] = tight_row_bytes;
+    frame_rgb->linesize[0] = (int)tight_row_bytes;
 
     // scaler
     int sws_flags = SWS_POINT; // or SWS_FAST_BILINEAR
@@ -117,7 +117,7 @@ bool hub_render_video(scene_info *scene, const char *filename) {
                 // optional: show fps
                 AVRational fr = format_ctx->streams[video_stream_index]->avg_frame_rate;
                 float fps = (float)av_q2d(fr);
-                calculate_fps(fps > 1e-3f ? fps : 30.0f, scene->show_fps);
+                calculate_fps((uint16_t)(fps > 1e-3f ? fps : 30.0f), scene->show_fps);
             }
         }
         av_packet_unref(packet); // NOTE: packet (not &packet)

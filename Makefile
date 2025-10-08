@@ -1,126 +1,211 @@
-CFLAGS_BASE := -O3 -g -pipe -fno-math-errno -ffast-math
-CFLAGS_CPU  ?= $(shell sh detect_flags.sh)
-CFLAGS      := $(CFLAGS_BASE) $(CFLAGS_CPU)
+#############################################
+# rpi-gpu-hub75 build system
+#  Features / Improvements:
+#   * Unified override-friendly flags
+#   * Automatic header dependency generation (-MMD -MP)
+#   * Separate CPU vs GPU+FFmpeg shared libs
+#   * Optional static lib (CPU subset)
+#   * pkg-config discovery for ffmpeg + GLES/GBM/EGL
+#   * Quiet vs verbose (V=1)
+#   * DESTDIR aware install/uninstall
+#   * Example app with rpath to run from build tree
+#   * Print useful variables (make print-vars)
+#############################################
 
-# Compiler and flags
-CC = gcc
-#CFLAGS = -DNDEBUG=1 -std=gnu2x -fPIC -ffast-math -fopt-info-vec -funroll-loops -ftree-vectorize -mtune=native -O3 -Wall -Wpedantic -Wdouble-promotion -Iinclude
-CFLAGS = -DNDEBUG=1 -std=gnu2x -fPIC -funroll-loops -ftree-vectorize -Wall -Wpedantic -Iinclude
-LDFLAGS = -lpthread -lrt -lm -lc -lavformat -lavcodec -lswscale -lavutil
-CFLAGS += $(DEF)
-CFLAGS += $(CFLAGS_BASE)
-CFLAGS += `pkg-config --cflags libavcodec` 
+.DEFAULT_GOAL := all
+.DELETE_ON_ERROR:
 
-# Directories
-PREFIX = /usr/local
-INCLUDEDIR = $(PREFIX)/include/rpihub75
-LIBDIR = $(PREFIX)/lib
-BUILDDIR = build
+VERSION        ?= 0.2.0
+CC             ?= gcc
+AR             ?= ar
+PKG_CONFIG     ?= pkg-config
 
-# Source files
+# CPU tuning flags auto-detected (ignore failure)
+CFLAGS_CPU     ?= $(shell sh detect_flags.sh 2>/dev/null)
+
+# Core flag groups (user can append via EXTRA_CFLAGS)
+STD_FLAGS      ?= -std=gnu2x
+OPT_FLAGS      ?= -O3 -g -pipe -fno-math-errno -ffast-math -funroll-loops -ftree-vectorize
+WARN_FLAGS     ?= -Wall -Wextra -Wpedantic -Wconversion -Wdouble-promotion
+FEATURE_FLAGS  ?= -DNDEBUG=1 -fPIC -pthread
+INCLUDE_FLAGS  ?= -Iinclude
+
+# External packages
+PKG_FFMPEG = libavcodec libavformat libswscale libavutil
+PKG_GPU    = glesv2 gbm egl
+PKG_CFLAGS       := $(shell $(PKG_CONFIG) --cflags $(PKG_FFMPEG) $(PKG_GPU) 2>/dev/null)
+PKG_LIBS_FFMPEG  := $(shell $(PKG_CONFIG) --libs $(PKG_FFMPEG) 2>/dev/null)
+PKG_LIBS_GPU     := $(shell $(PKG_CONFIG) --libs $(PKG_GPU) 2>/dev/null)
+
+CFLAGS ?= $(STD_FLAGS) $(OPT_FLAGS) $(WARN_FLAGS) $(FEATURE_FLAGS) $(INCLUDE_FLAGS) $(CFLAGS_CPU) $(PKG_CFLAGS) $(EXTRA_CFLAGS)
+
+LDLIBS_COMMON = -pthread -lm
+LDLIBS_FFMPEG = $(PKG_LIBS_FFMPEG)
+LDLIBS_GPU    = $(PKG_LIBS_GPU)
+
+# Verbosity
+V ?= 0
+ifeq ($(V),0)
+ Q=@
+else
+ Q=
+endif
+
+# Directories (DESTDIR for packaging)
+PREFIX      ?= /usr/local
+INCLUDEDIR  ?= $(PREFIX)/include/rpihub75
+LIBDIR      ?= $(PREFIX)/lib
+BUILDDIR    ?= build
+
+# Sources
 SRC_COMMON = src/util.c src/pixels.c src/rpihub75.c
-SRC_GPU = src/gpu.c src/video.c
+SRC_GPU    = src/gpu.c src/video.c
 
-# Library output names
-LIB_NO_GPU = librpihub75.so
-LIB_GPU = librpihub75_gpu.so
+# Library names
+LIB_BASENAME = rpihub75
+LIB_NO_GPU   = lib$(LIB_BASENAME).so
+LIB_GPU      = lib$(LIB_BASENAME)_gpu.so
+STATIC_LIB   = lib$(LIB_BASENAME).a
 
-# Object files
-# OBJ_COMMON = $(SRC_COMMON:%.c=$(BUILDDIR)/%.o)
-# OBJ_GPU = $(SRC_GPU:%.c=$(BUILDDIR)/%.o)
+# Objects
 OBJ_COMMON = $(patsubst src/%.c,$(BUILDDIR)/%.o,$(SRC_COMMON))
-OBJ_GPU = $(patsubst src/%.c,$(BUILDDIR)/%.o,$(SRC_GPU))
+OBJ_GPU    = $(patsubst src/%.c,$(BUILDDIR)/%.o,$(SRC_GPU))
+OBJ_ALL    = $(OBJ_COMMON) $(OBJ_GPU)
+DEPS       = $(OBJ_ALL:.o=.d)
 
-# Check for OpenGL ES, GBM, and EGL libraries
-GLESV2_FOUND := $(shell pkg-config --exists glesv2 && echo yes || echo no)
-GBM_FOUND := $(shell pkg-config --exists gbm && echo yes || echo no)
-EGL_FOUND := $(shell pkg-config --exists egl && echo yes || echo no)
-AVCODEC_FOUND := $(shell pkg-config --exists libavcodec && echo yes || echo no)
-SWSCALE_FOUND := $(shell pkg-config --exists libswscale && echo yes || echo no)
-AVUTIL_FOUND := $(shell pkg-config --exists libavutil && echo yes || echo no)
+# Library presence checks
+GLESV2_FOUND    := $(shell $(PKG_CONFIG) --exists glesv2      && echo yes || echo no)
+GBM_FOUND       := $(shell $(PKG_CONFIG) --exists gbm         && echo yes || echo no)
+EGL_FOUND       := $(shell $(PKG_CONFIG) --exists egl         && echo yes || echo no)
+AVCODEC_FOUND   := $(shell $(PKG_CONFIG) --exists libavcodec  && echo yes || echo no)
+AVFORMAT_FOUND  := $(shell $(PKG_CONFIG) --exists libavformat && echo yes || echo no)
+SWSCALE_FOUND   := $(shell $(PKG_CONFIG) --exists libswscale  && echo yes || echo no)
+AVUTIL_FOUND    := $(shell $(PKG_CONFIG) --exists libavutil   && echo yes || echo no)
+EFENCE_FOUND    := $(shell echo "int main(){}" | $(CC) -x c - -o /dev/null -lefence >/dev/null 2>&1 && echo yes || echo no)
+EFENCE_LIB      := $(if $(filter yes,$(EFENCE_FOUND)),-lefence,)
 
-# Targets
-.PHONY: all clean install check-libs example
+.PHONY: all lib libgpu static clean distclean install uninstall check-libs example scratch print-vars debug example-debug
 
-# Default target to build both libraries
 all: check-libs $(LIB_NO_GPU) $(LIB_GPU)
 
 lib: $(LIB_NO_GPU)
-
 libgpu: $(LIB_GPU)
+static: $(STATIC_LIB)
 
-# Create build directory if not exists
+print-vars:
+	@echo VERSION=$(VERSION)
+	@echo CC=$(CC)
+	@echo CFLAGS=$(CFLAGS)
+	@echo OBJ_COMMON=$(OBJ_COMMON)
+	@echo OBJ_GPU=$(OBJ_GPU)
+	@echo PKG_CFLAGS=$(PKG_CFLAGS)
+	@echo PKG_LIBS_FFMPEG=$(PKG_LIBS_FFMPEG)
+	@echo PKG_LIBS_GPU=$(PKG_LIBS_GPU)
+
 $(BUILDDIR):
-	mkdir -p $(BUILDDIR)
+	$(Q)mkdir -p $(BUILDDIR)
 
-# Check for required GPU libraries
 check-libs:
 ifeq ($(GLESV2_FOUND),no)
-    $(error "GLESv2 library not found. Please install it. sudo apt-get install libgles2-mesa-dev")
+  $(error Missing glesv2 (sudo apt-get install libgles2-mesa-dev))
 endif
 ifeq ($(GBM_FOUND),no)
-    $(error "GBM library not found. Please install it. sudo apt-get install libgbm-dev")
+  $(error Missing gbm (sudo apt-get install libgbm-dev))
 endif
 ifeq ($(EGL_FOUND),no)
-    $(error "EGL library not found. Please install it. sudo apt-get install libegl1-mesa-dev")
+  $(error Missing egl (sudo apt-get install libegl1-mesa-dev))
 endif
 ifeq ($(AVCODEC_FOUND),no)
-    $(error "AVCodec library not found. Please install it. sudo apt-get install libavcodec-dev")
+  $(error Missing libavcodec (sudo apt-get install libavcodec-dev))
+endif
+ifeq ($(AVFORMAT_FOUND),no)
+  $(error Missing libavformat (sudo apt-get install libavformat-dev))
 endif
 ifeq ($(SWSCALE_FOUND),no)
-    $(error "SWscale library not found. Please install it. sudo apt-get install libswscale-dev")
+  $(error Missing libswscale (sudo apt-get install libswscale-dev))
 endif
 ifeq ($(AVUTIL_FOUND),no)
-    $(error "SWscale library not found. Please install it. sudo apt-get install libavutil-dev")
+  $(error Missing libavutil (sudo apt-get install libavutil-dev))
 endif
 
-# No-GPU library (without gpu.c, no OpenGL)
+# Shared libs
 $(LIB_NO_GPU): $(OBJ_COMMON) | $(BUILDDIR)
-	$(CC) $(CFLAGS) $(CFLAGS_CPU) -shared -o $@ $(OBJ_COMMON)  $(LDFLAGS)
+	@echo "[LINK] $@ (CPU)"
+	$(Q)$(CC) -shared -o $@ $(OBJ_COMMON) $(LDLIBS_COMMON)
 
-# GPU-enabled library (with gpu.c, linked to OpenGL)
 $(LIB_GPU): $(OBJ_COMMON) $(OBJ_GPU) | $(BUILDDIR)
-	$(CC) $(CFLAGS) $(CFLAGS_CPU) -shared -o $@ $(OBJ_COMMON) $(OBJ_GPU) $(LDFLAGS) `pkg-config --libs glesv2 gbm egl`
+	@echo "[LINK] $@ (GPU+FFmpeg)"
+	$(Q)$(CC) -shared -o $@ $(OBJ_COMMON) $(OBJ_GPU) $(LDLIBS_COMMON) $(LDLIBS_FFMPEG) $(LDLIBS_GPU)
 
-# New example target to compile example.c
+# Static lib (CPU part only)
+$(STATIC_LIB): $(OBJ_COMMON)
+	@echo "[AR ] $@"
+	$(Q)$(AR) rcs $@ $(OBJ_COMMON)
+
+# Example program
 example: example.c $(LIB_GPU)
-	$(CC) example.c -Wall -O3 -lrpihub75_gpu -o example
+	@echo "[CC ] $@"
+	$(Q)$(CC) $(CFLAGS) -L. -Wl,-rpath,'$$ORIGIN' -o $@ $< -l$(LIB_BASENAME)_gpu $(LDLIBS_COMMON) $(LDLIBS_FFMPEG) $(LDLIBS_GPU)
 
-# New example target to compile scratch.c
+# Debug example (links with Electric Fence if available)
+example-debug: CFLAGS += -O0 -g -DDEBUG
+example-debug: example.c $(LIB_GPU)
+	@echo "[CC ] $@ (debug)"
+	@if [ "$(EFENCE_FOUND)" = "yes" ]; then echo "[INFO] Electric Fence detected; linking with -lefence"; else echo "[INFO] Electric Fence not found; building without it"; fi
+	$(Q)$(CC) $(CFLAGS) -L. -Wl,-rpath,'$$ORIGIN' -o $@ $< -l$(LIB_BASENAME)_gpu $(LDLIBS_COMMON) $(LDLIBS_FFMPEG) $(LDLIBS_GPU) $(EFENCE_LIB)
+
+# Full debug rebuild (rebuild libs with debug flags and produce example-debug)
+debug: CFLAGS += -O0 -g -DDEBUG
+debug: clean check-libs $(LIB_NO_GPU) $(LIB_GPU) example-debug
+	@echo "[DONE] Debug build complete (EFENCE: $(EFENCE_FOUND))"
+
+# Scratch test (optional if exists)
 scratch: tests/scratch.c $(LIB_GPU)
-	$(CC) tests/scratch.c -Wall -O3 -lrpihub75_gpu -o scratch
+	@echo "[CC ] $@"
+	$(Q)$(CC) $(CFLAGS) -L. -Wl,-rpath,'$$ORIGIN' -o $@ $< -l$(LIB_BASENAME)_gpu $(LDLIBS_COMMON) $(LDLIBS_FFMPEG) $(LDLIBS_GPU) || echo "scratch build skipped (missing file)"
 
-
-# Install target
+# Install / Uninstall
 install: all
-	# Create directories
-	mkdir -p $(INCLUDEDIR)
-	mkdir -p $(LIBDIR)
-	# Copy header files
-	chmod +x *.so
-	cp include/rpihub75.h $(INCLUDEDIR)
-	cp include/util.h $(INCLUDEDIR)
-	cp include/gpu.h $(INCLUDEDIR)
-	cp include/pixels.h $(INCLUDEDIR)
-	cp include/video.h $(INCLUDEDIR)
-	# Copy libraries
-	cp $(LIB_NO_GPU) $(LIB_GPU) $(LIBDIR)
-	ldconfig
+	@echo "[INSTALL] headers -> $(DESTDIR)$(INCLUDEDIR)"
+	$(Q)mkdir -p $(DESTDIR)$(INCLUDEDIR)
+	@echo "[INSTALL] libs -> $(DESTDIR)$(LIBDIR)"
+	$(Q)mkdir -p $(DESTDIR)$(LIBDIR)
+	$(Q)cp include/rpihub75.h include/util.h include/gpu.h include/pixels.h include/video.h $(DESTDIR)$(INCLUDEDIR)
+	$(Q)cp $(LIB_NO_GPU) $(LIB_GPU) $(DESTDIR)$(LIBDIR)
+	@echo "Consider running ldconfig (root) if not found at runtime."
 
-# Clean target
+uninstall:
+	@echo "[UNINSTALL] removing libs + headers"
+	$(Q)rm -f $(DESTDIR)$(LIBDIR)/$(LIB_NO_GPU) $(DESTDIR)$(LIBDIR)/$(LIB_GPU)
+	$(Q)rm -f $(DESTDIR)$(INCLUDEDIR)/rpihub75.h \
+	              $(DESTDIR)$(INCLUDEDIR)/util.h \
+	              $(DESTDIR)$(INCLUDEDIR)/gpu.h \
+	              $(DESTDIR)$(INCLUDEDIR)/pixels.h \
+	              $(DESTDIR)$(INCLUDEDIR)/video.h || true
+
+# Cleaning
 clean:
-	rm -rf $(BUILDDIR)
-	rm -f $(OBJ_COMMON) $(OBJ_GPU) $(LIB_NO_GPU) $(LIB_GPU) example
+	@echo "[CLEAN] objects"
+	$(Q)rm -rf $(BUILDDIR)
+	$(Q)rm -f $(OBJ_COMMON) $(OBJ_GPU) $(DEPS)
+	$(Q)rm -f $(LIB_NO_GPU) $(LIB_GPU) $(STATIC_LIB) example scratch
 
+distclean: clean
+	@echo "[CLEAN] distribution extras (none)"
 
-
-# Object file compilation rules
+# Compile objects with dependency generation
 $(BUILDDIR)/%.o: src/%.c | $(BUILDDIR)
-	$(CC) $(CFLAGS) $(CFLAGS_CPU) -c $< -o $@
+	@echo "[CC ] $<"
+	$(Q)$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
-# Dependencies (optional)
-$(BUILDDIR)/util.o: src/util.c include/util.h
-$(BUILDDIR)/pixels.o: src/pixels.c include/rpihub75.h include/pixels.h
-$(BUILDDIR)/video.o: src/video.c include/rpihub75.h
-$(BUILDDIR)/gpio.o: src/gpio.c include/rpihub75.h
-$(BUILDDIR)/gpu.o: src/gpu.c include/rpihub75.h include/stb_image.h
+# Auto-generated dependency files
+-include $(DEPS)
+
+# Convenience meta targets
+.PHONY: test run
+
+run: example
+	./example -h || true
+
+test: example
+	@echo "No test suite defined yet." 

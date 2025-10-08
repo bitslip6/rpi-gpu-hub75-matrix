@@ -105,7 +105,7 @@ int file_put_contents(const char *filename, const void *data, const size_t size)
  * @param filesize - pointer to the size of the file. will be set after the call. ugly i know
  * @return char* - pointer to read data. NOTE: caller must free
  */
-char *file_get_contents(const char *filename, long *filesize) {
+char *file_get_contents(const char *filename, size_t *filesize) {
     // Open the file in binary mode
     FILE *file = fopen(filename, "rb"); 
     if (file == NULL) {
@@ -198,6 +198,7 @@ int rnd(unsigned char *buffer, const size_t size) {
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <linux/time.h>
 
 /* rnd(void *buf, size_t n) must fill buf with cryptographic random bytes from /dev/urandom */
 
@@ -298,57 +299,6 @@ uint32_t *create_jitter_mask(const uint16_t jitter_size, const uint8_t brightnes
     return jitter;
 }
 
-/**
- * @brief  calculate a jitter mask for the OE pin that should randomly toggle the OE pin on/off acording to brightness
- * TODO: look for rows of > 3 bits that are all the same and spread these bits out. this will reduce flicker on the display
- * 
- * @param jitter_size  prime number > 1024 < 4096
- * @param brightness   larger values produce brighter output, max 255
- * @return uint32_t*   a pointer to the jitter mask. caller must release memory
- */
-uint32_t *create_jitter_mask2(const uint16_t jitter_size, const uint8_t brightness) {
-    srand(time(NULL));
-    uint32_t *jitter  = (uint32_t*)malloc(jitter_size*sizeof(uint32_t));
-    uint8_t *raw_data = (uint8_t*) malloc(jitter_size);
-
-    // read random data from urandom into the raw_data buffer
-    rnd(raw_data, jitter_size);
-
-    // map raw data to the global OE jitter mask (toggle the OE pin on/off for JITTERS_SIZE frames)
-    for (int i=0; i<jitter_size; i++) {
-        if (raw_data[i] > brightness) {
-            jitter[i] = PIN_OE;
-        }
-    }
-
-    // look for runs of 4 or more 1 or 0. where we find a run, regenerate the data
-    // make 3 passes at long run reduction, #defines in rpihub75.h  ....
-    for (int j = 0; j < JITTER_PASSES; j++) {
-        // Detect and redistribute runs of >4 identical bits
-        for (int i = 0; i < jitter_size - JITTER_MAX_RUN_LEN; i++) {
-            int run_length = 1;
-
-            // Check if we have a run of similar bits (either all set or all clear)
-            while (i + run_length < jitter_size && jitter[i] == jitter[i + run_length]) {
-                run_length++;
-            }
-
-            // If the run length is more than 3, recalculate the bits
-            if (run_length >= JITTER_MAX_RUN_LEN) {
-                // recreate these bits, enchancement: pull bits from /dev/urandom 
-                for (int j = i; j < i + run_length; j++) {
-                    jitter[j] = ((rand() % 255) > brightness) ? PIN_OE : 0;  // Randomly set or clear the OE pin
-                }
-            }
-
-            // Skip over the run we just processed
-            i += run_length - 1;
-        }
-    }
-
-    free(raw_data);
-    return jitter;
-}
 
 
 /**
@@ -1108,18 +1058,18 @@ void *calibrate_panels(void *arg) {
     printf("n - lower blue gamma,     N - raise blue gamma\n");
     printf("<enter> next color\n");
 	float rgb_bars[12][3] = {
-        {1.0, 1.0, 1.0},
-        {1.0, 0.0, 0.0},
-        {0.0, 1.0, 0.0},
-        {0.0, 0.0, 1.0},
-        {1.0, 1.0, 1.0},
-        {0.0, 0.4, 0.8},
-        {0.8, 0.4, 1.0},
-        {0.8, 0.0, 0.4},
-        {0.0, 0.8, 0.4},
-        {0.4, 0.8, 0.0},
-        {0.4, 0.0, 0.8},
-        {0.4, 0.6, 0.8}
+        {1.0f, 1.0f , 1.0f},
+        {1.0f, 0.0f, 0.0f},
+        {0.0f, 1.0f, 0.0f},
+        {0.0f, 0.0f, 1.0f},
+        {1.0f, 1.0f, 1.0f},
+        {0.0f, 0.4f, 0.8f},
+        {0.8f, 0.4f, 1.0f},
+        {0.8f, 0.0f, 0.4f},
+        {0.0f, 0.8f, 0.4f},
+        {0.4f, 0.8f, 0.0f},
+        {0.4f, 0.0f, 0.8f},
+        {0.4f, 0.6f, 0.8f}
     };
 
     printf("created rgb bars\n");
@@ -1132,8 +1082,9 @@ void *calibrate_panels(void *arg) {
     */
 
     // const scene_info *scene = (scene_info*)arg;
-    uint8_t *image          = (uint8_t*)malloc(scene->width * scene->height * scene->stride);
-    memset(image, 0, scene->width * scene->height * scene->stride);
+    const size_t image_size = (size_t)(scene->width * scene->height * scene->stride);
+    uint8_t *image          = (uint8_t*)malloc(image_size);
+    memset(image, 0, image_size);
     uint8_t j = 0, num_col = 5;
     printf("malloc memory %dx%d\n", scene->width, scene->height);
 
@@ -1143,11 +1094,12 @@ void *calibrate_panels(void *arg) {
             for (int x=0; x<scene->panel_width; x++) {
                 RGB *pixel = (RGB *)(image + ((y * scene->panel_width) + x) * scene->stride);
                 //printf("pixel ...%dx%d\n", x, y);
-                int i = x / floor(scene->panel_width / num_col);
+                int i = (int)((float)x / floorf((float)scene->panel_width / (float)num_col));
                 //if (y == 0) { printf("x = %d, i = %d = v:%d\n", x, i, (254 / (i+1))); }
-                c1.r = rgb_bars[j][0] * (254 / (i+1));
-                c1.g = rgb_bars[j][1] * (254 / (i+1));
-                c1.b = rgb_bars[j][2] * (254 / (i+1));
+                const float factor = (float)254 / (float)(i+1);
+                c1.r = (uint8_t)(float)(rgb_bars[j][0] * factor);
+                c1.g = (uint8_t)(float)(rgb_bars[j][1] * factor);
+                c1.b = (uint8_t)(float)(rgb_bars[j][2] * factor);
                 *pixel = c1;
             }
         }
@@ -1231,8 +1183,8 @@ void* receive_udp_data(void *arg) {
     int sock;
     struct sockaddr_in server_addr;
     struct udp_packet packet;
-    uint16_t max_frame_sz  = scene->width * scene->height * scene->stride;
-    uint16_t max_packet_id = ceilf((float)max_frame_sz / (float)(PACKET_SIZE - 10));
+    uint16_t max_frame_sz  = (uint16_t)(scene->width * scene->height * scene->stride);
+    uint16_t max_packet_id = (uint16_t)ceilf((float)max_frame_sz / (float)(PACKET_SIZE - 10));
 
     uint8_t *image_data = malloc(max_frame_sz * 16);
 
@@ -1255,7 +1207,7 @@ void* receive_udp_data(void *arg) {
 
     for(;;) {
         socklen_t len = sizeof(server_addr);
-        int n = recvfrom(sock, &packet, sizeof(packet), 0, (struct sockaddr *)&server_addr, &len);
+        ssize_t n = recvfrom(sock, &packet, sizeof(packet), 0, (struct sockaddr *)&server_addr, &len);
         if (n < 0) {
             close(sock);
             die("Receive failed");
@@ -1272,7 +1224,7 @@ void* receive_udp_data(void *arg) {
 
 
         const uint16_t frame_num = ntohs(packet.frame_num) % 8;
-        const uint16_t frame_off = MIN(MIN(packet_id, max_packet_id) * PACKET_SIZE, max_frame_sz-1);
+        const uint16_t frame_off = (uint16_t)MIN((uint16_t)(MIN(packet_id, max_packet_id) * PACKET_SIZE), (uint16_t)(max_frame_sz-1));
 
         memcpy(image_data + ((frame_num * max_frame_sz) + frame_off), packet.data, PACKET_SIZE - 10);
         if (packet_id == total_packets) {

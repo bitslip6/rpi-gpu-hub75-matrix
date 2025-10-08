@@ -181,7 +181,11 @@
 
 #else
 
-    #define ADDRESS_TYPE "HZELLER_HAT"
+    #ifdef ADA_3HAT
+        #define ADDRESS_TYPE "ADA_3HAT"
+    #else
+        #define ADDRESS_TYPE "HZELLER_HAT"
+    #endif
     /**
      * standard pin assignments
      */

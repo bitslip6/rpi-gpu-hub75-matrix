@@ -53,7 +53,7 @@
  * @param y the panel row number to calculate the mask for
  * @return uint32_t the bitmask for the address lines at row y
  */
-uint32_t row_to_address(const int y, uint8_t half_height) {
+uint32_t row_to_address(const int y, uint16_t half_height) {
 
     // if they pass in image y not panel y, convert to panel y
     uint16_t row = (y-1) % half_height;
@@ -438,7 +438,6 @@ uint8_t *mirror_flip_mapper(uint8_t *__restrict image,
  */
 void render_forever_pi4(const scene_info *scene, int version) {
 
-    srand(time(NULL));
     // map the gpio address to we can control the GPIO pins
     uint32_t *PERIBase = map_gpio(0, version); // for root on pi5 (/dev/mem, offset is 0xD0000)
     // offset to the RIO registers (required for #define register access. 
@@ -452,7 +451,7 @@ void render_forever_pi4(const scene_info *scene, int version) {
 
      
     // index into the OE jitter mask
-    uint16_t jitter_idx = 0;
+    uint32_t jitter_idx = 0;
     // pre compute some variables. let the compiler know the alignment for optimizations
     const uint8_t  half_height __attribute__((aligned(16))) = scene->panel_height / 2;
     const uint16_t width __attribute__((aligned(16))) = scene->width;
@@ -640,8 +639,6 @@ void render_forever(const scene_info *scene) {
     if (cpu_model < 5 ) {
         render_forever_pi4(scene, cpu_model);
     }
-    // This is Pi 5
-    srand(time(NULL));
     // map the gpio address to we can control the GPIO pins
     uint32_t *PERIBase = map_gpio(0, 5); // for root on pi5 (/dev/mem, offset is 0xD0000)
     // offset to the RIO registers (required for #define register access. 
@@ -651,11 +648,11 @@ void render_forever(const scene_info *scene) {
     configure_gpio(PERIBase, 5);
          
     // index into the OE jitter mask
-    uint16_t jitter_idx = 0;
+    uint32_t jitter_idx = 0;
     // pre compute some variables. let the compiler know the alignment for optimizations
-    const uint8_t  half_height __attribute__((aligned(16))) = scene->panel_height / 2;
-    const uint16_t width __attribute__((aligned(16))) = scene->width;
-    const uint8_t  bit_depth __attribute__((aligned(BIT_DEPTH_ALIGNMENT))) = scene->bit_depth;
+    const uint16_t  half_height = (uint16_t)scene->panel_height / 2;
+    const uint16_t width = scene->width;
+    const uint8_t  bit_depth = scene->bit_depth;
 
     // pointer to the current bcm data to be displayed
     uint32_t *bcm_signal = scene->bcm_signalA;

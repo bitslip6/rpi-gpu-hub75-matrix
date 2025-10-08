@@ -23,8 +23,11 @@
 #include "rpihub75.h"
 #include "util.h"
 
+
+#ifdef USE_STB_IMAGE
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
+#endif
 
 // Test Shader source code
 const char *test_shader_source =
@@ -76,6 +79,7 @@ const char *vertex_shader_source =
 
 
 // Load texture from a PNG file using stb_image
+#ifdef USE_STB_IMAGE
 GLuint load_texture(const char* filePath) {
     GLuint textureID;
     glGenTextures(1, &textureID);
@@ -100,7 +104,8 @@ GLuint load_texture(const char* filePath) {
         }
 
         // Upload texture to GPU with mipmaps
-        glTexImage2D(GL_TEXTURE_2D, 0, format, width, height, 0, format, GL_UNSIGNED_BYTE, data);
+        // internalformat parameter (3rd) is GLint; our chosen 'format' is GLenum, cast to GLint to silence -Wsign-conversion
+        glTexImage2D(GL_TEXTURE_2D, 0, (GLint)format, width, height, 0, format, GL_UNSIGNED_BYTE, data);
         glGenerateMipmap(GL_TEXTURE_2D);  // Generate mipmaps for texture
 
         // Set texture parameters for wrapping and filtering
@@ -118,6 +123,7 @@ GLuint load_texture(const char* filePath) {
 
     return textureID;
 }
+#endif
 
 /**
  * @brief helper method for compiling GLSL shaders
@@ -149,7 +155,7 @@ static GLuint compile_shader(const char *source, const GLenum shader_type) {
  * @return GLuint OpenGL id of the new program
  */
 static GLuint create_shadertoy_program(char *file) {
-    long filesize;
+    size_t filesize;
     char *src = file_get_contents(file, &filesize);
     if (filesize == 0) {
         die( "Failed to read shader source\n");
@@ -195,13 +201,15 @@ static GLuint create_shadertoy_program(char *file) {
 char *change_file_extension(const char *filename, const char *new_extension) {
     // Find the last dot in the filename
     const char *dot = strrchr(filename, '.');
-    size_t new_filename_length;
+    size_t new_filename_length = 0;
 
     // If there is no dot, simply append the new extension
     if (dot == NULL) {
         new_filename_length = strlen(filename) + strlen(new_extension) + 2; // +2 for dot and null terminator
+    } else if (dot > filename) {
+        new_filename_length = (unsigned)(dot - filename) + strlen(new_extension) + 2; // +2 for dot and null terminator
     } else {
-        new_filename_length = (dot - filename) + strlen(new_extension) + 2; // +2 for dot and null terminator
+        die("Invalid filename: %s\n", filename);
     }
 
     // Allocate memory for the new filename
@@ -215,7 +223,7 @@ char *change_file_extension(const char *filename, const char *new_extension) {
     if (dot == NULL) {
         strcpy(new_filename, filename);
     } else {
-        strncpy(new_filename, filename, dot - filename);
+        strncpy(new_filename, filename, (size_t)(dot - filename));
         new_filename[dot - filename] = '\0'; // Null-terminate the string
     }
 
@@ -369,13 +377,14 @@ void *render_shader(void *arg) {
     GLuint vbo; glGenBuffers(1, &vbo);
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
     glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
-    GLint pos_attrib = glGetAttribLocation(program, "position");
+    GLuint pos_attrib = (GLuint)glGetAttribLocation(program, "position");
     glEnableVertexAttribArray(pos_attrib);
     glVertexAttribPointer(pos_attrib, 3, GL_FLOAT, GL_FALSE, 0, 0);
 
     // IMPORTANT: ensure tight unpack before any texture uploads
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
+#ifdef USE_STB_IMAGE
     // Optional textures
     GLuint texture0 = 0, texture1 = 0;
     char *chan0 = change_file_extension(scene->shader_file, "channel0");
@@ -401,6 +410,8 @@ void *render_shader(void *arg) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
+#endif
+
 
     // uniforms
     GLint time_loc  = glGetUniformLocation(program, "iTime");
@@ -425,7 +436,7 @@ void *render_shader(void *arg) {
     clock_gettime(CLOCK_MONOTONIC, &orig_time);
     unsigned long frame = 0;
 
-    const size_t image_sz = (size_t)scene->width * scene->height * 4u;
+    const GLsizeiptr image_sz = scene->width * scene->height * 4u;
 
     // queues and mapper
     enum { RING_SIZE = 8 };
@@ -453,7 +464,7 @@ void *render_shader(void *arg) {
     uint8_t *cpu_pool[CPU_POOL];
     for (int i = 0; i < CPU_POOL; ++i) {
         // aligned_alloc requires size % alignment == 0, so round up
-        size_t sz = (image_sz + 63) & ~((size_t)63);
+        size_t sz = ((size_t)image_sz + 63) & ~((size_t)63);
         cpu_pool[i] = (uint8_t*)aligned_alloc(64, sz);
         if (!cpu_pool[i]) die("failed to alloc CPU staging buffer\n");
     }
@@ -478,8 +489,8 @@ void *render_shader(void *arg) {
     while (scene->do_render) {
         frame++;
         clock_gettime(CLOCK_MONOTONIC, &end_time);
-        float t  = (end_time.tv_sec - orig_time.tv_sec) + (end_time.tv_nsec - orig_time.tv_nsec) / 1e9f;
-        float dt = (end_time.tv_sec - start_time.tv_sec) + (end_time.tv_nsec - start_time.tv_nsec) / 1e9f;
+        float t  = (float)(end_time.tv_sec - orig_time.tv_sec) + (float)(end_time.tv_nsec - orig_time.tv_nsec) / 1e9f;
+        float dt = (float)(end_time.tv_sec - start_time.tv_sec) + (float)(end_time.tv_nsec - start_time.tv_nsec) / 1e9f;
 
         glUseProgram(program);
         glUniform1f(time_loc,  t);
@@ -487,11 +498,16 @@ void *render_shader(void *arg) {
         glUniform1f(frame_loc, (float)frame);
 
         // keep textures bound to expected units, harmless if absent
+        #ifdef USE_STB_IMAGE
         if (texture0) { 
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, texture0);
         }
-        if (texture1) { glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, texture1); }
+        if (texture1) {
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, texture1);
+        }
+        #endif
 
         // draw
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
@@ -520,7 +536,7 @@ void *render_shader(void *arg) {
                     glBindBuffer(GL_PIXEL_PACK_BUFFER, prev->pbo);
                     uint8_t *gpu_ptr = (uint8_t*)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, image_sz, GL_MAP_READ_BIT);
                     if (gpu_ptr) {
-                        memcpy(dst, gpu_ptr, image_sz);
+                        memcpy(dst, gpu_ptr, (size_t)image_sz);
                         glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
                         (void)spsc_try_push(&ring_filled, dst);
                     }
@@ -622,11 +638,12 @@ void *render_shader2(void *arg) {
     GLuint vbo; glGenBuffers(1, &vbo);
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
     glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
-    GLint pos_attrib = glGetAttribLocation(program, "position");
+    GLuint pos_attrib = (GLuint)glGetAttribLocation(program, "position");
     glEnableVertexAttribArray(pos_attrib);
     glVertexAttribPointer(pos_attrib, 3, GL_FLOAT, GL_FALSE, 0, 0);
 
     // optional textures
+    #ifdef USE_STB_IMAGE
     GLuint texture0 = 0, texture1 = 0;
     char *chan0 = change_file_extension(scene->shader_file, "channel0");
     if (access(chan0, R_OK) == 0) {
@@ -640,6 +657,7 @@ void *render_shader2(void *arg) {
     }
     if (texture0) { glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, texture0); }
     if (texture1) { glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, texture1); }
+    #endif
 
     // uniforms
     GLint time_loc  = glGetUniformLocation(program, "iTime");
@@ -664,7 +682,7 @@ void *render_shader2(void *arg) {
     clock_gettime(CLOCK_MONOTONIC, &orig_time);
     unsigned long frame = 0;
 
-    const size_t image_sz = (size_t)scene->width * scene->height * 4u;
+    const GLsizeiptr image_sz = scene->width * scene->height * 4u;
 
     // queues and mapper
     enum { RING_SIZE = 8 };         // filled queue
@@ -691,7 +709,7 @@ void *render_shader2(void *arg) {
     enum { CPU_POOL = 8 };          // number of reusable CPU buffers
     uint8_t *cpu_pool[CPU_POOL];
     for (int i = 0; i < CPU_POOL; ++i) {
-        cpu_pool[i] = (uint8_t*)aligned_alloc(64, image_sz);
+        cpu_pool[i] = (uint8_t*)aligned_alloc(64, (size_t)image_sz);
         if (!cpu_pool[i]) die("failed to alloc CPU staging buffer\n");
     }
     void *ring_free_storage[CPU_POOL];
@@ -716,8 +734,8 @@ void *render_shader2(void *arg) {
     while (scene->do_render) {
         frame++;
         clock_gettime(CLOCK_MONOTONIC, &end_time);
-        float t  = (end_time.tv_sec - orig_time.tv_sec) + (end_time.tv_nsec - orig_time.tv_nsec) / 1e9f;
-        float dt = (end_time.tv_sec - start_time.tv_sec) + (end_time.tv_nsec - start_time.tv_nsec) / 1e9f;
+        float t  = (float)(end_time.tv_sec - orig_time.tv_sec) + (float)(end_time.tv_nsec - orig_time.tv_nsec) / 1e9f;
+        float dt = (float)(end_time.tv_sec - start_time.tv_sec) + (float)(end_time.tv_nsec - start_time.tv_nsec) / 1e9f;
 
         glUseProgram(program);
         glUniform1f(time_loc,  t);
@@ -753,7 +771,7 @@ void *render_shader2(void *arg) {
                     uint8_t *gpu_ptr = (uint8_t*)glMapBufferRange(
                         GL_PIXEL_PACK_BUFFER, 0, image_sz, GL_MAP_READ_BIT);
                     if (gpu_ptr) {
-                        memcpy(dst, gpu_ptr, image_sz);
+                        memcpy(dst, gpu_ptr, (size_t)image_sz);
                         glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
 
                         // enqueue to mapper
@@ -914,7 +932,7 @@ void *render_shader_old(void *arg) {
     unsigned long frame = 0;
 
     // mapping pipeline
-    const size_t image_sz = (size_t)scene->width * scene->height * 4u;
+    const GLsizeiptr image_sz = (size_t)scene->width * scene->height * 4u;
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
 
 #if RENDER_USE_PBO
@@ -976,7 +994,7 @@ void *render_shader_old(void *arg) {
     spsc_ring_t ring_filled;
     spsc_init(&ring_filled, ring_filled_storage, RING_SIZE);
 
-    mapper_ctx_t mctx = { .q_in = &ring_filled, .q_free = NULL, .run = 1 };
+    mapper_ctx_t mctx = { .q_in = &ring_filled, .q_free = NULL, .scene = scene, .run = 1 };
     pthread_t mapper_th;
     if (pthread_create(&mapper_th, NULL, mapper_thread_main, &mctx) != 0) {
         die("failed to start mapper thread\n");

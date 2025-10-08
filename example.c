@@ -24,7 +24,7 @@
 #include <rpihub75/pixels.h>
 
 unsigned int ri(unsigned int max) {
-	return rand() % max;
+	return (unsigned)rand() % max;
 }
 
 // our CPU rendering implementation, see gpu.c for shader rendering details
@@ -32,8 +32,13 @@ void* render_cpu(void *arg) {
     // get the current scene info
     scene_info *scene = (scene_info*)arg;
     // allocate  memory for image data, we can also use the preallocated scene->image if that's easier
-    uint8_t *img = malloc(scene->width * scene->height * scene->stride);
-    memset(img, 0, scene->width * scene->height * scene->stride);
+    // total byte size of the working image buffer (avoid intermediate signed overflow)
+    size_t image_sz = (size_t)scene->width * (size_t)scene->height * (size_t)scene->stride;
+    uint8_t *img = (uint8_t *)malloc(image_sz);
+    if (!img) {
+        die("failed to allocate %zu bytes for CPU image buffer\n", image_sz);
+    }
+    memset(img, 0, image_sz);
 
     debug("rendering on CPU\n");
     // need to pause a second for gpio to be setup
@@ -41,22 +46,22 @@ void* render_cpu(void *arg) {
     for(;;) {
         // darken every pixel in the image for each byte of R,G,B data
         if (1) {
-            for (int i=0; i<scene->height*scene->width*scene->stride; i++) {
-                scene->image[i] = (uint8_t)scene->image[i] * 0.96f;
+            for (size_t i=0; i<image_sz; i++) {
+                scene->image[i] = (uint8_t)((float)scene->image[i] * 0.96f);
             }
         }
 
 
         // generate some random points on the screen
-        uint16_t x1 = ri(scene->width);
-        uint16_t x2 = ri(scene->width);
-        uint16_t x3 = ri(scene->width);
-        uint16_t y1 = ri(scene->height);
-        uint16_t y2 = ri(scene->height);
-        uint16_t y3 = ri(scene->height);
+        uint16_t x1 = (uint16_t)ri(scene->width);
+        uint16_t x2 = (uint16_t)ri(scene->width);
+        uint16_t x3 = (uint16_t)ri(scene->width);
+        uint16_t y1 = (uint16_t)ri(scene->height);
+        uint16_t y2 = (uint16_t)ri(scene->height);
+        uint16_t y3 = (uint16_t)ri(scene->height);
 
         // generate a random color
-        RGB color = {ri(250), ri(250), ri(250)};
+        RGB color = {(uint8_t)ri(250), (uint8_t)ri(250), (uint8_t)ri(250)};
 
         hub_triangle_aa(scene, x1, y1, x2, y2, x3, y3, color);
 
@@ -81,7 +86,7 @@ void* render_cpu(void *arg) {
 int main(int argc, char **argv)
 {
     printf("rpi-gpu-hub75 v0.2 example program %s pin out configuration\n", ADDRESS_TYPE);
-    srand(time(NULL));
+    srand((uint32_t)time(NULL));
 
     // parse command line options to define the scene
     // use -h for help, see this function in util.c for more information on command line parsing
