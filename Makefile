@@ -20,14 +20,34 @@ CC             ?= gcc
 AR             ?= ar
 PKG_CONFIG     ?= pkg-config
 
+# Build type: release (performance) or debug
+# Usage: make BUILD=debug   or   make BUILD=release
+BUILD          ?= release
+
+# Variant suffix & directory separation so both builds can coexist
+ifeq ($(BUILD),debug)
+	VARIANT_SUFFIX := _dbg
+	BUILDDIR       ?= build/debug
+	OPT_FLAGS      := -O0 -g -fno-omit-frame-pointer
+	FEATURE_FLAGS  := -DDEBUG -fPIC -pthread
+	# Extra debug aids (comment out if undesired)
+	DEBUG_EXTRA    ?= 
+else ifeq ($(BUILD),release)
+	VARIANT_SUFFIX :=
+	BUILDDIR       ?= build/release
+	OPT_FLAGS      := -O3 -g -pipe -fno-math-errno -ffast-math -funroll-loops -ftree-vectorize
+	FEATURE_FLAGS  := -DNDEBUG=1 -fPIC -pthread
+	DEBUG_EXTRA    ?=
+else
+	$(error Unknown BUILD='$(BUILD)' (expected 'release' or 'debug'))
+endif
+
 # CPU tuning flags auto-detected (ignore failure)
 CFLAGS_CPU     ?= $(shell sh detect_flags.sh 2>/dev/null)
 
 # Core flag groups (user can append via EXTRA_CFLAGS)
 STD_FLAGS      ?= -std=gnu2x
-OPT_FLAGS      ?= -O3 -g -pipe -fno-math-errno -ffast-math -funroll-loops -ftree-vectorize
 WARN_FLAGS     ?= -Wall -Wextra -Wpedantic -Wconversion -Wdouble-promotion
-FEATURE_FLAGS  ?= -DNDEBUG=1 -fPIC -pthread
 INCLUDE_FLAGS  ?= -Iinclude
 
 # External packages
@@ -37,7 +57,7 @@ PKG_CFLAGS       := $(shell $(PKG_CONFIG) --cflags $(PKG_FFMPEG) $(PKG_GPU) 2>/d
 PKG_LIBS_FFMPEG  := $(shell $(PKG_CONFIG) --libs $(PKG_FFMPEG) 2>/dev/null)
 PKG_LIBS_GPU     := $(shell $(PKG_CONFIG) --libs $(PKG_GPU) 2>/dev/null)
 
-CFLAGS ?= $(STD_FLAGS) $(OPT_FLAGS) $(WARN_FLAGS) $(FEATURE_FLAGS) $(INCLUDE_FLAGS) $(CFLAGS_CPU) $(PKG_CFLAGS) $(EXTRA_CFLAGS)
+CFLAGS ?= $(STD_FLAGS) $(OPT_FLAGS) $(WARN_FLAGS) $(FEATURE_FLAGS) $(INCLUDE_FLAGS) $(CFLAGS_CPU) $(PKG_CFLAGS) $(DEBUG_EXTRA) $(EXTRA_CFLAGS)
 
 LDLIBS_COMMON = -pthread -lm
 LDLIBS_FFMPEG = $(PKG_LIBS_FFMPEG)
@@ -55,17 +75,17 @@ endif
 PREFIX      ?= /usr/local
 INCLUDEDIR  ?= $(PREFIX)/include/rpihub75
 LIBDIR      ?= $(PREFIX)/lib
-BUILDDIR    ?= build
+# (BUILDDIR set per BUILD above)
 
 # Sources
-SRC_COMMON = src/util.c src/pixels.c src/rpihub75.c
+SRC_COMMON = src/util.c src/pixels.c src/rpihub75.c src/scene.c src/transformers.c src/hub_api.c
 SRC_GPU    = src/gpu.c src/video.c
 
 # Library names
 LIB_BASENAME = rpihub75
-LIB_NO_GPU   = lib$(LIB_BASENAME).so
-LIB_GPU      = lib$(LIB_BASENAME)_gpu.so
-STATIC_LIB   = lib$(LIB_BASENAME).a
+LIB_NO_GPU   = lib$(LIB_BASENAME)$(VARIANT_SUFFIX).so
+LIB_GPU      = lib$(LIB_BASENAME)_gpu$(VARIANT_SUFFIX).so
+STATIC_LIB   = lib$(LIB_BASENAME)$(VARIANT_SUFFIX).a
 
 # Objects
 OBJ_COMMON = $(patsubst src/%.c,$(BUILDDIR)/%.o,$(SRC_COMMON))
@@ -84,9 +104,14 @@ AVUTIL_FOUND    := $(shell $(PKG_CONFIG) --exists libavutil   && echo yes || ech
 EFENCE_FOUND    := $(shell echo "int main(){}" | $(CC) -x c - -o /dev/null -lefence >/dev/null 2>&1 && echo yes || echo no)
 EFENCE_LIB      := $(if $(filter yes,$(EFENCE_FOUND)),-lefence,)
 
-.PHONY: all lib libgpu static clean distclean install uninstall check-libs example scratch print-vars debug example-debug
+.PHONY: all lib libgpu static clean distclean install uninstall check-libs example scratch print-vars debug perf example-debug example-perf
 
-all: check-libs $(LIB_NO_GPU) $(LIB_GPU)
+all: check-libs $(LIB_NO_GPU) $(LIB_GPU) 
+ifeq ($(BUILD),debug)
+	@echo "[INFO] Built DEBUG variant (suffix $(VARIANT_SUFFIX))"
+else
+	@echo "[INFO] Built RELEASE variant"
+endif
 
 lib: $(LIB_NO_GPU)
 libgpu: $(LIB_GPU)
@@ -145,19 +170,20 @@ $(STATIC_LIB): $(OBJ_COMMON)
 # Example program
 example: example.c $(LIB_GPU)
 	@echo "[CC ] $@"
-	$(Q)$(CC) $(CFLAGS) -L. -Wl,-rpath,'$$ORIGIN' -o $@ $< -l$(LIB_BASENAME)_gpu $(LDLIBS_COMMON) $(LDLIBS_FFMPEG) $(LDLIBS_GPU)
+	$(Q)$(CC) $(CFLAGS) -L. -Wl,-rpath,'$$ORIGIN' -o $@ $< -l$(LIB_BASENAME)_gpu$(VARIANT_SUFFIX) $(LDLIBS_COMMON) $(LDLIBS_FFMPEG) $(LDLIBS_GPU)
 
 # Debug example (links with Electric Fence if available)
-example-debug: CFLAGS += -O0 -g -DDEBUG
-example-debug: example.c $(LIB_GPU)
-	@echo "[CC ] $@ (debug)"
-	@if [ "$(EFENCE_FOUND)" = "yes" ]; then echo "[INFO] Electric Fence detected; linking with -lefence"; else echo "[INFO] Electric Fence not found; building without it"; fi
-	$(Q)$(CC) $(CFLAGS) -L. -Wl,-rpath,'$$ORIGIN' -o $@ $< -l$(LIB_BASENAME)_gpu $(LDLIBS_COMMON) $(LDLIBS_FFMPEG) $(LDLIBS_GPU) $(EFENCE_LIB)
+# Convenience wrappers that invoke recursive make with BUILD override
+debug:
+	$(MAKE) BUILD=debug clean all example
+perf:
+	$(MAKE) BUILD=release clean all example
 
-# Full debug rebuild (rebuild libs with debug flags and produce example-debug)
-debug: CFLAGS += -O0 -g -DDEBUG
-debug: clean check-libs $(LIB_NO_GPU) $(LIB_GPU) example-debug
-	@echo "[DONE] Debug build complete (EFENCE: $(EFENCE_FOUND))"
+# Legacy names retained for compatibility
+example-debug:
+	$(MAKE) BUILD=debug example
+example-perf:
+	$(MAKE) BUILD=release example
 
 # Scratch test (optional if exists)
 scratch: tests/scratch.c $(LIB_GPU)
@@ -170,7 +196,8 @@ install: all
 	$(Q)mkdir -p $(DESTDIR)$(INCLUDEDIR)
 	@echo "[INSTALL] libs -> $(DESTDIR)$(LIBDIR)"
 	$(Q)mkdir -p $(DESTDIR)$(LIBDIR)
-	$(Q)cp include/rpihub75.h include/util.h include/gpu.h include/pixels.h include/video.h $(DESTDIR)$(INCLUDEDIR)
+	#$(Q)cp include/rpihub75.h include/util.h include/gpu.h include/pixels.h include/video.h include/scene.h $(DESTDIR)$(INCLUDEDIR) 
+	$(Q)cp include/hub75gpu.h $(DESTDIR)$(INCLUDEDIR) 
 	$(Q)cp $(LIB_NO_GPU) $(LIB_GPU) $(DESTDIR)$(LIBDIR)
 	@echo "Consider running ldconfig (root) if not found at runtime."
 
@@ -181,14 +208,16 @@ uninstall:
 	              $(DESTDIR)$(INCLUDEDIR)/util.h \
 	              $(DESTDIR)$(INCLUDEDIR)/gpu.h \
 	              $(DESTDIR)$(INCLUDEDIR)/pixels.h \
+	              $(DESTDIR)$(INCLUDEDIR)/scene.h \
+	              $(DESTDIR)$(INCLUDEDIR)/hub75gpu.h \
 	              $(DESTDIR)$(INCLUDEDIR)/video.h || true
 
 # Cleaning
 clean:
 	@echo "[CLEAN] objects"
-	$(Q)rm -rf $(BUILDDIR)
+	$(Q)rm -rf build/debug build/release
 	$(Q)rm -f $(OBJ_COMMON) $(OBJ_GPU) $(DEPS)
-	$(Q)rm -f $(LIB_NO_GPU) $(LIB_GPU) $(STATIC_LIB) example scratch
+	$(Q)rm -f lib$(LIB_BASENAME).so lib$(LIB_BASENAME)_gpu.so lib$(LIB_BASENAME)_gpu_dbg.so lib$(LIB_BASENAME)_dbg.so example example_dbg example-perf scratch
 
 distclean: clean
 	@echo "[CLEAN] distribution extras (none)"
