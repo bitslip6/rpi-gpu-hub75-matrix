@@ -7,6 +7,10 @@
 #include <libswscale/swscale.h>
 #include <libavutil/imgutils.h>
 
+
+#define MEMGUARD_OVERRIDE_STDLIB
+#include "memguard2.h"
+
 #include "rpihub75.h"
 #include "video.h"
 #include "pixels.h"

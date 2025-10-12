@@ -73,8 +73,9 @@ extern "C" {
 #ifndef MEMGUARD_GUARD_BACK_PAGES
 #define MEMGUARD_GUARD_BACK_PAGES 1   /* catch overruns */
 #endif
+/* keep this definition somewhere near your config */
 #ifndef MEMGUARD_GUARDPAGE_THRESHOLD
-#define MEMGUARD_GUARDPAGE_THRESHOLD 0 /* 0 = use mprotect for all allocations */
+#define MEMGUARD_GUARDPAGE_THRESHOLD (0)  /* explicit size_t */
 #endif
 
 /* Quarantine to help catch UAF. 0 disables. */
@@ -114,10 +115,13 @@ void*  memguard_malloc(size_t n, const char *file, int line);
 void*  memguard_calloc(size_t nmemb, size_t size, const char *file, int line);
 void*  memguard_realloc(void *ptr, size_t n, const char *file, int line);
 char*  memguard_strdup(const char *s, const char *file, int line);
+
 void   memguard_free(void *ptr, const char *file, int line);
 
-int    memguard_check_block(const void *user_ptr);     /* 0 OK, nonzero corrupted */
-size_t memguard_check_all(FILE *report);               /* returns corrupt blocks */
+// 0 OK, nonzero corrupted
+int    memguard_check_block(const void *user_ptr);
+// returns corrupt blocks
+size_t memguard_check_all(FILE *report);
 void   memguard_get_stats(struct memguard_stats *out);
 size_t memguard_report_leaks(FILE *out);
 void   memguard_teardown(void);
@@ -192,6 +196,8 @@ struct mg_header {
     mg_header *prev;
     mg_header *next;
     int      is_active;         /* for double free detection */
+    void *owner_globals;
+
 
 #if MEMGUARD_USE_MPROTECT
     int      was_mmap;          /* allocated via mmap path */
@@ -294,6 +300,19 @@ void memguard_init(size_t front_guard_bytes, size_t back_guard_bytes) {
     pthread_mutex_unlock(&mg_g.lock);
 }
 
+// dump the current list of memory allocations
+__attribute__((unused)) static void mg_dump_live_list(FILE *out) {
+    if (!out) out = stderr;
+    pthread_mutex_lock(&mg_g.lock);
+    fprintf(out, "[memguard] live list (head=%p):\n", (void*)mg_g.head);
+    for (mg_header *it = mg_g.head; it; it = it->next) {
+        fprintf(out, "  h=%p user=%p from %s:%d active=%d\n",
+                (void*)it, mg_user_ptr(it), it->file, it->line, it->is_active);
+    }
+    pthread_mutex_unlock(&mg_g.lock);
+}
+
+
 /* at-exit leak report */
 static void mg_at_exit(void) {
     size_t leaks = memguard_report_leaks(stderr);
@@ -309,10 +328,6 @@ void memguard_set_enabled(int enabled) {
     pthread_once(&mg_once, mg_install_atexit);
 }
 
-static int mg_is_in_active_list(const mg_header *h) {
-    for (const mg_header *it = mg_g.head; it; it = it->next) if (it == h) return 1;
-    return 0;
-}
 
 #if MEMGUARD_QUARANTINE_MAX > 0
 static void mg_quarantine_push(mg_header *h) {
@@ -395,6 +410,8 @@ static void* mg_alloc_block_mmap(size_t req, const char *file, int line) {
     h->line           = line;
     h->prev = h->next = NULL;
     h->is_active      = 1;
+    h->owner_globals  = (void*)&mg_g;
+
 #if MEMGUARD_USE_MPROTECT
     h->was_mmap       = 1;
     h->map_len_total  = total_len;
@@ -449,6 +466,8 @@ static void* mg_alloc_block_malloc(size_t req, const char *file, int line) {
     h->line           = line;
     h->prev = h->next = NULL;
     h->is_active      = 1;
+    h->owner_globals  = (void*)&mg_g;
+
 #if MEMGUARD_USE_MPROTECT
     h->was_mmap       = 0;
     h->map_len_total  = 0;
@@ -472,9 +491,16 @@ static void* mg_alloc_block_malloc(size_t req, const char *file, int line) {
 }
 
 static void* mg_alloc_block(size_t req, const char *file, int line) {
-#if MEMGUARD_USE_MPROTECT
-    if (req >= MEMGUARD_GUARDPAGE_THRESHOLD) return mg_alloc_block_mmap(req, file, line);
-#endif
+    #if MEMGUARD_USE_MPROTECT
+    #if MEMGUARD_GUARDPAGE_THRESHOLD > 0
+        if (req >= (size_t)MEMGUARD_GUARDPAGE_THRESHOLD) {
+            return mg_alloc_block_mmap(req, file, line);
+        }
+    #else
+        /* threshold == 0, always use mprotect path */
+        return mg_alloc_block_mmap(req, file, line);
+    #endif
+    #endif
     return mg_alloc_block_malloc(req, file, line);
 }
 
@@ -551,8 +577,11 @@ size_t memguard_check_all(FILE *report) {
     if (!report) report = stderr;
     size_t bad = 0;
     pthread_mutex_lock(&mg_g.lock);
-    for (mg_header *it = mg_g.head; it; it = it->next) bad += mg_check_ranges(it, report, "scan");
+    for (mg_header *it = mg_g.head; it; it = it->next) {
+        bad += (size_t)(mg_check_ranges(it, report, "scan") != 0);
+    }
     pthread_mutex_unlock(&mg_g.lock);
+    fprintf(report, "[memguard] check_all found %zu bad blocks\n", bad);    
     return bad;
 }
 
@@ -612,22 +641,72 @@ char* memguard_strdup(const char *s, const char *file, int line) {
     return p;
 }
 
+static int mg_is_in_active_list(const mg_header *h) {
+    for (const mg_header *it = mg_g.head; it; it = it->next) {
+        if (it == h) return 1;
+    }
+    return 0;
+}
+
+/* helper in implementation */
+static inline int mg_probably_poisoned_header(const mg_header *h) {
+    /* checking just owner_globals is enough here */
+    const uintptr_t p = (uintptr_t)h->owner_globals;
+    return p == (uintptr_t)0xddddddddddddddddULL;
+}
+
 void memguard_free(void *ptr, const char *file, int line) {
+    
     (void)file; (void)line;
     if (!ptr) return;
     if (!mg_g.enabled) { free(ptr); return; }
 
     pthread_mutex_lock(&mg_g.lock);
+
     mg_header *h = mg_from_user(ptr);
 
-    if (!h || !h->is_active || !mg_is_in_active_list(h)) {
-        fprintf(stderr, "[memguard] invalid or double free at %p\n", ptr);
+    // quick check for poisoned header (double free)
+    if (mg_probably_poisoned_header(h)) {
+        static _Thread_local int warned;
+        if (!warned) {
+            fprintf(stderr, "[memguard] double free detected at %p (poisoned header), suppressing repeats\n", ptr);
+            warned = 1;
+        }
         pthread_mutex_unlock(&mg_g.lock);
         return;
     }
 
+
+    /* ownership and membership validation BEFORE any mutation */
+    if (!h || h->owner_globals != (void*)&mg_g) {
+        fprintf(stderr, "[memguard] free: header not owned by this allocator, user=%p h=%p owner=%p this=%p\n",
+                ptr, (void*)h, h ? h->owner_globals : NULL, (void*)&mg_g);
+        pthread_mutex_unlock(&mg_g.lock);
+        return;
+    }
+    if (!h->is_active || !mg_is_in_active_list(h)) {
+        fprintf(stderr, "[memguard] invalid or double free at user=%p, h=%p\n", ptr, (void*)h);
+        pthread_mutex_unlock(&mg_g.lock);
+        return;
+    }
+
+    /* optional integrity check */
     (void)mg_check_ranges(h, stderr, "free");
 
+    /* compute overhead BEFORE mutating header */
+    const size_t overhead = h->front_guard + h->back_guard
+                          + sizeof(mg_header) + sizeof(uint32_t)
+#if MEMGUARD_USE_MPROTECT
+                          + ((size_t)MEMGUARD_GUARD_FRONT_PAGES + (size_t)MEMGUARD_GUARD_BACK_PAGES)
+                            * (h->was_mmap ? h->page_size : 0)
+#endif
+                          ;
+
+    /* unlink first, then update counters */
+    mg_list_remove(h);
+    mg_update_stats_on_free(h->requested_size, overhead);
+
+    /* poison after being removed from the list */
     uint8_t *front_p = mg_front_ptr(h);
     uint8_t *back_p  = mg_back_ptr(h);
     uint32_t *tail_p = (uint32_t*)(back_p + h->back_guard);
@@ -641,20 +720,11 @@ void memguard_free(void *ptr, const char *file, int line) {
     h->magic = 0;
     h->is_active = 0;
 
-    const size_t overhead = h->front_guard + h->back_guard + sizeof(mg_header) + sizeof(uint32_t)
-#if MEMGUARD_USE_MPROTECT
-                          + ((size_t)MEMGUARD_GUARD_FRONT_PAGES + (size_t)MEMGUARD_GUARD_BACK_PAGES) * (h->was_mmap ? h->page_size : 0)
-#endif
-                          ;
-
-    mg_list_remove(h);
-    mg_update_stats_on_free(h->requested_size, overhead);
-
 #if MEMGUARD_QUARANTINE_MAX > 0
-    /* For mmap blocks, flip inner RW area to PROT_NONE so UAF faults immediately */
 #   if MEMGUARD_USE_MPROTECT
     if (h->was_mmap) {
-        size_t inner_len = mg_page_round_up(h->front_guard + sizeof(mg_header) + h->alloc_size + h->back_guard + sizeof(uint32_t), h->page_size);
+        size_t inner_len = mg_page_round_up(h->front_guard + sizeof(mg_header) +
+                         h->alloc_size + h->back_guard + sizeof(uint32_t), h->page_size);
         mprotect((void*)((uint8_t*)h - h->front_guard), inner_len, PROT_NONE);
     }
 #   endif
@@ -673,6 +743,7 @@ void memguard_free(void *ptr, const char *file, int line) {
 
     pthread_mutex_unlock(&mg_g.lock);
 }
+
 
 /* -------- Info and diagnostics -------- */
 
@@ -705,7 +776,12 @@ size_t memguard_report_leaks(FILE *out) {
 
 size_t memguard_check_all(FILE *report);
 
+
+/**
+ * only call this after joining all threads....
+ */
 void memguard_teardown(void) {
+
     pthread_mutex_lock(&mg_g.lock);
     mg_header *it = mg_g.head;
     while (it) {
@@ -756,6 +832,7 @@ int memguard_protect_readonly(void *user_ptr) {
     (void)user_ptr; return -1;
 #endif
 }
+
 int memguard_protect_readwrite(void *user_ptr) {
 #if MEMGUARD_USE_MPROTECT
     mg_header *h = mg_from_user(user_ptr);

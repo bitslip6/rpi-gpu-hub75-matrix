@@ -1,3 +1,9 @@
+/*
+ * File: gpu.c
+ * Description: Implements OpenGL ES and EGL initialization, shader compilation, texture management,
+ * and a simple single-producer single-consumer (SPSC) ring buffer for GPU operations.
+ */
+
 #include <stdio.h>
 #include <GLES3/gl3.h>
 #include <EGL/egl.h>
@@ -7,8 +13,11 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
+#include <linux/time.h>
 #include <math.h>
 #include <string.h>
+#include <errno.h>
+#include <semaphore.h>
 #if defined(__arm__) || defined(__aarch64__)
 #include <arm_neon.h>
 #endif
@@ -20,22 +29,30 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
+#define MEMGUARD_OVERRIDE_STDLIB
+#include "memguard2.h"
+
 #include "rpihub75.h"
 #include "util.h"
-
+#include "pixels.h"
+#include "spsc.h"
 
 #ifdef USE_STB_IMAGE
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 #endif
 
-// Test Shader source code
+/*
+ * Test Shader Source:
+ * This constant contains a simple GLSL fragment shader used for testing purposes.
+ * It outputs a red color to the framebuffer.
+ */
 const char *test_shader_source =
     "#version 310 es\n"
     "precision mediump float;\n"
     "out vec4 color;\n"
     "void main() {\n"
-    "    color = vec4(1.0, 0.0, 1.0, 1.0);\n"  // Red color
+    "    color = vec4(1.0, 0.0, 1.0, 1.0);\n" // Red color
     "}\n";
 
 /**
@@ -65,10 +82,9 @@ const char *shadertoy_header =
     "    mainImage(fragColor, gl_FragCoord.xy);\n"
     "}\n";
 
-
 /**
  * @brief trivial vertex shader. pass vertex directly to the GPU
- * 
+ *
  */
 const char *vertex_shader_source =
     "#version 310 es\n"
@@ -77,10 +93,14 @@ const char *vertex_shader_source =
     "    gl_Position = position;\n"
     "}\n";
 
-
-// Load texture from a PNG file using stb_image
+/** 
+ * Load Texture:
+ * Loads a PNG texture from the specified file path using stb_image.
+ * Generates an OpenGL texture, sets texture parameters, and returns the texture ID.
+ */
 #ifdef USE_STB_IMAGE
-GLuint load_texture(const char* filePath) {
+GLuint load_texture(const char *filePath)
+{
     GLuint textureID;
     glGenTextures(1, &textureID);
     glBindTexture(GL_TEXTURE_2D, textureID);
@@ -88,7 +108,8 @@ GLuint load_texture(const char* filePath) {
     // Load the texture data from a PNG file using stb_image
     int width, height, nrChannels;
     unsigned char *data = stbi_load(filePath, &width, &height, &nrChannels, 0);
-    if (data) {
+    if (data)
+    {
         // Determine the format based on the number of channels in the PNG file
         GLenum format;
         if (nrChannels == 1)
@@ -97,7 +118,8 @@ GLuint load_texture(const char* filePath) {
             format = GL_RGB;
         else if (nrChannels == 4)
             format = GL_RGBA;
-        else {
+        else
+        {
             printf("Unsupported number of channels in PNG: %d\n", nrChannels);
             stbi_image_free(data);
             return 0;
@@ -106,18 +128,19 @@ GLuint load_texture(const char* filePath) {
         // Upload texture to GPU with mipmaps
         // internalformat parameter (3rd) is GLint; our chosen 'format' is GLenum, cast to GLint to silence -Wsign-conversion
         glTexImage2D(GL_TEXTURE_2D, 0, (GLint)format, width, height, 0, format, GL_UNSIGNED_BYTE, data);
-        glGenerateMipmap(GL_TEXTURE_2D);  // Generate mipmaps for texture
+        glGenerateMipmap(GL_TEXTURE_2D); // Generate mipmaps for texture
 
         // Set texture parameters for wrapping and filtering
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);  // Wrap horizontally
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);  // Wrap vertically
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);  // Minify filter with mipmaps
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);                   // Wrap horizontally
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);                   // Wrap vertically
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR); // Minify filter with mipmaps
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);               // Magnification filter
-
-    } else {
+    }
+    else
+    {
         die("Failed to load texture: %s\n", filePath);
     }
-    
+
     // Free image memory after loading into OpenGL
     stbi_image_free(data);
 
@@ -125,21 +148,24 @@ GLuint load_texture(const char* filePath) {
 }
 #endif
 
+
 /**
- * @brief helper method for compiling GLSL shaders
+ * @brief Compiles a GLSL shader from the provided source code using the specified shader type.
  * 
- * @param source the source code for the shader
- * @param shader_type one of GL_VERTEX_SHADER or GL_FRAGMENT_SHADER
- * @return GLuint reference to the created shader id
+ * @param source The GLSL source code for the shader.
+ * @param shader_type The type of shader (e.g., GL_VERTEX_SHADER or GL_FRAGMENT_SHADER).
+ * @return The OpenGL shader ID if compilation is successful; otherwise, aborts execution on error.
  */
-static GLuint compile_shader(const char *source, const GLenum shader_type) {
+static GLuint compile_shader(const char *source, const GLenum shader_type)
+{
     GLuint shader = glCreateShader(shader_type);
     glShaderSource(shader, 1, &source, NULL);
     glCompileShader(shader);
 
     GLint success;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
-    if (!success) {
+    if (!success)
+    {
         char info_log[512];
         glGetShaderInfoLog(shader, 512, NULL, info_log);
         die("Shader compilation error: %s\n", info_log);
@@ -148,21 +174,26 @@ static GLuint compile_shader(const char *source, const GLenum shader_type) {
     return shader;
 }
 
+
 /**
- * @brief Create a complete OpenGL program for a shadertoy shader
+ * @brief: Creates an OpenGL program by compiling and linking a vertex and fragment shader. 
+ *              The fragment shader is based on a shadertoy shader file with a header prepended.
  * 
- * @param file name of the shadertoy file to load
- * @return GLuint OpenGL id of the new program
+ * @param file The file path of the shadertoy shader source to load and compile.
+ * @returns The OpenGL program ID of the linked shader program.
  */
-static GLuint create_shadertoy_program(char *file) {
+static GLuint create_shadertoy_program(char *file)
+{
     size_t filesize;
     char *src = file_get_contents(file, &filesize);
-    if (filesize == 0) {
-        die( "Failed to read shader source\n");
+    if (filesize == 0)
+    {
+        die("Failed to read shader source\n");
     }
 
     char *src_with_header = (char *)malloc(filesize + 8192);
-    if (src_with_header == NULL) {
+    if (src_with_header == NULL)
+    {
         die("unable to allocate %d bytes memory for shader program\n", filesize + 8192);
     }
     snprintf(src_with_header, filesize + 8192, shadertoy_header, src);
@@ -177,7 +208,8 @@ static GLuint create_shadertoy_program(char *file) {
 
     GLint success;
     glGetProgramiv(program, GL_LINK_STATUS, &success);
-    if (!success) {
+    if (!success)
+    {
         char info_log[512];
         glGetProgramInfoLog(program, 512, NULL, info_log);
         die("Program linking error: %s\n", info_log);
@@ -186,43 +218,52 @@ static GLuint create_shadertoy_program(char *file) {
     glDeleteShader(vertex_shader);
     glDeleteShader(fragment_shader);
 
-    free(src_with_header);
+    SAFE_FREE(src_with_header);
     return program;
 }
 
-
 /**
  * @brief return a new string with the extension changed to new_extension
- * 
- * @param filename 
- * @param new_extension 
- * @return char* 
+ *
+ * @param filename
+ * @param new_extension
+ * @return char* - caller must free() the returned string
  */
-char *change_file_extension(const char *filename, const char *new_extension) {
+char *change_file_extension(const char *filename, const char *new_extension)
+{
     // Find the last dot in the filename
     const char *dot = strrchr(filename, '.');
     size_t new_filename_length = 0;
 
     // If there is no dot, simply append the new extension
-    if (dot == NULL) {
+    if (dot == NULL)
+    {
         new_filename_length = strlen(filename) + strlen(new_extension) + 2; // +2 for dot and null terminator
-    } else if (dot > filename) {
+    }
+    else if (dot > filename)
+    {
         new_filename_length = (unsigned)(dot - filename) + strlen(new_extension) + 2; // +2 for dot and null terminator
-    } else {
+    }
+    else
+    {
         die("Invalid filename: %s\n", filename);
     }
 
     // Allocate memory for the new filename
     char *new_filename = (char *)malloc(new_filename_length);
-    if (new_filename == NULL) {
+    if (new_filename == NULL)
+    {
         perror("Unable to allocate memory");
         return NULL;
     }
 
     // Copy the original filename up to the dot, if it exists
-    if (dot == NULL) {
+    if (dot == NULL)
+    {
         strcpy(new_filename, filename);
-    } else {
+    }
+    else
+    {
         strncpy(new_filename, filename, (size_t)(dot - filename));
         new_filename[dot - filename] = '\0'; // Null-terminate the string
     }
@@ -234,194 +275,251 @@ char *change_file_extension(const char *filename, const char *new_extension) {
     return new_filename;
 }
 
-
-
-
+/*
+ * Macro: RENDER_USE_PBO
+ * Description: Enables the use of Pixel Buffer Objects (PBO) for efficient GPU data transfers when available.
+ * If not defined or GLES 3 is unavailable, the code will fallback to CPU pointer queueing.
+ */
 #ifndef RENDER_USE_PBO
-// enable when GLES 3 is available, else falls back to CPU pointer queueing
-#define RENDER_USE_PBO 1
+#define RENDER_USE_PBO 0
 #endif
+
 
 // --------- simple SPSC ring for pointers ---------
-typedef struct {
-    atomic_uint head;
-    atomic_uint tail;
-    unsigned size;      // power of two
-    void **items;
-} spsc_ring_t;
 
-static inline void spsc_init(spsc_ring_t *q, void **storage, unsigned size_pow2) {
-    atomic_store_explicit(&q->head, 0u, memory_order_relaxed);
-    atomic_store_explicit(&q->tail, 0u, memory_order_relaxed);
-    q->size = size_pow2;
-    q->items = storage;
-}
 
-static inline int spsc_push(spsc_ring_t *q, void *p) {
-    unsigned h = atomic_load_explicit(&q->head, memory_order_relaxed);
-    unsigned t = atomic_load_explicit(&q->tail, memory_order_acquire);
-    if (((h + 1u) & (q->size - 1u)) == (t & (q->size - 1u))) return 0;
-    q->items[h & (q->size - 1u)] = p;
-    atomic_store_explicit(&q->head, h + 1u, memory_order_release);
-    return 1;
-}
-static inline void* spsc_pop(spsc_ring_t *q) {
-    unsigned t = atomic_load_explicit(&q->tail, memory_order_relaxed);
-    unsigned h = atomic_load_explicit(&q->head, memory_order_acquire);
-    if ((t & (q->size - 1u)) == (h & (q->size - 1u))) return NULL;
-    void *p = q->items[t & (q->size - 1u)];
-    atomic_store_explicit(&q->tail, t + 1u, memory_order_release);
-    return p;
-}
-static inline int spsc_try_push(spsc_ring_t *q, void *p) {
-    if (spsc_push(q, p)) return 1;
-    // pop one, drop it, then push
-    (void)spsc_pop(q);
-    return spsc_push(q, p);
-}
 
-// --------- jobs handed from render -> mapper ---------
-typedef enum { JOB_CPU_PIXELS = 1, JOB_PBO, JOB_QUIT = 255 } job_kind_t;
 
-typedef struct {
-    job_kind_t kind;
-    scene_info *scene;
-    size_t size_bytes;
-    union {
-        struct { uint8_t *pixels; } cpu;
-#if RENDER_USE_PBO
-        struct { GLuint pbo; GLsync fence; } pbo;
-#endif
-    } u;
-} map_job_t;
 
-// mapper thread state
-typedef struct {
-    spsc_ring_t *q_in;
-    spsc_ring_t *q_filled;
-    spsc_ring_t *q_free;
-    scene_info *scene;
-    volatile int run;
-} mapper_ctx_t;
-
-static void *mapper_thread_main(void *arg) {
-    printf("BCM mapper thread started\n");
-    mapper_ctx_t *ctx = (mapper_ctx_t*)arg;
-    while(ctx->run) {
-        uint8_t *pixels = (uint8_t*)spsc_pop(ctx->q_filled);
-        if (!pixels) {
-            sched_yield();
-            continue;
+/**
+ * @brief Opens the DRM device for rendering, preferring /dev/dri/renderD128.
+ * @return The file descriptor of the opened DRM device. - caller needs to call close()
+ */
+int open_dri_device() {
+    char path[256];
+    snprintf(path, sizeof(path), "/dev/dri/renderD128");
+    if (!file_exists("/dev/dri/renderD128"))
+    {
+        debug(" * v3d-pi5 not enabled, ensure config.txt contains: dtroverlay=vc4-kms-v3d-pi5 - for headless nodes disable hdmi via dtoverlay=vc4-kms-v3d-pi5,nohdmi\n");
+        // fallback to /dev/dri/card0
+        if (file_exists("/dev/dri/card0"))
+        {
+            snprintf(path, sizeof(path), "/dev/dri/card0");
         }
-        unsigned old = atomic_load_explicit(&ctx->scene->frame_ready, memory_order_relaxed);
-        atomic_store_explicit(&ctx->scene->frame_ready, old | 1u, memory_order_relaxed);
-
-        ctx->scene->bcm_mapper(ctx->scene, pixels);
-
-
-	// publish: bump seq to next even with release
-        atomic_store_explicit(&ctx->scene->frame_ready, (old + 2u) & ~1u, memory_order_release);
-
-	//ctx->secen->frame_swap = true;
-        if (ctx->q_free) {
-            (void)spsc_try_push(ctx->q_free, pixels);
+        else
+        {
+            die(" * DRM render node /dev/dri/renderD128 not found, /dev/dri/card0 also not found. ensure vc4-kms-v3d is loaded\n");
         }
     }
-    return NULL;
+    // DRM / GBM
+    int fd = open(path, O_RDWR);
+    if (fd < 0)
+    {
+        die("Failed to open DRM device /dev/dri/card0\n");
+    }
+
+    return fd;
 }
 
 
-// ---------- full renderer ----------
-void *render_shader(void *arg) {
-    scene_info *scene = (scene_info*)arg;
-    debug("render shader %s\n", scene->shader_file);
+#ifdef USE_STB_IMAGE
+void bind_tex(char *shader_file, char *texture_extension, GLuint unit) {
+    char *chan0 = change_file_extension(shader_file, texture_extension);
+    if (access(chan0, R_OK) == 0)
+    {
+        GLuint texture = load_texture(chan0);
+        if (!texture)
+        {
+            die("unable to load texture '%s'\n", chan0);
+        }
+        glActiveTexture(GL_TEXTURE0 + unit);
+        glBindTexture(GL_TEXTURE_2D, texture);
 
-    // DRM / GBM
-    int fd = open("/dev/dri/card0", O_RDWR);
-    if (fd < 0) die("Failed to open DRM device /dev/dri/card0\n");
-    struct gbm_device  *gbm     = gbm_create_device(fd);
-    struct gbm_surface *surface = gbm_surface_create(
-        gbm, scene->width, scene->height,
+        // force no-mipmap sampling and NPOT-safe wrap
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+
+        glActiveTexture(GL_texture);
+        glBindTexture(GL_TEXTURE_2D, texture);
+    }
+
+    SAFE_FREE(chan0);
+}
+#endif
+
+
+
+
+/**
+ * @brief update the time uniforms in the shader. call once per frame
+ * 
+ * @param program 
+ */
+void update_uniforms(GLuint program) {
+
+    static struct timespec end_time, orig_time, start_time;
+    static GLint frame_loc = -1, time_loc = -1, dtym_loc = -1;
+    static uint32_t frame = 0;
+
+    // set the uniform locations once
+    if (time_loc == -1 || dtym_loc == -1) {
+        time_loc  = glGetUniformLocation(program, "iTime");
+        dtym_loc  = glGetUniformLocation(program, "iTimeDelta");
+        frame_loc = glGetUniformLocation(program, "iFrame");
+        clock_gettime(CLOCK_MONOTONIC, &start_time);
+    }
+
+    // update time uniforms
+    clock_gettime(CLOCK_MONOTONIC, &end_time);
+    float t  = (float)(end_time.tv_sec - orig_time.tv_sec) + (float)(end_time.tv_nsec - orig_time.tv_nsec) / 1e9f;
+    float dt = (float)(end_time.tv_sec - start_time.tv_sec) + (float)(end_time.tv_nsec - start_time.tv_nsec) / 1e9f;
+
+    frame++;
+
+    glUseProgram(program);
+    glUniform1f(time_loc, t);
+    glUniform1f(dtym_loc, dt);
+    glUniform1f(frame_loc, (float)frame);
+}
+
+
+
+/**
+ * @brief Structure to hold GPU initialization resources
+ */
+typedef struct {
+    int device_fd;
+    struct gbm_device *gbm;
+    struct gbm_surface *surface;
+    EGLDisplay display;
+    EGLContext context;
+    EGLSurface egl_surface;
+} gpu_context_t;
+
+/**
+ * @brief Initializes GPU context including DRM, GBM, EGL and OpenGL ES
+ * 
+ * @param width Surface width
+ * @param height Surface height
+ * @return gpu_context_t* Pointer to initialized GPU context, or NULL on failure
+ */
+static gpu_context_t* init_gpu_context(int width, int height) {
+    gpu_context_t *ctx = malloc(sizeof(gpu_context_t));
+    if (!ctx) {
+        die("Failed to allocate GPU context\n");
+    }
+    
+    // Open DRI device
+    ctx->device_fd = open_dri_device();
+    
+    // Create GBM device and surface
+    ctx->gbm = gbm_create_device(ctx->device_fd);
+    ctx->surface = gbm_surface_create(
+        ctx->gbm, width, height,
         GBM_FORMAT_XRGB8888, GBM_BO_USE_RENDERING);
 
-    // EGL / GLES
-    EGLDisplay display = eglGetDisplay(gbm);
-    eglInitialize(display, NULL, NULL);
+    // EGL / GLES setup
+    ctx->display = eglGetDisplay(ctx->gbm);
+    eglInitialize(ctx->display, NULL, NULL);
     eglBindAPI(EGL_OPENGL_ES_API);
 
-    EGLConfig config; EGLint num_configs;
+    EGLConfig config;
+    EGLint num_configs;
     EGLint attribs[] = {
         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
-        EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
-        EGL_RED_SIZE,        8,
-        EGL_GREEN_SIZE,      8,
-        EGL_BLUE_SIZE,       8,
-        EGL_ALPHA_SIZE,      8,
-        EGL_NONE
-    };
-    eglChooseConfig(display, attribs, &config, 1, &num_configs);
-    static const EGLint ctx_attribs[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
-    EGLContext context = eglCreateContext(display, config, EGL_NO_CONTEXT, ctx_attribs);
-    EGLSurface egl_surface = eglCreateWindowSurface(display, config, (EGLNativeWindowType)surface, NULL);
-    eglMakeCurrent(display, egl_surface, egl_surface, context);
-    eglSwapInterval(display, 0); // uncapped
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+        EGL_ALPHA_SIZE, 8,
+        EGL_NONE};
+    eglChooseConfig(ctx->display, attribs, &config, 1, &num_configs);
+    
+    static const EGLint ctx_attribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+    ctx->context = eglCreateContext(ctx->display, config, EGL_NO_CONTEXT, ctx_attribs);
+    ctx->egl_surface = eglCreateWindowSurface(ctx->display, config, (EGLNativeWindowType)ctx->surface, NULL);
+    
+    eglMakeCurrent(ctx->display, ctx->egl_surface, ctx->egl_surface, ctx->context);
+    eglSwapInterval(ctx->display, 0); // uncapped
+    
+    return ctx;
+}
+
+/**
+ * @brief Cleanup GPU context and free resources
+ * 
+ * @param ctx GPU context to cleanup
+ */
+static void cleanup_gpu_context(gpu_context_t *ctx) {
+    if (!ctx) return;
+    
+    eglDestroySurface(ctx->display, ctx->egl_surface);
+    eglDestroyContext(ctx->display, ctx->context);
+    eglTerminate(ctx->display);
+    gbm_surface_destroy(ctx->surface);
+    gbm_device_destroy(ctx->gbm);
+    close(ctx->device_fd);
+    free(ctx);
+}
+
+// ---------- full renderer ----------
+/**
+ * @brief Primary rendering function that sets up DRM/GBM and EGL/GL contexts, compiles
+ *              the shader program from a shadertoy file, sets up vertex buffers and textures,
+ *              and enters the main rendering loop. It handles asynchronous readback using PBOs (if enabled)
+ *              or CPU readback, and adjusts frame rate dynamically. This function is executed in a separate
+ *              thread and uses the provided scene_info for configuration.
+ * 
+ * @param arg A pointer to a scene_info structure containing rendering parameters such as shader file,
+ *          dimensions, and FPS settings.
+ */
+void *render_shader(void *arg)
+{
+    scene_info *scene = (scene_info *)arg;
+    debug(" ~~ render shader %s\n", scene->shader_file);
+
+    // Initialize GPU context
+    gpu_context_t *gpu_ctx = init_gpu_context(scene->width, scene->height);
 
     // program and quad
     GLuint program = create_shadertoy_program(scene->shader_file);
     glUseProgram(program);
 
     static const GLfloat verts[] = {
-        -1.f,  1.f, 0.f,   -1.f, -1.f, 0.f,
-         1.f,  1.f, 0.f,    1.f, -1.f, 0.f
-    };
-    GLuint vbo; glGenBuffers(1, &vbo);
+        -1.f, 1.f, 0.f, -1.f, -1.f, 0.f,
+        1.f, 1.f, 0.f, 1.f, -1.f, 0.f};
+    GLuint vbo;
+    glGenBuffers(1, &vbo);
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
     glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
     GLuint pos_attrib = (GLuint)glGetAttribLocation(program, "position");
-    glEnableVertexAttribArray(pos_attrib);
-    glVertexAttribPointer(pos_attrib, 3, GL_FLOAT, GL_FALSE, 0, 0);
+    if ((GLint)pos_attrib >= 0) {
+        glEnableVertexAttribArray((GLuint)pos_attrib);
+        glVertexAttribPointer((GLuint)pos_attrib, 3, GL_FLOAT, GL_FALSE, 0, 0);
+    }
 
     // IMPORTANT: ensure tight unpack before any texture uploads
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
-#ifdef USE_STB_IMAGE
     // Optional textures
-    GLuint texture0 = 0, texture1 = 0;
-    char *chan0 = change_file_extension(scene->shader_file, "channel0");
-    if (access(chan0, R_OK) == 0) {
-        texture0 = load_texture(chan0);
-        if (!texture0) die("unable to load texture '%s'\n", chan0);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, texture0);
-        // force no-mipmap sampling and NPOT-safe wrap
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        
-    }
-    char *chan1 = change_file_extension(scene->shader_file, "channel1");
-    if (access(chan1, R_OK) == 0) {
-        texture1 = load_texture(chan1);
-        if (!texture1) die("unable to load texture '%s'\n", chan1);
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, texture1);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    }
-#endif
+#ifdef USE_STB_IMAGE
+    
+    bind_tex(scene->shader_file, "channel0", 0);
+    bind_tex(scene->shader_file, "channel1", 1);
 
-
-    // uniforms
-    GLint time_loc  = glGetUniformLocation(program, "iTime");
-    GLint dtym_loc  = glGetUniformLocation(program, "iTimeDelta");
-    GLint frame_loc = glGetUniformLocation(program, "iFrame");
-    GLint res_loc   = glGetUniformLocation(program, "iResolution");
-    GLint c0_loc    = glGetUniformLocation(program, "iChannel0");
-    GLint c1_loc    = glGetUniformLocation(program, "iChannel1");
+    GLint c0_loc = glGetUniformLocation(program, "iChannel0");
+    GLint c1_loc = glGetUniformLocation(program, "iChannel1");
     glUniform1i(c0_loc, 0);
     glUniform1i(c1_loc, 1);
+
+#endif
+
+    // uniforms
+    GLint res_loc = glGetUniformLocation(program, "iResolution");
     glUniform3f(res_loc, scene->width, scene->height, 0);
 
     // GL state for readbacks
@@ -431,87 +529,54 @@ void *render_shader(void *arg) {
     glViewport(0, 0, scene->width, scene->height);
 
     // timing
-    struct timespec start_time, end_time, orig_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
-    clock_gettime(CLOCK_MONOTONIC, &orig_time);
     unsigned long frame = 0;
 
     const GLsizeiptr image_sz = scene->width * scene->height * 4u;
 
-    // queues and mapper
-    enum { RING_SIZE = 8 };
-    void *ring_filled_storage[RING_SIZE];
-    spsc_ring_t ring_filled;
-    spsc_init(&ring_filled, ring_filled_storage, RING_SIZE);
+    //spsc_init(&ring_filled, ring_filled_storage, RING_SIZE);
 
 #if RENDER_USE_PBO
+
     // triple PBOs
     enum { PBO_COUNT = 3 };
-    typedef struct { GLuint pbo; GLsync fence; } pbo_item_t;
+    typedef struct
+    {
+        GLuint pbo;
+        GLsync fence;
+    } pbo_item_t;
     pbo_item_t pboq[PBO_COUNT];
     GLuint pbos[PBO_COUNT];
     glGenBuffers(PBO_COUNT, pbos);
-    for (int i = 0; i < PBO_COUNT; ++i) {
-        pboq[i].pbo   = pbos[i];
+    for (int i = 0; i < PBO_COUNT; ++i)
+    {
+        pboq[i].pbo = pbos[i];
         pboq[i].fence = 0;
         glBindBuffer(GL_PIXEL_PACK_BUFFER, pboq[i].pbo);
         glBufferData(GL_PIXEL_PACK_BUFFER, image_sz, NULL, GL_STREAM_READ);
     }
     glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
 
-    // CPU buffer pool and free ring
-    enum { CPU_POOL = 8 };
-    uint8_t *cpu_pool[CPU_POOL];
-    for (int i = 0; i < CPU_POOL; ++i) {
-        // aligned_alloc requires size % alignment == 0, so round up
-        size_t sz = ((size_t)image_sz + 63) & ~((size_t)63);
-        cpu_pool[i] = (uint8_t*)aligned_alloc(64, sz);
-        if (!cpu_pool[i]) die("failed to alloc CPU staging buffer\n");
-    }
-    void *ring_free_storage[CPU_POOL];
-    spsc_ring_t ring_free;
-    spsc_init(&ring_free, ring_free_storage, CPU_POOL);
-    for (int i = 0; i < CPU_POOL; ++i) (void)spsc_push(&ring_free, cpu_pool[i]);
-
-    mapper_ctx_t mctx = { .q_filled = &ring_filled, .q_free = &ring_free, .scene = scene, .run = 1 };
-#else
-    mapper_ctx_t mctx = { .q_filled = &ring_filled, .q_free = NULL, .scene = scene, .run = 1 };
 #endif
-
-    pthread_t mapper_th;
-    if (pthread_create(&mapper_th, NULL, mapper_thread_main, &mctx) != 0) {
-        die("failed to start mapper thread\n");
-    }
 
     int slot = 0;
 
     // main loop
-    while (scene->do_render) {
-        frame++;
-        clock_gettime(CLOCK_MONOTONIC, &end_time);
-        float t  = (float)(end_time.tv_sec - orig_time.tv_sec) + (float)(end_time.tv_nsec - orig_time.tv_nsec) / 1e9f;
-        float dt = (float)(end_time.tv_sec - start_time.tv_sec) + (float)(end_time.tv_nsec - start_time.tv_nsec) / 1e9f;
-
-        glUseProgram(program);
-        glUniform1f(time_loc,  t);
-        glUniform1f(dtym_loc,  dt);
-        glUniform1f(frame_loc, (float)frame);
-
-        // keep textures bound to expected units, harmless if absent
-        #ifdef USE_STB_IMAGE
-        if (texture0) { 
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, texture0);
-        }
-        if (texture1) {
-            glActiveTexture(GL_TEXTURE1);
-            glBindTexture(GL_TEXTURE_2D, texture1);
-        }
-        #endif
-
+    while (scene->do_render)
+    {
+        // update the time uniforms
+        update_uniforms(program);
+        
         // draw
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
+        uint8_t *dst = spsc_push_ptr_begin(scene->ring_buf_mapper, 200);
+        if (!dst) {
+            debug("dropping frame from OpenGL\n");
+            // eglSwapBuffers(gpu_ctx->display, gpu_ctx->egl_surface); // do we need this?
+            continue;
+        }
+        
+        // pull the pixels back to CPU using the GPU
 #if RENDER_USE_PBO
         // queue async readback into current PBO, then fence
         pbo_item_t *cur = &pboq[slot];
@@ -521,623 +586,61 @@ void *render_shader(void *arg) {
         glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
 
         // present after queuing readback
-        eglSwapBuffers(display, egl_surface);
+        // eglSwapBuffers(gpu_ctx->display, gpu_ctx->egl_surface);
 
         // harvest previous PBO if ready
         int prev_idx = (slot + PBO_COUNT - 1) % PBO_COUNT;
         pbo_item_t *prev = &pboq[prev_idx];
-        if (prev->fence) {
+        if (prev->fence)
+        {
             GLenum r = glClientWaitSync(prev->fence, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
-            if (r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED) {
-                glDeleteSync(prev->fence); prev->fence = 0;
-
-                uint8_t *dst = (uint8_t*)spsc_pop(&ring_free);
-                if (dst) {
-                    glBindBuffer(GL_PIXEL_PACK_BUFFER, prev->pbo);
-                    uint8_t *gpu_ptr = (uint8_t*)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, image_sz, GL_MAP_READ_BIT);
-                    if (gpu_ptr) {
-                        memcpy(dst, gpu_ptr, (size_t)image_sz);
-                        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
-                        (void)spsc_try_push(&ring_filled, dst);
-                    }
-                    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-                }
-            } else if (r == GL_WAIT_FAILED) {
-                glFinish();
-                glDeleteSync(prev->fence); prev->fence = 0;
-            }
-        }
-        slot = (slot + 1) % PBO_COUNT;
-#else
-        // CPU path
-        uint8_t *dst = (uint8_t*)aligned_alloc(64, (image_sz + 63) & ~((size_t)63));
-        if (LIKELY(dst)) {
-            glReadPixels(0, 0, scene->width, scene->height, GL_RGBA, GL_UNSIGNED_BYTE, dst);
-            eglSwapBuffers(display, egl_surface);
-            (void)spsc_try_push(&ring_filled, dst);
-        } else {
-            eglSwapBuffers(display, egl_surface);
-        }
-#endif
-
-        long slept = calculate_fps(scene->fps, scene->show_fps);
-        if (scene->auto_fps) {
-            long single_time = 1000000 / scene->fps;
-            float percent = 100.0f - (float)slept / (float)single_time * 100.0f;
-            if (percent < 95.0f) scene->fps++;
-            else if (percent > 97.0f) scene->fps--;
-        }
-    }
-
-    // stop mapper and join
-    mctx.run = 0;
-    pthread_join(mapper_th, NULL);
-
-    // cleanup
-    glDeleteBuffers(1, &vbo);
-#if RENDER_USE_PBO
-    glDeleteBuffers(3, (GLuint[]){ pboq[0].pbo, pboq[1].pbo, pboq[2].pbo });
-    // free CPU buffer pool
-    // (we cannot drain the free ring safely here, we kept our own array)
-    for (int i = 0; i < 8; ++i) ; // no-op if you keep cpu_pool in a wider scope
-#endif
-    eglDestroySurface(display, egl_surface);
-    eglDestroyContext(display, context);
-    eglTerminate(display);
-    gbm_surface_destroy(surface);
-    gbm_device_destroy(gbm);
-    close(fd);
-    return NULL;
-}
-
-
-// ---------- main renderer ----------
-void *render_shader2(void *arg) {
-    scene_info *scene = (scene_info*)arg;
-    debug("render shader %s\n", scene->shader_file);
-
-    // DRM / GBM
-    int fd = open("/dev/dri/card0", O_RDWR);
-    if (fd < 0) die("Failed to open DRM device /dev/dri/card0\n");
-    struct gbm_device  *gbm     = gbm_create_device(fd);
-    struct gbm_surface *surface = gbm_surface_create(
-        gbm, scene->width, scene->height,
-        GBM_FORMAT_XRGB8888, GBM_BO_USE_RENDERING);
-
-    // EGL / GLES
-    EGLDisplay display = eglGetDisplay(gbm);
-    eglInitialize(display, NULL, NULL);
-    eglBindAPI(EGL_OPENGL_ES_API);
-
-    EGLConfig config; EGLint num_configs;
-    EGLint attribs[] = {
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,   // ES3 preferred
-        EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
-        EGL_RED_SIZE,        8,
-        EGL_GREEN_SIZE,      8,
-        EGL_BLUE_SIZE,       8,
-        EGL_ALPHA_SIZE,      8,
-        EGL_NONE
-    };
-    eglChooseConfig(display, attribs, &config, 1, &num_configs);
-
-    static const EGLint ctx_attribs[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
-    EGLContext context = eglCreateContext(display, config, EGL_NO_CONTEXT, ctx_attribs);
-    EGLSurface egl_surface = eglCreateWindowSurface(display, config, (EGLNativeWindowType)surface, NULL);
-    eglMakeCurrent(display, egl_surface, egl_surface, context);
-    eglSwapInterval(display, 0);  // no vsync
-
-    // program and quad
-    GLuint program = create_shadertoy_program(scene->shader_file);
-    glUseProgram(program);
-
-    static const GLfloat verts[] = {
-        -1.f,  1.f, 0.f,   -1.f, -1.f, 0.f,
-         1.f,  1.f, 0.f,    1.f, -1.f, 0.f
-    };
-    GLuint vbo; glGenBuffers(1, &vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
-    GLuint pos_attrib = (GLuint)glGetAttribLocation(program, "position");
-    glEnableVertexAttribArray(pos_attrib);
-    glVertexAttribPointer(pos_attrib, 3, GL_FLOAT, GL_FALSE, 0, 0);
-
-    // optional textures
-    #ifdef USE_STB_IMAGE
-    GLuint texture0 = 0, texture1 = 0;
-    char *chan0 = change_file_extension(scene->shader_file, "channel0");
-    if (access(chan0, R_OK) == 0) {
-        texture0 = load_texture(chan0);
-        if (!texture0) die("unable to load texture '%s'\n", chan0);
-    }
-    char *chan1 = change_file_extension(scene->shader_file, "channel1");
-    if (access(chan1, R_OK) == 0) {
-        texture1 = load_texture(chan1);
-        if (!texture1) die("unable to load texture '%s'\n", chan1);
-    }
-    if (texture0) { glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, texture0); }
-    if (texture1) { glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, texture1); }
-    #endif
-
-    // uniforms
-    GLint time_loc  = glGetUniformLocation(program, "iTime");
-    GLint dtym_loc  = glGetUniformLocation(program, "iTimeDelta");
-    GLint frame_loc = glGetUniformLocation(program, "iFrame");
-    GLint res_loc   = glGetUniformLocation(program, "iResolution");
-    GLint c0_loc    = glGetUniformLocation(program, "iChannel0");
-    GLint c1_loc    = glGetUniformLocation(program, "iChannel1");
-    glUniform1i(c0_loc, 0);
-    glUniform1i(c1_loc, 1);
-    glUniform3f(res_loc, scene->width, scene->height, 0);
-
-    // GL state for readbacks
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glDisable(GL_DITHER);
-    glDisable(GL_BLEND);
-    glViewport(0, 0, scene->width, scene->height);
-
-    // timing
-    struct timespec start_time, end_time, orig_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
-    clock_gettime(CLOCK_MONOTONIC, &orig_time);
-    unsigned long frame = 0;
-
-    const GLsizeiptr image_sz = scene->width * scene->height * 4u;
-
-    // queues and mapper
-    enum { RING_SIZE = 8 };         // filled queue
-    void *ring_filled_storage[RING_SIZE];
-    spsc_ring_t ring_filled;
-    spsc_init(&ring_filled, ring_filled_storage, RING_SIZE);
-
-#if RENDER_USE_PBO
-    // PBOs
-    enum { PBO_COUNT = 3 };
-    typedef struct { GLuint pbo; GLsync fence; } pbo_item_t;
-    pbo_item_t pboq[PBO_COUNT];
-    GLuint pbos[PBO_COUNT];
-    glGenBuffers(PBO_COUNT, pbos);
-    for (int i = 0; i < PBO_COUNT; ++i) {
-        pboq[i].pbo   = pbos[i];
-        pboq[i].fence = 0;
-        glBindBuffer(GL_PIXEL_PACK_BUFFER, pboq[i].pbo);
-        glBufferData(GL_PIXEL_PACK_BUFFER, image_sz, NULL, GL_STREAM_READ);
-    }
-    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-
-    // CPU buffer pool and free ring
-    enum { CPU_POOL = 8 };          // number of reusable CPU buffers
-    uint8_t *cpu_pool[CPU_POOL];
-    for (int i = 0; i < CPU_POOL; ++i) {
-        cpu_pool[i] = (uint8_t*)aligned_alloc(64, (size_t)image_sz);
-        if (!cpu_pool[i]) die("failed to alloc CPU staging buffer\n");
-    }
-    void *ring_free_storage[CPU_POOL];
-    spsc_ring_t ring_free;
-    spsc_init(&ring_free, ring_free_storage, CPU_POOL);
-    for (int i = 0; i < CPU_POOL; ++i) (void)spsc_push(&ring_free, cpu_pool[i]);
-
-    mapper_ctx_t mctx = { .q_filled = &ring_filled, .q_free = &ring_free, .scene = scene, .run = 1 };
-#else
-    // CPU path uses same filled ring, no free ring needed if you do not reuse
-    mapper_ctx_t mctx = { .q_filled = &ring_filled, .q_free = NULL, .scene = scene, .run = 1 };
-#endif
-
-    pthread_t mapper_th;
-    if (pthread_create(&mapper_th, NULL, mapper_thread_main, &mctx) != 0) {
-        die("failed to start mapper thread\n");
-    }
-
-    int slot = 0;
-
-    // main loop
-    while (scene->do_render) {
-        frame++;
-        clock_gettime(CLOCK_MONOTONIC, &end_time);
-        float t  = (float)(end_time.tv_sec - orig_time.tv_sec) + (float)(end_time.tv_nsec - orig_time.tv_nsec) / 1e9f;
-        float dt = (float)(end_time.tv_sec - start_time.tv_sec) + (float)(end_time.tv_nsec - start_time.tv_nsec) / 1e9f;
-
-        glUseProgram(program);
-        glUniform1f(time_loc,  t);
-        glUniform1f(dtym_loc,  dt);
-        glUniform1f(frame_loc, (float)frame);
-
-        // draw the fullscreen quad
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-
-#if RENDER_USE_PBO
-        // queue async readback into current PBO, fence it
-        pbo_item_t *cur = &pboq[slot];
-        glBindBuffer(GL_PIXEL_PACK_BUFFER, cur->pbo);
-        glReadPixels(0, 0, scene->width, scene->height, GL_RGBA, GL_UNSIGNED_BYTE, 0);
-        cur->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-
-        // present after fence creation
-        eglSwapBuffers(display, egl_surface);
-
-        // harvest previous PBO if ready
-        int prev_idx = (slot + PBO_COUNT - 1) % PBO_COUNT;
-        pbo_item_t *prev = &pboq[prev_idx];
-        if (prev->fence) {
-            GLenum r = glClientWaitSync(prev->fence, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
-            if (r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED) {
-                glDeleteSync(prev->fence); prev->fence = 0;
-
-                // pull a free CPU buffer
-                uint8_t *dst = (uint8_t*)spsc_pop(&ring_free);
-                if (dst) {
-                    glBindBuffer(GL_PIXEL_PACK_BUFFER, prev->pbo);
-                    uint8_t *gpu_ptr = (uint8_t*)glMapBufferRange(
-                        GL_PIXEL_PACK_BUFFER, 0, image_sz, GL_MAP_READ_BIT);
-                    if (gpu_ptr) {
-                        memcpy(dst, gpu_ptr, (size_t)image_sz);
-                        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
-
-                        // enqueue to mapper
-                        (void)spsc_try_push(&ring_filled, dst);
-                    }
-                    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-                }
-            } else if (r == GL_WAIT_FAILED) {
-                glFinish();
-                glDeleteSync(prev->fence); prev->fence = 0;
-            }
-        }
-
-        slot = (slot + 1) % PBO_COUNT;
-#else
-        // simple CPU path: readback directly to a freshly malloc'd buffer
-        uint8_t *dst = (uint8_t*)aligned_alloc(64, image_sz);
-        if (LIKELY(dst)) {
-            glReadPixels(0, 0, scene->width, scene->height, GL_RGBA, GL_UNSIGNED_BYTE, dst);
-            eglSwapBuffers(display, egl_surface);
-            (void)spsc_try_push(&ring_filled, dst);
-        } else {
-            eglSwapBuffers(display, egl_surface);
-        }
-#endif
-
-        long slept = calculate_fps(scene->fps, scene->show_fps);
-        if (scene->auto_fps) {
-            long single_time = 1000000 / scene->fps;
-            float percent = 100.0f - (float)slept / (float)single_time * 100.0f;
-            if (percent < 95.0f) scene->fps++;
-            else if (percent > 97.0f) scene->fps--;
-        }
-    }
-
-    // stop mapper and join
-    mctx.run = 0;
-    pthread_join(mapper_th, NULL);
-
-    // cleanup
-    glDeleteBuffers(1, &vbo);
-#if RENDER_USE_PBO
-    glDeleteBuffers(PBO_COUNT, pbos);
-    // free CPU buffer pool
-    for (int i = 0; i < CPU_POOL; ++i) free(cpu_pool[i]);
-#endif
-    eglDestroySurface(display, egl_surface);
-    eglDestroyContext(display, context);
-    eglTerminate(display);
-    gbm_surface_destroy(surface);
-    gbm_device_destroy(gbm);
-    close(fd);
-    return NULL;
-}
-
-
-
-// ------------- replacement function -------------
-/*/
-void *render_shader_old(void *arg) {
-    scene_info *scene = (scene_info*)arg;
-    debug("render shader %s\n", scene->shader_file);
-
-    // DRM / GBM setup
-    int fd = open("/dev/dri/card0", O_RDWR);
-    if (fd < 0) die("Failed to open DRM device /dev/dri/card0\n");
-
-    struct gbm_device *gbm = gbm_create_device(fd);
-    struct gbm_surface *surface = gbm_surface_create(
-        gbm, scene->width, scene->height,
-        GBM_FORMAT_XRGB8888, GBM_BO_USE_RENDERING);
-
-    // EGL and GLES
-    EGLDisplay display = eglGetDisplay(gbm);
-    eglInitialize(display, NULL, NULL);
-    eglBindAPI(EGL_OPENGL_ES_API);
-
-    // prefer ES3 for PBOs, fall back to ES2 if needed
-    EGLConfig config; EGLint num_configs;
-    EGLint attribs[] = {
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, // ES3 preferred
-        EGL_SURFACE_TYPE,   EGL_WINDOW_BIT,
-        EGL_RED_SIZE,       8,
-        EGL_GREEN_SIZE,     8,
-        EGL_BLUE_SIZE,      8,
-        EGL_ALPHA_SIZE,     8,
-        EGL_NONE
-    };
-    eglChooseConfig(display, attribs, &config, 1, &num_configs);
-
-    // request ES 3 context to enable PBO + sync, will still work with ES2 with RENDER_USE_PBO 0
-    static const EGLint context_attribs[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
-    EGLContext context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attribs);
-    EGLSurface egl_surface = eglCreateWindowSurface(display, config, (EGLNativeWindowType)surface, NULL);
-    eglMakeCurrent(display, egl_surface, egl_surface, context);
-
-    // disable vsync so GPU is not capped
-    eglSwapInterval(display, 0);
-
-    // GL program
-    printf("compiling GLSL shader...\n");
-    GLuint program = create_shadertoy_program(scene->shader_file);
-    glUseProgram(program);
-    printf("compiled\n");
-
-    // full screen quad
-    static const GLfloat vertices[] = {
-        -1.f,  1.f, 0.f,   -1.f, -1.f, 0.f,
-         1.f,  1.f, 0.f,    1.f, -1.f, 0.f
-    };
-    GLuint vbo;
-    glGenBuffers(1, &vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
-    GLint pos_attrib = glGetAttribLocation(program, "position");
-    glEnableVertexAttribArray(pos_attrib);
-    glVertexAttribPointer(pos_attrib, 3, GL_FLOAT, GL_FALSE, 0, 0);
-
-
-    // textures, bind once
-    GLuint texture0 = 0, texture1 = 0;
-    char *chan0 = change_file_extension(scene->shader_file, "channel0");
-    if (access(chan0, R_OK) == 0) {
-        texture0 = load_texture(chan0);
-        if (!texture0) die("unable to load texture '%s'\n", chan0);
-    }
-    char *chan1 = change_file_extension(scene->shader_file, "channel1");
-    if (access(chan1, R_OK) == 0) {
-        texture1 = load_texture(chan1);
-        if (!texture1) die("unable to load texture '%s'\n", chan1);
-    }
-    if (texture0) { glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, texture0); }
-    if (texture1) { glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, texture1); }
-
-    // uniforms locations
-    GLint time_loc      = glGetUniformLocation(program, "iTime");
-    GLint timed_loc     = glGetUniformLocation(program, "iTimeDelta");
-    GLint frame_loc     = glGetUniformLocation(program, "iFrame");
-    GLint res_loc       = glGetUniformLocation(program, "iResolution");
-    GLint chan0_loc     = glGetUniformLocation(program, "iChannel0");
-    GLint chan1_loc     = glGetUniformLocation(program, "iChannel1");
-
-    glUniform1i(chan0_loc, 0);
-    glUniform1i(chan1_loc, 1);
-    glUniform3f(res_loc, scene->width, scene->height, 0);
-
-
-    // pack alignment for readbacks
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glDisable(GL_DITHER);
-    glDisable(GL_BLEND);
-    glViewport(0, 0, scene->width, scene->height);
-
-    // frame timing
-    struct timespec start_time, end_time, orig_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
-    clock_gettime(CLOCK_MONOTONIC, &orig_time);
-    unsigned long frame = 0;
-
-    // mapping pipeline
-    const GLsizeiptr image_sz = (size_t)scene->width * scene->height * 4u;
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-
-#if RENDER_USE_PBO
-    printf("PBO in use\n");
-    
-    // 3 PBOs
-    enum { PBO_COUNT = 3 };
-    typedef struct { GLuint pbo; GLsync fence; uint8_t *cpu; } pbo_item_t;
-    pbo_item_t pboq[PBO_COUNT];
-    map_job_t jobs[PBO_COUNT];
-
-    GLuint pbos[PBO_COUNT];
-    glGenBuffers(PBO_COUNT, pbos);
-    for (int i=0;i<PBO_COUNT;i++) {
-        pboq[i].fence = 0;
-        pboq[i].cpu   = (uint8_t*)aligned_alloc(64, image_sz);
-        pboq[i].pbo   = pbos[i];
-        glBindBuffer(GL_PIXEL_PACK_BUFFER, pboq[i].pbo);
-        glBufferData(GL_PIXEL_PACK_BUFFER, image_sz, NULL, GL_STREAM_READ);
-    }
-    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-
-    // CPU buffer pool and rings
-    enum { CPU_POOL = 8, RING_SIZE = 8 };
-    uint8_t *cpu_pool[CPU_POOL];
-    for (int i = 0; i < CPU_POOL; ++i) {
-        cpu_pool[i] = (uint8_t*)aligned_alloc(64, image_sz);
-        if (!cpu_pool[i]) die("failed to alloc CPU staging buffer\n");
-    }
-
-    void *ring_filled_storage[RING_SIZE];
-    void *ring_free_storage[CPU_POOL];
-
-    spsc_ring_t ring_filled, ring_free;
-    spsc_init(&ring_filled, ring_filled_storage, RING_SIZE);
-    spsc_init(&ring_free,   ring_free_storage,   CPU_POOL);
-
-    // populate free ring with all buffers
-    for (int i = 0; i < CPU_POOL; ++i) (void)spsc_push(&ring_free, cpu_pool[i]);
-
-    // mapper thread
-    mapper_ctx_t mctx = { .q_in = &ring_filled, .q_free = &ring_free, .run = 1 };
-    pthread_t mapper_th;
-    if (pthread_create(&mapper_th, NULL, mapper_thread_main, &mctx) != 0) {
-        die("failed to start mapper thread\n");
-    }
-
-#else
-    // CPU path
-    enum { CPU_BUF_COUNT = 3, RING_SIZE = 8 };
-    uint8_t *cpu_bufs[CPU_BUF_COUNT];
-    for (int i = 0; i < CPU_BUF_COUNT; ++i) {
-        cpu_bufs[i] = (uint8_t*)aligned_alloc(64, image_sz);
-        if (!cpu_bufs[i]) die("failed to alloc CPU staging buffer\n");
-    }
-    map_job_t jobs[CPU_BUF_COUNT];
-
-    void *ring_filled_storage[RING_SIZE];
-    spsc_ring_t ring_filled;
-    spsc_init(&ring_filled, ring_filled_storage, RING_SIZE);
-
-    mapper_ctx_t mctx = { .q_in = &ring_filled, .q_free = NULL, .scene = scene, .run = 1 };
-    pthread_t mapper_th;
-    if (pthread_create(&mapper_th, NULL, mapper_thread_main, &mctx) != 0) {
-        die("failed to start mapper thread\n");
-    }
-#endif
-
-
-
-
-
-#else
-    // CPU staging buffers and jobs
-    enum { CPU_BUF_COUNT = 3 };
-    uint8_t *cpu_bufs[CPU_BUF_COUNT];
-    for (int i = 0; i < CPU_BUF_COUNT; ++i) {
-        cpu_bufs[i] = (uint8_t*)aligned_alloc(64, image_sz);
-        if (!cpu_bufs[i]) die("failed to alloc CPU staging buffer\n");
-    }
-    map_job_t jobs[CPU_BUF_COUNT];
-#endif
-
-    // mapper thread and ring
-    enum { RING_SIZE = 8 };
-    void *ring_storage[RING_SIZE];
-    spsc_ring_t ring;
-    spsc_init(&ring, ring_storage, RING_SIZE);
-
-    mapper_ctx_t mctx = { .q_in = &ring, .run = 1 };
-    pthread_t mapper_th;
-    if (pthread_create(&mapper_th, NULL, mapper_thread_main, &mctx) != 0) {
-        die("failed to start mapper thread\n");
-    }
-
-    int slot = 0;
-
-    while (scene->do_render) {
-        frame++;
-        clock_gettime(CLOCK_MONOTONIC, &end_time);
-        float t  = (end_time.tv_sec - orig_time.tv_sec) + (end_time.tv_nsec - orig_time.tv_nsec) / 1e9f;
-        float dt = (end_time.tv_sec - start_time.tv_sec) + (end_time.tv_nsec - start_time.tv_nsec) / 1e9f;
-
-        glUseProgram(program);
-        glUniform1f(time_loc,  t);
-        glUniform1f(timed_loc, dt);
-        glUniform1f(frame_loc, (float)frame);
-
-        // render full-screen quad
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-
-#if RENDER_USE_PBO
-        // 1) Kick async readback for current slot
-        pbo_item_t *cur = &pboq[slot];
-        glBindBuffer(GL_PIXEL_PACK_BUFFER, cur->pbo);
-        glReadPixels(0, 0, scene->width, scene->height, GL_RGBA, GL_UNSIGNED_BYTE, 0);
-        // make sure the GPU sees the commands soon
-        glFlush();
-        cur->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-
-        eglSwapBuffers(display, egl_surface);
-
-        // 2) Try to harvest the previous slot
-        int prev_idx = (slot + PBO_COUNT - 1) % PBO_COUNT;
-        pbo_item_t *prev = &pboq[prev_idx];
-
-        if (prev->fence) {
-            // ask once, also ask driver to flush if needed
-            GLenum r = glClientWaitSync(prev->fence, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
-            if (r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED) {
-                glDeleteSync(prev->fence); prev->fence = 0;
+            if (r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED)
+            {
+                glDeleteSync(prev->fence);
+                prev->fence = 0;
+
+                
 
                 glBindBuffer(GL_PIXEL_PACK_BUFFER, prev->pbo);
-                uint8_t *gpu_ptr = (uint8_t*)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, image_sz, GL_MAP_READ_BIT);
-                if (gpu_ptr) {
-                    memcpy(prev->cpu, gpu_ptr, image_sz);
+                uint8_t *gpu_ptr = (uint8_t *)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, image_sz, GL_MAP_READ_BIT);
+                if (gpu_ptr)
+                {
+                    memcpy(dst, gpu_ptr, (size_t)image_sz);
                     glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
-
-                    // queue to mapper as CPU job
-                    map_job_t *job = &jobs[prev_idx];
-                    job->kind = JOB_CPU_PIXELS;
-                    job->scene = scene;
-                    job->size_bytes = image_sz;
-                    job->u.cpu.pixels = prev->cpu;
-                    // try to push, drop if full to avoid deadlock
-                    if (!spsc_try_push(&ring, job)) {
-                        printf("mapper ring full, dropping frame\n");
-                    }
+                    spsc_push_ptr_commit(scene->ring_buf_mapper);
                 }
                 glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-            } else if (r == GL_WAIT_FAILED) {
-                // driver issue or context problem, fallback: block once
+            }
+            else if (r == GL_WAIT_FAILED)
+            {
                 glFinish();
-                glDeleteSync(prev->fence); prev->fence = 0;
+                glDeleteSync(prev->fence);
+                prev->fence = 0;
             }
         }
-
         slot = (slot + 1) % PBO_COUNT;
 #else
-        // CPU path: read directly to a staging buffer, then enqueue pointer
-        uint8_t *dst = cpu_bufs[slot];
+        // pull the pixels back to the CPU using the CPU
         glReadPixels(0, 0, scene->width, scene->height, GL_RGBA, GL_UNSIGNED_BYTE, dst);
-        eglSwapBuffers(display, egl_surface);
 
-        map_job_t *job = &jobs[slot];
-        job->kind = JOB_CPU_PIXELS;
-        job->scene = scene;
-        job->size_bytes = image_sz;
-        job->u.cpu.pixels = dst;
-
-        if (!spsc_try_push(&ring, job)) {
-            printf("mapper ring full, dropping frame\n");
-        }
-        slot = (slot + 1) % CPU_BUF_COUNT;
+        eglSwapBuffers(gpu_ctx->display, gpu_ctx->egl_surface);
+        // push the read frame onto the mapper thread
+        spsc_push_ptr_commit(scene->ring_buf_mapper);
 #endif
 
-        // FPS pacing and adaptive fps, unchanged
         long slept = calculate_fps(scene->fps, scene->show_fps);
-        if (scene->auto_fps) {
-            long single_time = 1000000 / scene->fps;
-            float percent = 100.0f - (float)slept / (float)single_time * 100.0f;
-            if (percent < 95.0f) scene->fps++;
-            else if (percent > 97.0f) scene->fps--;
-        }
+        
     }
 
-    // stop mapper
-    map_job_t quit = { .kind = JOB_QUIT, .scene = scene, .size_bytes = 0 };
-    (void)spsc_try_push(&ring, &quit);
-    pthread_join(mapper_th, NULL);
+    debug(" ## GPU render thread exiting...\n");
 
-    // Cleanup GL
+    // cleanup
     glDeleteBuffers(1, &vbo);
 #if RENDER_USE_PBO
-    // glDeleteBuffers(PBO_COUNT, pboq);
-#else
-    for (int i = 0; i < CPU_BUF_COUNT; ++i) free(cpu_bufs[i]);
+    glDeleteBuffers(3, (GLuint[]){pboq[0].pbo, pboq[1].pbo, pboq[2].pbo});
 #endif
-    eglDestroySurface(display, egl_surface);
-    eglDestroyContext(display, context);
-    eglTerminate(display);
-    gbm_surface_destroy(surface);
-    gbm_device_destroy(gbm);
-    close(fd);
+    cleanup_gpu_context(gpu_ctx);
+
     return NULL;
 }
-    */
+

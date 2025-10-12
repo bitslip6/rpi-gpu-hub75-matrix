@@ -27,6 +27,7 @@
 #include "mymath.h"
 #include "hub75gpu.h"
 #include "transformers.h"
+#include "scene.h"
 
 #define MEMGUARD_OVERRIDE_STDLIB
 #include "memguard2.h"
@@ -74,6 +75,19 @@ char *str_trim_spaces(char *s) {
     return s;
 }
 
+/**
+ * @brief safe free a pointer and set it to NULL
+ * 
+ * @param pp pointer to the pointer to free
+ */
+void safe_free(void **pp) {
+    void *p = *pp;
+    if (p) {
+        free(p);
+        *pp = NULL;
+    }
+}
+
 
 /**
  * @brief parse a string to a float, return -1 on error
@@ -112,7 +126,6 @@ int parse_panel_types(const char *arg,
         return -1;
     }
 
-
     int count = 0;
     uint8_t max_type = 0;
     char *save_outer = NULL;
@@ -133,7 +146,8 @@ int parse_panel_types(const char *arg,
                 break;
             }
             uint8_t v = ato8(str_trim_spaces(ctok));
-            if (v > max_type) {
+            printf("  !! -- panel type %d\n", v);
+            if (v > max_type && v <= max_out) {
                 max_type = v;
             }
             dst[count++] = v;
@@ -143,8 +157,9 @@ int parse_panel_types(const char *arg,
 
     // output the maximum panel type number
     if (out_count) {
-        *out_count = max_type;
+        *out_count = max_type + 1;
     }
+
     return 0;
 }
 
@@ -185,7 +200,7 @@ int parse_panel_scales(const char *arg,
         {
             float v;
             if (parse_float(str_trim_spaces(ctok), &v) != 0) {
-                free(buf);
+                SAFE_FREE(buf);
                 return -1;
             }
             if      (idx == 0) s.red_q8   = math_norm_q8(v);
@@ -196,7 +211,7 @@ int parse_panel_scales(const char *arg,
         dst[count++] = s;
     }
 
-    free(buf);
+    SAFE_FREE(buf);
     if (out_count) {
         *out_count = count;
     }
@@ -248,7 +263,7 @@ int parse_panel_offsets(const char *arg,
         dst[count++] = s;
     }
 
-    free(buf);
+    SAFE_FREE(buf);
     if (out_count) {
         *out_count = count;
     }
@@ -425,8 +440,9 @@ scene_info *parse_scene(int argc, char **argv) {
             }
             break;
         case 'P':
+            debug("parse panel types: %s\n", optarg);
             if (parse_panel_types(optarg, scene->panel_types, MAX_PANEL_TYPES, &scene->num_panel_types) != 0) {
-                fprintf(stderr, "invalid -T format: %s\n", optarg);
+                fprintf(stderr, "invalid -P format: %s\n", optarg);
                 exit(1);
             }
             break;
@@ -535,7 +551,7 @@ scene_info *parse_scene(int argc, char **argv) {
 
 
     if (num_scales != 0 && num_scales != scene->num_panel_types) {
-        fprintf(stderr, "-T does not match -P !!\n\n");
+        fprintf(stderr, "-T does not match -P num scale: %d, num types: %d!!\n\n", num_scales, scene->num_panel_types);
         fprintf(stderr, "each R:G:B comma 'pair' passed to -T represents a single panel type scaling for RGB planes\n");
         fprintf(stderr, "each output port has it's panel type defined in -P\n");
         fprintf(stderr, "seperate panel types for each port with a colon, separate ports with a comma\n\n");
@@ -753,7 +769,7 @@ static void rotate_u32(uint32_t *a, size_t n, size_t rot) {
  * Returns malloc()'d array of uint32_t, caller must free().
  */
 uint32_t *create_jitter_mask(const uint16_t jitter_size, const uint8_t brightness) {
-    const size_t n = (size_t)jitter_size;
+    const size_t n = (size_t)jitter_size + 1024*16; // add extra to avoid modulo bias 
     uint32_t *jitter = (uint32_t*)malloc(n * sizeof(uint32_t));
     if (!jitter) return NULL;
 
@@ -819,6 +835,33 @@ uint32_t *create_jitter_mask(const uint16_t jitter_size, const uint8_t brightnes
 
 
 /**
+ * @brief return the difference between two timespecs in microseconds
+ */
+int64_t ts_diff_us(const struct timespec *a, const struct timespec *b) {
+    return (int64_t)(a->tv_sec - b->tv_sec) * 1000000LL
+         + (int64_t)(a->tv_nsec - b->tv_nsec) / 1000LL;
+}
+
+
+/**
+ * @brief Adds a specified number of milliseconds to a timespec structure, handling the overflow
+ *              of nanoseconds to seconds.
+ * 
+ * @param ts: Pointer to the timespec structure to modify.
+ * @param ms: Number of milliseconds to add.
+ */
+void timespec_add_ms(struct timespec *ts, long ms)
+{
+    ts->tv_sec += ms / 1000;
+    ts->tv_nsec += (ms % 1000) * 1000000L;
+    if (ts->tv_nsec >= 1000000000L)
+    {
+        ts->tv_nsec -= 1000000000L;
+        ts->tv_sec++;
+    }
+}
+
+/**
  * @brief count number of times this function is called, 1 every second output
  * the number of times called and reset the counter. This function can not
  * be called from multiple locations. It is not thread safe.
@@ -826,7 +869,7 @@ uint32_t *create_jitter_mask(const uint16_t jitter_size, const uint8_t brightnes
  * @param target_fps - target a sleep time to achieve this fps
  * @return long - returns sleep time in microseconds
  */
-long calculate_fps(const uint16_t target_fps, const bool show_fps) {
+long calculate_fps_old(const uint16_t target_fps, const bool show_fps) {
     // Variables to track FPS
     static unsigned long frame_count = 0;
     static time_t        last_time_s = 0;
@@ -856,10 +899,10 @@ long calculate_fps(const uint16_t target_fps, const bool show_fps) {
         if (show_fps) {
             double percent = 100.0;
             if (sleep_time > 0) {
-                double percent = 100-(double)((double)sleep_time / (double)target_frame_time_us)*100;
+                percent = 100-((double)((double)sleep_time / (double)target_frame_time_us)*100);
             }
             printf("%ld, FPS: %ld, micro second sleep per frame: %d, CPU: %.1f%%\n", frame_time, frame_count, sleep_time, percent);
-    }
+        }
 
         // Reset frame count and update last_time
         frame_count = 0;
@@ -869,6 +912,66 @@ long calculate_fps(const uint16_t target_fps, const bool show_fps) {
     clock_gettime(CLOCK_MONOTONIC, &last_time);
     return sleep_time;
 }
+
+
+long calculate_fps(const uint16_t target_fps, const bool show_fps) {
+    static bool           inited = false;
+    static struct timespec last_ts;          /* last frame timestamp */
+    static struct timespec window_start_ts;  /* start of current 1 s window */
+    static unsigned long   frame_count = 0;
+
+    struct timespec now_ts;
+    clock_gettime(CLOCK_MONOTONIC, &now_ts);
+
+    if (!inited) {
+        last_ts = now_ts;
+        window_start_ts = now_ts;
+        inited = true;
+    }
+
+    long frame_time_us = ts_diff_us(&now_ts, &last_ts);
+    if (frame_time_us < 0) frame_time_us = 0;
+
+    /* compute target frame time in usec, guard divide by zero */
+    uint32_t target_frame_time_us = (target_fps > 0) ? (1000000u / target_fps) : 0u;
+
+    /* sleep to match target fps */
+    long sleep_time_us = 0;
+    if (target_frame_time_us > 0 && frame_time_us < (long)target_frame_time_us) {
+        sleep_time_us = (long)target_frame_time_us - frame_time_us;
+        if (sleep_time_us > 10 && sleep_time_us < 1000000L) {
+            usleep((useconds_t)sleep_time_us);
+            /* refresh timestamps so next frame delta starts after sleep */
+            clock_gettime(CLOCK_MONOTONIC, &now_ts);
+            frame_time_us = ts_diff_us(&now_ts, &last_ts); /* now includes sleep */
+        }
+    }
+
+    frame_count++;
+    last_ts = now_ts;
+
+    /* once per second, print and reset window, no internal loops */
+    long window_us = ts_diff_us(&now_ts, &window_start_ts);
+    if (window_us >= 1000000L) {
+        if (show_fps) {
+            double percent = 100.0;
+            if (target_frame_time_us > 0 && sleep_time_us > 0) {
+                /* percent cpu used this frame based on sleep ratio, same intent as original */
+                percent = 100.0 - ((double)sleep_time_us / (double)target_frame_time_us) * 100.0;
+                if (percent < 0.0) percent = 0.0;
+                if (percent > 100.0) percent = 100.0;
+            }
+            printf("%ld, FPS: %lu, micro second sleep per frame: %ld, CPU: %.1f%%\n",
+                   frame_time_us, frame_count, sleep_time_us, percent);
+        }
+        window_start_ts = now_ts;  /* start a new one second window */
+        frame_count = 0;
+    }
+
+    return sleep_time_us;
+}
+
+
 
 
 /**

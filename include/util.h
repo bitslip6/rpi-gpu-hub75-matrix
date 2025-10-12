@@ -1,10 +1,10 @@
 #include <unistd.h>
 #include <stdint.h>
 
-#include "rpihub75.h"
 
-#ifndef _UTIL_H
-#define _UTIL_H 1
+#ifndef __UTIL_H__
+#define __UTIL_H__
+#include "rpihub75.h"
 
 
 /**
@@ -44,7 +44,39 @@ void die(const char *message, ...);
  * @param format 
  * @param ... 
  */
+#define HAVE_DEBUG_FUNC 1
 void debug(const char *format, ...);
+
+/**
+ * @brief return the difference between two timespecs in microseconds
+ */
+int64_t ts_diff_us(const struct timespec *a, const struct timespec *b);
+
+
+/**
+ * @brief Adds a specified number of milliseconds to a timespec structure, handling the overflow
+ *              of nanoseconds to seconds.
+ **/
+void timespec_add_ms(struct timespec *ts, long ms);
+
+/**
+ * @brief safe free a pointer and set it to NULL
+ * 
+ * @param pp pointer to the pointer to free
+ */
+void safe_free(void **pp);
+
+#ifndef SAFE_FREE
+#define SAFE_FREE(p)                                      \
+    do {                                                  \
+        void **__pp = (void**)&(p);                       \
+        if (__pp && *__pp) {                              \
+            free(*__pp);  /* or mg_free(*__pp); */        \
+            *__pp = NULL;                                 \
+        }                                                 \
+    } while (0)
+#endif
+
 
 
 /**
@@ -66,7 +98,7 @@ uint32_t *create_jitter_mask(const uint16_t jitter_size, const uint8_t brightnes
  * @return int number of bytes written, -1 on error
  */
 
-int file_put_contents(const char *filename, const void *data, const size_t size);
+size_t file_put_contents(const char *filename, const void *data, const size_t size);
 
 /**
  * @brief read in a file, allocate memory and return the data. caller must free.
@@ -105,14 +137,9 @@ void binary64(FILE *fd, const uint64_t number);
 int rnd(unsigned char *buffer, const size_t size);
 
 /**
- * @brief count number of times this function is called, 1 every second output
- * the number of times called and reset the counter. This function can not
- * be called from multiple locations. It is not thread safe.
- * 
- * @param target_fps - target a sleep time to achieve this fps
- * @return long - returns sleep time in microseconds
+ * @brief compute exponential moving average
  */
-long calculate_fps(const uint16_t target_fps, const bool show_fps);
+float math_ema(float new_value, float old_value, float alpha);
 
 /**
  * @brief map the gpio pins to memory
@@ -120,7 +147,7 @@ long calculate_fps(const uint16_t target_fps, const bool show_fps);
  * @param offset 
  * @return uint32_t* 
  */
-uint32_t* map_gpio(uint32_t offset, int version);
+uint32_t* map_gpio(int version);
 
 /**
  * @brief remove whitespace from string
@@ -131,6 +158,8 @@ char *str_trim_spaces(char *s);
 
 int parse_float(const char *s, float *out);
 uint8_t math_norm_q8(float x);
+Normal normalize(float x, float period);
+
 
 /**
  * @brief set the GPIO pins for hub75 operation.  this is based on hzeller's active board pinouts
@@ -148,17 +177,6 @@ void configure_gpio(uint32_t *PERIBase, int version);
  */
 void usage(int argc, char **argv);
 
-/**
- * @brief create a default scene setup using the #DEFINE values
- * parse command line options to override. This is a great way
- * to test your setup easily from command line
- * @see usage() for details
- * 
- * @param argc 
- * @param argv 
- * @return scene_info* 
- */
-scene_info *default_scene(int argc, char **argv);
 
 /**
  * @brief draw various test patterns to the display
@@ -178,13 +196,12 @@ void *calibrate_panels(void *arg);
  */
 void* receive_udp_data(void *arg);
 
+
 /**
- * @brief  test if a file has a specific extension
- * 
- * @param filename 
- * @param extension 
- * @return true|false
+ * @brief test if a file exists
  */
-bool has_extension(const char *filename, const char *extension);
+bool file_exists(const char *filename);
+
+
 
 #endif

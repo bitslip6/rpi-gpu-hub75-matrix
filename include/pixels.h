@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include "rpihub75.h"
+#include "hub75gpu.h"
 
 #ifndef _HUB75_PIXELS_H
 #define _HUB75_PIXELS_H 1
@@ -28,6 +29,8 @@
 #define rfpart(x) (1.0f - fpart(x)) // 1 - fractional part of x
 
 
+void *mapper_thread_main(void *arg);
+
 /**
  * @brief function definition to function that maps RGB image data
  * to BCM data for shifting out to GPIO
@@ -48,27 +51,15 @@ typedef void (*update_bcm_signal_fn)(
  * @param image the input RGB or RGBA image to render
  * @param offset offset into the bcm buffer
  */
-void update_bcm_signal_64(
+__attribute__((hot))
+void update_bcm_signal_64_rgb(
     const scene_info *scene,
     const void *__restrict__ void_bits,
     uint32_t *__restrict__ bcm_signal,
-    const uint8_t *__restrict__ images);
-
-
-/**
- * @brief update_bcm_signal_fn implementation for up to 32 bit BCM data
- * 
- * @param scene 
- * @param void_bits 
- * @param bcm_signal 
- * @param image 
- * @param offset 
- */
-void update_bcm_signal_32(
-    const scene_info *scene,
-    const void *__restrict__ void_bits,
-    uint32_t *__restrict__ bcm_signal,
-    const uint8_t *__restrict__ image);
+    const uint8_t *__restrict__ image,
+    uint16_t *__restrict__ quant_err_lut,
+    uint8_t phase
+);
 
 
 
@@ -80,7 +71,7 @@ void update_bcm_signal_32(
  * @param scene the scene information
  * @param image the image to map to the scene bcm data. if NULL scene->image will be used
  */
-void map_byte_image_to_bcm(scene_info *scene, uint8_t *image);
+void map_byte_image_to_bcm(const scene_info *scene, const uint8_t *image);
 
 
 /**
@@ -235,7 +226,7 @@ void copy_tone_mapperF(const RGBF *__restrict__ in, RGBF *__restrict__ out, cons
  * 
  */
 __attribute__((cold))
-void *tone_map_rgb_bits(const scene_info *scene, const int num_bits, uint16_t *quant_errors);
+void *tone_map_rgb_bits(const scene_info *scene, const uint8_t num_bits, uint16_t *quant_errors);
 
 
 
@@ -277,20 +268,6 @@ void hub_line(scene_info *scene, int x0, int y0, int x1, int y1, RGB color);
  */
 void hub_line_aa(scene_info *scene, int x0, int y0, int x1, int y1, RGB color);
 
-
-/**
- * @brief draw an unfilled anti-aliased triangle using Xiolin Wu's line drawing algorithm
- * 
- * @param scene 
- * @param x0  p0 x
- * @param y0  p0 y
- * @param x1  p1 x
- * @param y1  p2 y
- * @param x2  p3 x
- * @param y2  p3 y
- * @param color 
- */
-void hub_triangle_aa(scene_info *scene, int x0, int y0, int x1, int y1, int x2, int y2, RGB color);
 
 /**
  * @brief draw an unfilled aliased triangle using Xiolin Wu's line drawing algorithm

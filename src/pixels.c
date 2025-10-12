@@ -24,8 +24,38 @@
 #include "util.h"
 #include "pixels.h"
 #include "mymath.h"
+#include "spsc.h"
 
+/**
+ * @brief Entry point for the mapper thread. Continuously monitors the filled ring buffer,
+ *              maps the rendered GPU image to the display system, and signals frame updates.
+ * 
+ * @param arg: Pointer to a mapper_ctx_t structure containing context for the mapper thread, including
+ *          ring buffers and scene information.
+ * Returns: Pointer indicating thread termination (unused in this context).
+ */
+void *mapper_thread_main(void *arg)
+{
+    debug(" ~~ BCM mapper thread started\n");
 
+    scene_info *scene = (scene_info *)arg;
+
+    while (scene->do_render)
+    {
+        const uint8_t *src = spsc_pop_ptr_begin(scene->ring_buf_mapper, 200);
+        if (src == NULL) {
+            continue;
+        }
+
+        // map the linear rgba image to bcm mapping
+        map_byte_image_to_bcm(scene, src);
+
+        spsc_pop_ptr_commit(scene->ring_buf_mapper);
+    }
+
+    printf(" ## BCM mapper thread exiting...\n");
+    return NULL;
+}
 
 
 
@@ -674,7 +704,7 @@ void update_bcm_signal_64_rgb(
     const scene_info *scene,
     const void *__restrict__ void_bits,
     uint32_t *__restrict__ bcm_signal,
-    const uint8_t *__restrict__ image,
+    const uint8_t *image,
     uint16_t *__restrict__ quant_err_lut,
     uint8_t phase
 ) {
@@ -682,23 +712,24 @@ void update_bcm_signal_64_rgb(
     static int32_t *accum = NULL;
     static int32_t cached_w = -1, cached_h = -1, cached_stride = -1;
 
+
+    // AGENT: an we hoist this conditional out of the loop?
     if (UNLIKELY(scene->width != cached_w || scene->panel_height != cached_h || scene->stride != cached_stride)) {
         cached_w = scene->width;
         cached_h = scene->panel_height;
         cached_stride = scene->stride;
         if (accum != NULL) {
-            free(accum);
+            SAFE_FREE(accum);
         }
         size_t acc_size = (size_t)(scene->width * scene->height * scene->stride);
         accum = (int32_t*)calloc(acc_size, sizeof(int32_t));
         build_port_luts(); // once
+        debug("  alloc dither accum %zu bytes\n", acc_size * sizeof(int32_t));
     }
 
-    // can be called from anywhere for cleanup
-    if (UNLIKELY(phase == 255)) {
-        if (accum != NULL) {
-            free(accum);
-        }
+    if (accum == NULL || image == NULL) {
+        debug("  dither accum or image is NULL\n");
+        // allocation failed
         return;
     }
 
@@ -1109,12 +1140,14 @@ static inline void copy_rect_rgb(const uint8_t *pixels, uint8_t *mapped_pixels,
 }
 
 
-static inline void apply_panel_brightness_q8(uint8_t * pixels, uint8_t *mapped_pixels, scene_info *scene) {
+static inline void apply_panel_brightness_q8(uint8_t * pixels, uint8_t *mapped_pixels, const scene_info *scene) {
     for (int py = 0; py < scene->num_ports; ++py) {
         for (int px = 0; px < scene->num_chains; ++px) {
             const int idx = py * scene->num_chains + px;
-            const int panel_type = scene->panel_types[idx] - 1;
-            if ((unsigned)panel_type >= (unsigned)scene->num_panel_types) continue;
+            const int panel_type = scene->panel_types[idx];
+            if ((unsigned)panel_type >= (unsigned)scene->num_panel_types) {
+                continue;
+            }
 
             const uint16_t rq = scene->panel_scale[panel_type].red_q8;
             const uint16_t gq = scene->panel_scale[panel_type].green_q8;
@@ -1157,7 +1190,7 @@ static inline void apply_panel_brightness_q8(uint8_t * pixels, uint8_t *mapped_p
  * @param image the image to map to the scene bcm data. if NULL scene->image will be used
  */
 __attribute__((hot))
-void map_byte_image_to_bcm(scene_info *scene, uint8_t *image) {
+void map_byte_image_to_bcm(const scene_info *scene, const uint8_t *image) {
 
     // tone map the bits for the current scene, update if the lookup table if scene tone mapping changes....
     // TODO: create per panel tone mapping tables if panels have different characteristics
@@ -1182,7 +1215,7 @@ void map_byte_image_to_bcm(scene_info *scene, uint8_t *image) {
             quant_errors = (uint16_t*)calloc(768*2, sizeof(uint16_t));
         }
         if (bits != NULL) { // don't leak memory!
-            free(bits);
+            SAFE_FREE(bits);
         }   
         bits = (uint64_t*)tone_map_rgb_bits(scene, scene->bit_depth, quant_errors);
         debug("new tone mapped bits created\n");
@@ -1191,6 +1224,11 @@ void map_byte_image_to_bcm(scene_info *scene, uint8_t *image) {
     // select our image source
     uint8_t *image_ptr = (image == NULL) ? scene->image : image;
 
+    if (image_ptr == NULL) {
+        debug("not mapping null image");
+        return;
+    }
+
     // map the image to handle weird panel chain configurations
     // the image mapper should take a normal image and map it to match the chain configuration
     // the image mapper should operate on the image in place
@@ -1198,7 +1236,6 @@ void map_byte_image_to_bcm(scene_info *scene, uint8_t *image) {
         scene->image_mapper(image_ptr, mapped_image, scene);
         image_ptr = mapped_image;
     }
-
 
     if (scene->num_panel_types > 1) {
         apply_panel_brightness_q8(image_ptr, mapped_image2, scene);
@@ -1209,11 +1246,6 @@ void map_byte_image_to_bcm(scene_info *scene, uint8_t *image) {
         //dither_spatial_bayer8_low(image_ptr, scene->width, scene->height, scene->stride, 80, (uint8_t)scene->dither);
         dither_spatial_hash_low(image_ptr, scene->width, scene->height, scene->stride, 80, (uint8_t)scene->dither);
     }
-
-
-   
-    //update_bcm_signal_fn update_bcm_signal = NULL;
-    //update_bcm_signal = (update_bcm_signal_fn)update_bcm_signal_64_rgb;
 
     ASSERT(scene->panel_height % 16 == 0);
     ASSERT(scene->panel_width % 16 == 0);
@@ -1226,10 +1258,13 @@ void map_byte_image_to_bcm(scene_info *scene, uint8_t *image) {
     ASSERT(half_height % 16 == 0);
     ASSERT(width % 32 == 0);                        // Ensure length is a multiple of 32
 
-    // which buffer we are rendering to
-    uint32_t *bcm_signal = (scene->bcm_ptr)
-        ? (scene->bcm_signalA)
-        : (scene->bcm_signalB);
+
+    uint32_t *bcm_signal = (uint32_t *) spsc_push_ptr_begin(scene->ring_buf_renderer, 200);
+    if (!bcm_signal) {
+        // we are dropping a frame, just return
+        debug("dropping mapp frame\n");
+        return;
+    }
 
     // convenience variables
     const uint16_t stride     = scene->stride;
@@ -1249,9 +1284,7 @@ void map_byte_image_to_bcm(scene_info *scene, uint8_t *image) {
         }
     }
 
-    // flip the double buffer. render_forever will detect this on next vsync and switch the buffers
-    scene->bcm_ptr = !scene->bcm_ptr;
-    scene->frame_index++;
+    spsc_push_ptr_commit(scene->ring_buf_renderer);
 }
 
 
@@ -1508,29 +1541,43 @@ void hub_line(scene_info *scene, int x0, int y0, int x1, int y1, RGB color) {
 void hub_line_aa(scene_info *scene, const int x0, const int y0, const int x1, const int y1, const RGB color) {
 
 
-    float fx0 = (float)MIN(x0, scene->width-1);
-    float fx1 = (float)MIN(x1, scene->width-1);
-    float fy0 = (float)MIN(y0, scene->height-1);
-    float fy1 = (float)MIN(y1, scene->height-1);
+    float fx0 = clampf(x0, 0, scene->width-1);
+    float fx1 = clampf(x1, 0, scene->width-1);
+    float fy0 = clampf(y0, 0, scene->width-1);
+    float fy1 = clampf(y1, 0, scene->width-1);
 
+
+    /* handle the trivial point */
+    if ((int)fx0 == (int)fx1 && (int)fy0 == (int)fy1) {
+        hub_pixel(scene, (int)fx0, (int)fy0, color);
+        return;
+    }
 
     float dx = (fx1 - fx0);
     float dy = (fy1 - fy0);
     
     int steep = fabs(dy) > fabs(dx);
-    
-    
-    
+
+    if (steep) {
+        /* swap x <-> y for both endpoints */
+        float tmp;
+        tmp = fx0; fx0 = fy0; fy0 = tmp;
+        tmp = fx1; fx1 = fy1; fy1 = tmp;
+        /* recompute deltas in swapped space */
+        dx = fx1 - fx0;
+        dy = fy1 - fy0;
+    }
+
+    /* ensure we iterate left to right in the major axis */
     if (fx0 > fx1) {
-        // Swap (fx0, fy0) with (fx1, fy1)
         float tmp;
         tmp = fx0; fx0 = fx1; fx1 = tmp;
         tmp = fy0; fy0 = fy1; fy1 = tmp;
-        dx = (float)(fx1 - fx0);
-        dy = (float)(fy1 - fy0);
+        dx = fx1 - fx0;
+        dy = fy1 - fy0;
     }
 
-    float gradient = (dx == 0.0f) ? 1.0f : dy / dx;
+    float gradient = (dx == 0.0f) ? 0.0f : dy / dx;
 
     // Handle the first endpoint
     float xend = roundf(fx0);
