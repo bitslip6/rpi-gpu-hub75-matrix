@@ -59,7 +59,7 @@ PKG_LIBS_GPU     := $(shell $(PKG_CONFIG) --libs $(PKG_GPU) 2>/dev/null)
 
 CFLAGS ?= $(STD_FLAGS) $(OPT_FLAGS) $(WARN_FLAGS) $(FEATURE_FLAGS) $(INCLUDE_FLAGS) $(CFLAGS_CPU) $(PKG_CFLAGS) $(DEBUG_EXTRA) $(EXTRA_CFLAGS)
 
-LDLIBS_COMMON = -pthread -lm
+LDLIBS_COMMON = -pthread -lm -lrt
 LDLIBS_FFMPEG = $(PKG_LIBS_FFMPEG)
 LDLIBS_GPU    = $(PKG_LIBS_GPU)
 
@@ -78,7 +78,7 @@ LIBDIR      ?= $(PREFIX)/lib
 # (BUILDDIR set per BUILD above)
 
 # Sources
-SRC_COMMON = src/util.c src/pixels.c src/rpihub75.c src/scene.c src/transformers.c src/hub_api.c
+SRC_COMMON = src/util.c src/spsc.c src/pixels.c src/rpihub75.c src/scene.c src/transformers.c src/hub_api.c
 SRC_GPU    = src/gpu.c src/video.c
 
 # Library names
@@ -196,8 +196,8 @@ install: all
 	$(Q)mkdir -p $(DESTDIR)$(INCLUDEDIR)
 	@echo "[INSTALL] libs -> $(DESTDIR)$(LIBDIR)"
 	$(Q)mkdir -p $(DESTDIR)$(LIBDIR)
-	#$(Q)cp include/rpihub75.h include/util.h include/gpu.h include/pixels.h include/video.h include/scene.h $(DESTDIR)$(INCLUDEDIR) 
-	$(Q)cp include/hub75gpu.h $(DESTDIR)$(INCLUDEDIR) 
+	#$(Q)cp include/rpihub75.h include/util.h include/gpu.h include/spsc.h include/pixels.h include/video.h include/scene.h $(DESTDIR)$(INCLUDEDIR) 
+	$(Q)cp include/hub75gpu.h include/spsc.h include/pixels.h include/util.h $(DESTDIR)$(INCLUDEDIR) 
 	$(Q)cp $(LIB_NO_GPU) $(LIB_GPU) $(DESTDIR)$(LIBDIR)
 	@echo "Consider running ldconfig (root) if not found at runtime."
 
@@ -209,6 +209,7 @@ uninstall:
 	              $(DESTDIR)$(INCLUDEDIR)/gpu.h \
 	              $(DESTDIR)$(INCLUDEDIR)/pixels.h \
 	              $(DESTDIR)$(INCLUDEDIR)/scene.h \
+	              $(DESTDIR)$(INCLUDEDIR)/spsc.h \
 	              $(DESTDIR)$(INCLUDEDIR)/hub75gpu.h \
 	              $(DESTDIR)$(INCLUDEDIR)/video.h || true
 
