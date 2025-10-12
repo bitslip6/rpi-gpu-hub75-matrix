@@ -1,5 +1,5 @@
 #!/bin/sh
-make clean
+sudo make clean
 make BUILD=debug -j5
 sudo make BUILD=debug -j5 install
 sudo ldconfig
