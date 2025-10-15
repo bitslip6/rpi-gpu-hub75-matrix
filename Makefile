@@ -78,7 +78,7 @@ LIBDIR      ?= $(PREFIX)/lib
 # (BUILDDIR set per BUILD above)
 
 # Sources
-SRC_COMMON = src/util.c src/spsc.c src/pixels.c src/rpihub75.c src/scene.c src/transformers.c src/hub_api.c
+SRC_COMMON = src/util.c src/mini_gpu.c src/spsc.c src/pixels.c src/rpihub75.c src/api.c src/scene.c src/transformers.c src/hub_api.c
 SRC_GPU    = src/gpu.c src/video.c
 
 # Library names

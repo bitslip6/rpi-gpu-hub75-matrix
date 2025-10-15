@@ -57,7 +57,6 @@ void update_bcm_signal_64_rgb(
     const void *__restrict__ void_bits,
     uint32_t *__restrict__ bcm_signal,
     const uint8_t *__restrict__ image,
-    uint16_t *__restrict__ quant_err_lut,
     uint8_t phase
 );
 
@@ -229,21 +228,6 @@ __attribute__((cold))
 void *tone_map_rgb_bits(const scene_info *scene, const uint8_t num_bits, uint16_t *quant_errors);
 
 
-
-/**
- * @brief draw an unfilled triangle using Bresenham's line drawing algorithm
- * 
- * @param scene 
- * @param x0  p0 x
- * @param y0  p0 y
- * @param x1  p1 x
- * @param y1  p2 y
- * @param x2  p3 x
- * @param y2  p3 y
- * @param color 
- */
-void hub_triangle(scene_info *scene, int x0, int y0, int x1, int y1, int x2, int y2, RGB color);
-
 /**
  * @brief draw a line using Bresenham's line drawing algorithm
  * 
@@ -254,7 +238,6 @@ void hub_triangle(scene_info *scene, int x0, int y0, int x1, int y1, int x2, int
  * @param y1 end pixel y
  * @param color color to draw the line
  */
-void hub_line(scene_info *scene, int x0, int y0, int x1, int y1, RGB color);
 
 /**
  * @brief draw an anti-aliased line using Xiolin Wu's line drawing algorithm
@@ -266,7 +249,7 @@ void hub_line(scene_info *scene, int x0, int y0, int x1, int y1, RGB color);
  * @param y1 end pixel y
  * @param color color to draw the line
  */
-void hub_line_aa(scene_info *scene, int x0, int y0, int x1, int y1, RGB color);
+void hub_line_aa(scene_info *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, const RGB color);
 
 
 /**
@@ -281,7 +264,7 @@ void hub_line_aa(scene_info *scene, int x0, int y0, int x1, int y1, RGB color);
  * @param y2  p3 y
  * @param color 
  */
-void hub_triangle(scene_info *scene, int x0, int y0, int x1, int y1, int x2, int y2, RGB color);
+void hub_triangle(scene_info *scene, uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB color);
 
 
 /**

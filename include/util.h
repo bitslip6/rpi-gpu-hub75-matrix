@@ -203,5 +203,6 @@ void* receive_udp_data(void *arg);
 bool file_exists(const char *filename);
 
 
+int pin_thread_to_cpu(int cpu_id);
 
 #endif

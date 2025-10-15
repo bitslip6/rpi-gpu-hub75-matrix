@@ -12,8 +12,14 @@
 #define MAX_BITS 64
 #define MAX_PANEL_TYPES 8
 #define MAX_PANELS     24
-#define FPS_MAX 240
+#define FPS_MAX 200
 #define FPS_MIN 1
+
+#ifndef MAX_POLY_POINTS
+#define MAX_POLY_POINTS 32
+#endif
+
+
 
 #ifdef ADA_HAT
     #define ADDRESS_TYPE "ADAFRUIT_HAT"
@@ -72,6 +78,22 @@ typedef struct {
     Normal l; 
 } HSLF;
 
+
+typedef struct
+{
+    Normal x;
+    Normal y;
+
+} Pointf_t;
+
+typedef struct
+{
+    Pointf_t points[MAX_POLY_POINTS];
+    size_t num_points;
+
+} Polygonf_t;
+
+typedef enum { POLY_DEGENERATE = 0, POLY_CW = 1, POLY_CCW = 2 } poly_winding_t;
 
 
 typedef struct panel_rgb_scale {
@@ -181,11 +203,14 @@ typedef struct scene_info {
     spsc_semring_t *ring_buf_renderer;
     spsc_semring_t *ring_buf_mapper;
 
-    /* flag to indicate a new frame is ready (i think we can just signal on bcm_ptr ... */
-    _Atomic(unsigned) frame_ready;
-
     /** @brief pointer to a single frame for CPU drawing functions */
     uint8_t *image;
+
+    /** @brief accumulator for quantization errors */
+    int32_t *accum;
+
+    /** @brief LUT for RGB to quant error */
+    uint16_t *quant_errors_lut;
 
     /** @brief a shader file to render on the GPU */
     char *shader_file;
@@ -248,8 +273,11 @@ typedef struct scene_info {
 
     pthread_t render_thread;
     pthread_t mapper_thread;
+
+    bool frame_ready;
     
 } scene_info;
+
 
 /**
  * @brief this function takes the image data and maps it to the bcm signal.
@@ -270,6 +298,7 @@ void *render_forever(const scene_info *scene);
  * @brief render the shader arg->shader_file shader on the GPU
  */
 void *render_shader(void *arg);
+void *render_shader_minimal(void *arg);
 
 /**
  * @brief pass this function to your pthread_create() call to render a video file
@@ -306,6 +335,7 @@ long calculate_fps(const uint16_t target_fps, const bool show_fps);
 void render_loop_shutdown(struct scene_info *scene);
 void hub75_request_shutdown(struct scene_info *scene);
 void hub75_wait_shutdown(struct scene_info *scene);
+void draw_polygon(scene_info *scene, Polygonf_t *poly, RGB color1, RGB color2);
 
 
 /**
@@ -320,10 +350,10 @@ void hub75_wait_shutdown(struct scene_info *scene);
  * @param y2  p3 y
  * @param color 
  */
-void hub_triangle_aa(scene_info *scene, int x0, int y0, int x1, int y1, int x2, int y2, RGB color);
+void hub_triangle_aa(scene_info *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, const uint16_t x2, const uint16_t y2, RGB color);
 
-void hub_line_aa(scene_info *scene, const int x0, const int y0, const int x1, const int y1, const RGB color);
-void hub_line(scene_info *scene, const int x0, const int y0, const int x1, const int y1, const RGB color);
+void hub_line_aa(scene_info *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, const RGB color);
+void hub_line(scene_info *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, RGB color);
 
 /**
  * @brief parse command line arguments and create a valid scene
@@ -376,10 +406,10 @@ typedef struct hub75_api {
     void (*pixel_factor)(int x, int y, RGB pixel, float factor);
     void (*pixel_alpha)(int x, int y, RGBA pixel);
     void (*fill)(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB color);
-    void (*line)(int x0, int y0, int x1, int y1, RGB color);
+    void (*line)(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, RGB color);
     void (*line_aa)(int x0, int y0, int x1, int y1, RGB color);
-    void (*triangle)(int x0, int y0, int x1, int y1, int x2, int y2, RGB color);
-    void (*triangle_aa)(int x0, int y0, int x1, int y1, int x2, int y2, RGB color);
+    void (*triangle)(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB color);
+    void (*triangle_aa)(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB color);
     void (*circle)(uint16_t cx, uint16_t cy, uint16_t radius, RGB color);
     void (*fill_grad)(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, Gradient gradient);
 } hub75_api;
@@ -387,5 +417,21 @@ typedef struct hub75_api {
 /* Obtain & initialize (or re-point) the singleton API to a scene. */
 const hub75_api *hub75_get_api(scene_info *scene);
 
+poly_winding_t polygon_winding(const Polygonf_t *poly);
+
+typedef struct {
+    void (*clear)();
+    void (*pixel)(const uint16_t x, const uint16_t y, RGB c);
+    void (*line)(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, RGB c);
+    void (*line_aa)(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, RGB c);
+    void (*poly)(Polygonf_t *poly, RGB color1, RGB color2);
+    void (*begin_frame)();
+    void (*end_frame)();
+} hub75gpu_t;
+
+/* set the current thread's scene and get an API whose functions do not take a scene */
+hub75gpu_t hub75gpu(scene_info *s);
+
+void* mini_gpu (void *arg);
 
 #endif
