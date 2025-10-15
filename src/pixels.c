@@ -48,7 +48,9 @@ void *mapper_thread_main(void *arg)
         }
 
         // map the linear rgba image to bcm mapping
-        map_byte_image_to_bcm(scene, src);
+        // Don't push onto the render ring just testing recieving frames
+        // XXX
+        // map_byte_image_to_bcm(scene, src);
 
         spsc_pop_ptr_commit(scene->ring_buf_mapper);
     }
@@ -705,55 +707,32 @@ void update_bcm_signal_64_rgb(
     const void *__restrict__ void_bits,
     uint32_t *__restrict__ bcm_signal,
     const uint8_t *image,
-    uint16_t *__restrict__ quant_err_lut,
     uint8_t phase
 ) {
 
-    static int32_t *accum = NULL;
-    static int32_t cached_w = -1, cached_h = -1, cached_stride = -1;
-
-
-    // AGENT: an we hoist this conditional out of the loop?
-    if (UNLIKELY(scene->width != cached_w || scene->panel_height != cached_h || scene->stride != cached_stride)) {
-        cached_w = scene->width;
-        cached_h = scene->panel_height;
-        cached_stride = scene->stride;
-        if (accum != NULL) {
-            SAFE_FREE(accum);
-        }
-        size_t acc_size = (size_t)(scene->width * scene->height * scene->stride);
-        accum = (int32_t*)calloc(acc_size, sizeof(int32_t));
-        build_port_luts(); // once
-        debug("  alloc dither accum %zu bytes\n", acc_size * sizeof(int32_t));
-    }
-
-    if (accum == NULL || image == NULL) {
-        debug("  dither accum or image is NULL\n");
-        // allocation failed
-        return;
-    }
-
     const uint8_t bit_depth = scene->bit_depth;
-    ASSERT(bit_depth % BIT_DEPTH_ALIGNMENT == 0);
+    ASSERT((bit_depth & 1u) == 0u); // must be even
     ASSERT(bit_depth >= 32);
 
 
 
     /* channel LUT planes for quant error, element offsets not bytes */
-    const uint16_t *Wr = quant_err_lut + 0;
-    const uint16_t *Wg = quant_err_lut + 256;
-    const uint16_t *Wb = quant_err_lut + 512;
-
-    // 3) helper macros for pointer/index math
-    #define PIX_PTR(px_index)   (image + (size_t)(px_index) * (size_t)stride_bytes)
-    #define ACC_IDX(px_index,c) ((px_index) * 3 + (c))   /* c: 0=R,1=G,2=B */
+    const uint16_t *Wr = scene->quant_errors_lut + 0;
+    const uint16_t *Wg = scene->quant_errors_lut + 256;
+    const uint16_t *Wb = scene->quant_errors_lut + 512;
 
 
     // 2) derive pixel-stride geometry
-    const int stride_bytes = scene->stride;                         // 3 or 4
-    const int panel_stride_px = scene->width * (scene->panel_height / 2);
+    const unsigned int stride_bytes = scene->stride;                         // 3 or 4
+    const unsigned int panel_stride_px = scene->width * (scene->panel_height / 2); // number of pixels per panel half
 
-    // p*_px are pixel indices, not byte offsets
+    // 3) helper macros for pointer/index math
+    #define PIX_PTR(px_index)   (image + (size_t)(px_index) * stride_bytes)
+    #define ACC_IDX(px_index,c) ((px_index) * 3 + (c))   /* c: 0=R,1=G,2=B */
+
+
+
+    // p*_px are pixel indices, not byte offsets // we advance in units of pixels from one output signal to the next 
     const int p0t_px = 0;
     const int p0b_px = p0t_px + panel_stride_px;
     const int p1t_px = p0b_px + panel_stride_px;
@@ -770,6 +749,7 @@ void update_bcm_signal_64_rgb(
     const uint8_t *p2t_ptr = PIX_PTR(p2t_px);
     const uint8_t *p2b_ptr = PIX_PTR(p2b_px);
 
+    uint32_t *accum = scene->accum;
 
     // 6) fetch with correct accum indexing; ternary evaluates only one side
     const uint8_t r0  = scene->quant_dither ? sd_weight_step_fast(p0t_ptr[0], &accum[ACC_IDX(p0t_px,0)], Wr) : p0t_ptr[0];
@@ -807,16 +787,19 @@ void update_bcm_signal_64_rgb(
     const uint64_t R2T = bits_r[r2t], G2T = bits_g[g2t], B2T = bits_b[b2t];
     const uint64_t R2B = bits_r[r2b], G2B = bits_g[g2b], B2B = bits_b[b2b];
 
-    uint8_t  bcm_offset = 0;
+    uint32_t  bcm_offset = 0;
     // mask for just this current BCM bit postion
     uint64_t m = init_mask(phase, bit_depth);
 
     const uint8_t *restrict remap = get_idx_remap(scene->panel_order);
 
 
+
+    const uint32_t frame_size = scene->width * (scene->height / 2);
+
     // unroll by 2 to cut loop overhead, requires bit_depth even, which it is
     // this is the innermost loop of the mapper thread converting sRGB to BCM GPIO
-    #pragma GCC ivdep
+    // #pragma GCC ivdep
     for (uint8_t j = 0; j < bit_depth; j += 2) {
         // slot j
         {
@@ -850,7 +833,8 @@ void update_bcm_signal_64_rgb(
             // PORTx_LUT maps the 6 bit linear RGB index to the actual GPIO bits to set
             uint32_t lut_word = PORT0_LUT[ remap[idx0] ] | PORT1_LUT[ remap[idx1] ] | PORT2_LUT[ remap[idx2] ];
             // store the result in the bcm_signal array
-            bcm_signal[bcm_offset++] = lut_word;
+            bcm_signal[bcm_offset] = lut_word;
+            bcm_offset += frame_size;
         }
 
         // slot j+1
@@ -886,16 +870,14 @@ void update_bcm_signal_64_rgb(
             // PORTx_LUT maps the 6 bit linear RGB index to the actual GPIO bits to set
             uint32_t lut_word = PORT0_LUT[ remap[idx0] ] | PORT1_LUT[ remap[idx1] ] | PORT2_LUT[ remap[idx2] ];
 
-            bcm_signal[bcm_offset++] = lut_word;
+            bcm_signal[bcm_offset] = lut_word;
 
+            bcm_offset += frame_size;
             // advance the rolling mask by 2
             m = rotl2_mask(m, bit_depth);
         }
     }
 }
-
-
-
 
 /**
  * @brief helper posix_memalign avoids "aligned_alloc size must be multiple of alignment"
@@ -1195,29 +1177,27 @@ void map_byte_image_to_bcm(const scene_info *scene, const uint8_t *image) {
     // tone map the bits for the current scene, update if the lookup table if scene tone mapping changes....
     // TODO: create per panel tone mapping tables if panels have different characteristics
     static void     *bits = NULL;
-    static uint16_t *quant_errors = NULL;
     static uint8_t  *mapped_image = NULL;
     static uint8_t  *mapped_image2 = NULL;
     static uint8_t  phase = 1;
-    phase = phase + 1 % 64;
+    phase = phase + 1;
 
-    if (phase == 255) { phase = 0; } // 255 is a magic number to update_bcm_singal_64 to free it's memory
+    if (phase >= 64) { phase = 0; } // 255 is a magic number to update_bcm_singal_64 to free it's memory
+    phase = 0;
 
     if (UNLIKELY(bits == NULL)) {
-        const size_t image_sz = (size_t)(scene->width * scene->height * scene->stride);
+        const size_t image_sz = (size_t)(scene->width * scene->height * 4); // always allocate for RGBA8
         if (mapped_image == NULL) {
             mapped_image = (uint8_t*)calloc(image_sz, sizeof(uint8_t));
         }
         if (mapped_image2 == NULL) {
             mapped_image2 = (uint8_t*)calloc(image_sz, sizeof(uint8_t));
         }
-        if (quant_errors == NULL) {
-            quant_errors = (uint16_t*)calloc(768*2, sizeof(uint16_t));
-        }
         if (bits != NULL) { // don't leak memory!
             SAFE_FREE(bits);
         }   
-        bits = (uint64_t*)tone_map_rgb_bits(scene, scene->bit_depth, quant_errors);
+        bits = (uint64_t*)tone_map_rgb_bits(scene, scene->bit_depth, scene->quant_errors_lut);
+        build_port_luts(); // once
         debug("new tone mapped bits created\n");
     }
 
@@ -1247,16 +1227,9 @@ void map_byte_image_to_bcm(const scene_info *scene, const uint8_t *image) {
         dither_spatial_hash_low(image_ptr, scene->width, scene->height, scene->stride, 80, (uint8_t)scene->dither);
     }
 
-    ASSERT(scene->panel_height % 16 == 0);
-    ASSERT(scene->panel_width % 16 == 0);
     const uint16_t half_height = (uint16_t)scene->panel_height / 2;
     // ensure 16 bit alignment for width
     const uint16_t width = (uint16_t)scene->width;
-
-    // ensure alignment for the compiler to optimize these loops
-    ASSERT(scene->bit_depth % BIT_DEPTH_ALIGNMENT == 0);
-    ASSERT(half_height % 16 == 0);
-    ASSERT(width % 32 == 0);                        // Ensure length is a multiple of 32
 
 
     uint32_t *bcm_signal = (uint32_t *) spsc_push_ptr_begin(scene->ring_buf_renderer, 200);
@@ -1277,15 +1250,18 @@ void map_byte_image_to_bcm(const scene_info *scene, const uint8_t *image) {
 
             // create the bcm signal for the current pixel, 
             // writes bit_depth *(sizeof(uint32_t)) bytes to bcm_signal
-            update_bcm_signal_64_rgb(scene, bits, bcm_signal, image_ptr, quant_errors, phase);
+            update_bcm_signal_64_rgb(scene, bits, bcm_signal, image_ptr, phase);
 
-            bcm_signal += bit_depth;// + 1;
+            //bcm_signal += bit_depth;// + 1;
+            bcm_signal++;
             image_ptr += stride;
         }
     }
 
     spsc_push_ptr_commit(scene->ring_buf_renderer);
 }
+
+
 
 
 
@@ -1307,6 +1283,11 @@ float gradient_quad(uint16_t p1, uint16_t p2, uint16_t p3, uint16_t p4 __attribu
 }
 */
 
+void hub_clear(scene_info *scene) {
+    if (scene->image) {
+        memset(scene->image, 0, scene->width * scene->height * 4); // always clear in case image is RGBA
+    }
+}
 
 /**
  * @brief helper method to set a pixel in a 24 bpp RGB image buffer
@@ -1502,27 +1483,29 @@ void hub_circle(scene_info *scene, const uint16_t centerX, const uint16_t center
  * @param y1 end pixel y
  * @param color color to draw the line
  */
-void hub_line(scene_info *scene, int x0, int y0, int x1, int y1, RGB color) {
+void hub_line(scene_info *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, RGB color) {
     int dx = abs(x1 - x0);
     int dy = abs(y1 - y0);
     int sx = (x0 < x1) ? 1 : -1; // Step in the x direction
     int sy = (y0 < y1) ? 1 : -1; // Step in the y direction
     int err = dx - dy;           // Error value
 
+    int mx = x0, my = y0;
+
     while (1) {
-        hub_pixel(scene, x0, y0, color); // Set pixel
+        hub_pixel(scene, mx, my, color); // Set pixel
 
         // Check if we've reached the end point
-        if (x0 == x1 && y0 == y1) break;
+        if (mx == x1 && my == y1) break;
 
         int err2 = err * 2;
         if (err2 > -dy) { // Error term for the x direction
             err -= dy;
-            x0 += sx;
+            mx += sx;
         }
         if (err2 < dx) { // Error term for the y direction
             err += dx;
-            y0 += sy;
+            my += sy;
         }
     }
 }
@@ -1538,13 +1521,13 @@ void hub_line(scene_info *scene, int x0, int y0, int x1, int y1, RGB color) {
  * @param y1 end pixel y
  * @param color color to draw the line
  */
-void hub_line_aa(scene_info *scene, const int x0, const int y0, const int x1, const int y1, const RGB color) {
+void hub_line_aa(scene_info *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, const RGB color) {
 
 
-    float fx0 = clampf(x0, 0, scene->width-1);
-    float fx1 = clampf(x1, 0, scene->width-1);
-    float fy0 = clampf(y0, 0, scene->width-1);
-    float fy1 = clampf(y1, 0, scene->width-1);
+    float fx0 = clampf((float)x0, 0, scene->width-1);
+    float fx1 = clampf((float)x1, 0, scene->width-1);
+    float fy0 = clampf((float)y0, 0, scene->width-1);
+    float fy1 = clampf((float)y1, 0, scene->width-1);
 
 
     /* handle the trivial point */
@@ -1637,13 +1620,13 @@ void hub_line_aa(scene_info *scene, const int x0, const int y0, const int x1, co
  * @param y2 
  * @param color 
  */
-void hub_triangle(scene_info *scene, int x0, int y0, int x1, int y1, int x2, int y2, RGB color) {
+void hub_triangle(scene_info *scene, uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB color) {
     hub_line(scene, x0, y0, x1, y1, color);
     hub_line(scene, x1, y1, x2, y2, color);
     hub_line(scene, x2, y2, x0, y0, color);
 }
 
-void hub_triangle_aa(scene_info *scene, int x0, int y0, int x1, int y1, int x2, int y2, RGB color) {
+void hub_triangle_aa(scene_info *scene, uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB color) {
     hub_line_aa(scene, x0, y0, x1, y1, color);
     hub_line_aa(scene, x1, y1, x2, y2, color);
     hub_line_aa(scene, x2, y2, x0, y0, color);

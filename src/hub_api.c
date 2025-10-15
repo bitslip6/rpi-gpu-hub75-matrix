@@ -19,10 +19,10 @@ extern void hub_pixel(scene_info *scene, int x, int y, RGB pixel);
 extern void hub_pixel_factor(scene_info *scene, int x, int y, RGB pixel, float factor);
 extern void hub_pixel_alpha(scene_info *scene, int x, int y, RGBA pixel);
 extern void hub_fill(scene_info *scene, uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB color);
-extern void hub_line(scene_info *scene, int x0, int y0, int x1, int y1, RGB color);
-extern void hub_line_aa(scene_info *scene, int x0, int y0, int x1, int y1, RGB color);
-extern void hub_triangle(scene_info *scene, int x0, int y0, int x1, int y1, int x2, int y2, RGB color);
-extern void hub_triangle_aa(scene_info *scene, int x0, int y0, int x1, int y1, int x2, int y2, RGB color);
+extern void hub_line(scene_info *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, RGB color);
+extern void hub_line_aa(scene_info *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, const RGB color);
+extern void hub_triangle(scene_info *scene, uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB color);
+extern void hub_triangle_aa(scene_info *scene, uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB color);
 extern void hub_circle(scene_info *scene, uint16_t cx, uint16_t cy, uint16_t radius, RGB color);
 extern void hub_fill_grad(scene_info *scene, uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, Gradient gradient);
 
@@ -39,10 +39,10 @@ static void api_pixel(int x, int y, RGB p)                   { if (g_api.scene) 
 static void api_pixel_factor(int x, int y, RGB p, float f)    { if (g_api.scene) hub_pixel_factor(g_api.scene, x, y, p, f); }
 static void api_pixel_alpha(int x, int y, RGBA p)             { if (g_api.scene) hub_pixel_alpha(g_api.scene, x, y, p); }
 static void api_fill(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB c) { if (g_api.scene) hub_fill(g_api.scene, x1, y1, x2, y2, c); }
-static void api_line(int x0, int y0, int x1, int y1, RGB c)   { if (g_api.scene) hub_line(g_api.scene, x0, y0, x1, y1, c); }
+static void api_line(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, RGB c)   { if (g_api.scene) hub_line(g_api.scene, x0, y0, x1, y1, c); }
 static void api_line_aa(int x0, int y0, int x1, int y1, RGB c){ if (g_api.scene) hub_line_aa(g_api.scene, x0, y0, x1, y1, c); }
-static void api_triangle(int x0,int y0,int x1,int y1,int x2,int y2, RGB c) { if (g_api.scene) hub_triangle(g_api.scene,x0,y0,x1,y1,x2,y2,c); }
-static void api_triangle_aa(int x0,int y0,int x1,int y1,int x2,int y2, RGB c){ if (g_api.scene) hub_triangle_aa(g_api.scene,x0,y0,x1,y1,x2,y2,c); }
+static void api_triangle(uint16_t x0,uint16_t y0,uint16_t x1,uint16_t y1,uint16_t x2,uint16_t y2, RGB c) { if (g_api.scene) hub_triangle(g_api.scene,x0,y0,x1,y1,x2,y2,c); }
+static void api_triangle_aa(uint16_t x0,uint16_t y0,uint16_t x1,uint16_t y1,uint16_t x2,uint16_t y2, RGB c){ if (g_api.scene) hub_triangle_aa(g_api.scene,x0,y0,x1,y1,x2,y2,c); }
 static void api_circle(uint16_t cx,uint16_t cy,uint16_t r, RGB c){ if (g_api.scene) hub_circle(g_api.scene,cx,cy,r,c); }
 static void api_fill_grad(uint16_t x0,uint16_t y0,uint16_t x1,uint16_t y1, Gradient g){ if (g_api.scene) hub_fill_grad(g_api.scene,x0,y0,x1,y1,g); }
 

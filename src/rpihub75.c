@@ -143,15 +143,26 @@ void start_scene(scene_info *scene) {
     SAFE_FREE(scene->ring_buf_mapper);
 
     printf("allocate mapper ring\n");
-    scene->ring_buf_mapper = spsc_create(8, (size_t)scene->width * scene->height * 4); // bcm mapper ring, always allocate for RGBA
+    scene->ring_buf_mapper = spsc_create(8, (size_t)(scene->width * scene->height * 4)); // bcm mapper ring, always allocate for RGBA
     printf("allocate render ring\n");
-    scene->ring_buf_renderer = spsc_create(8, (size_t)scene->width * (scene->height / 2) * scene->bit_depth * sizeof(uint32_t)); // renderer ring
+    scene->ring_buf_renderer = spsc_create(8, (size_t)(scene->width * (scene->height / 2) * scene->bit_depth * sizeof(uint32_t))); // renderer ring
 
+    // allocate memory for the quantization error accumulator (3 beacuse we only have RGB (dont need alpha))
+    scene->accum = (int32_t*)calloc((size_t)(scene->width * scene->height * 4), sizeof(int32_t));
+
+    // allocate memory for LUT for input 8 bit RGB to 16 bit quant error value, forgot what 256 entries for R, G, B.
+    // we could probably use a single LUT for all 3 channels since they are all the same...
+    scene->quant_errors_lut = (uint16_t*)calloc(768*4, sizeof(uint16_t));
+
+    /*
+    // XXX removed for debugging GPU code
     if (pthread_create(&scene->mapper_thread, NULL, mapper_thread_main, scene) != 0)
     {
         die("failed to start mapper thread\n");
     }
+        */
 
+    scene->frame_ready = true;
 }
 
 
@@ -296,7 +307,7 @@ void hub75_request_shutdown(struct scene_info *scene) {
     }
 
     scene->do_render = false;
-    update_bcm_signal_64_rgb(scene, NULL, NULL, NULL, NULL, 0);
+    //update_bcm_signal_64_rgb(scene, NULL, NULL, NULL, 0);
 
     hub75_wait_shutdown(scene);
 }
@@ -378,13 +389,8 @@ void cpu_affinity(unsigned int cpu) {
  */
 void* render_forever(const scene_info *scene) {
 
-    bool is_realtime = enable_rt_and_lock_mem();
     cpu_affinity(3); // pin only this thread
     debug(" ~~ rendering on CPU 3...\n");
-
-    /* pin only this thread */
-    //cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(3, &cs);
-    //pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
 
     // check the CPU model to determine which GPIO function to use
     // note one cannot use file_get_contents as this file is zero length...
@@ -476,76 +482,90 @@ void* render_forever(const scene_info *scene) {
     uint16_t jitter_idx = 0; // jitter_mask has an extra 16K of bits in it, so overrun is ok
     uint32_t *bcm_signal;
 
-    printf(" $ [%p] acquire first frame...\n", scene->ring_buf_renderer);
+    printf(" $ acquire first frame...\n");
     while (scene->do_render) {
         bcm_signal = spsc_pop_ptr_begin(scene->ring_buf_renderer, 1000);
-        if (bcm_signal != NULL) break; // success, keep it
-        printf("[%p] unable to locate first rendered frame\n", scene->ring_buf_renderer);
+        if (bcm_signal != NULL) {
+            break; // success, keep it
+        }
+        printf("unable to locate first rendered frame\n");
     }
     if (bcm_signal == NULL) {
         debug("unable to locate first rendered frame\n");
         return NULL;
     }
-    printf(" $$ first frame acquired $$\n");
+    printf(" first frame acquired $$\n");
 
 
+    // lock the memory we just touched (bcm_signal)...
+    bool is_realtime = enable_rt_and_lock_mem();
+
+    const int max_phase = JITTER_SIZE;
+    uint32_t full_frame = 0;
     while (scene->do_render) {
 
-        //phase++; // phase is always advancing...
+        uint32_t offset = 0;
         for (uint8_t pwm = 0; pwm < bit_depth; pwm++) {
+
             // check for a new frame, reset jitter phase once we hit the end
             if ((pwm & 15u) == 0u) {   // true at i = 0,16,32,...
-                if (phase >= JITTER_SIZE - width) {
-                    phase = 0;
-                }
                 // Only swap to a new frame if there is at least one additional item
                 // beyond the one we currently hold. This avoids re-popping the same slot
                 // and releasing it too early while still in use.
                 if (spsc_count(scene->ring_buf_renderer) >= 2) {
                     // release the current frame
-                    spsc_pop_ptr_commit(scene->ring_buf_renderer);
                     // acquire the next frame (non-blocking)
-                    uint32_t *tmp = spsc_pop_ptr_begin(scene->ring_buf_renderer, 0);
+                    const uint32_t *tmp = spsc_pop_ptr_begin(scene->ring_buf_renderer, 0);
                     if (tmp) {
+                        spsc_pop_ptr_commit(scene->ring_buf_renderer);
                         bcm_signal = tmp;
                     }
                 }
-            }   
+            }
 
-            uint32_t offset = pwm;
 
             frame_count++;
-            jitter_idx = phase;
+            
             for (uint16_t y = 0; y < half_height; y++) {
 
-                /* optional: inhibit jitter on first couple of pixels to avoid latch-adjacent OE flips */
-                //uint32_t inhibit = 2; /* set 0..2 as needed */
                 const uint32_t addr_bits = addr_map[y];
                 //jitter_idx = ((y * 1315423911u) + phase) % JITTER_SIZE; // decorrelate rows
 
+                jitter_idx = 0;//phase;
                 // jitter_idx must be at least width pixels before end of jitter_mask
                 for (uint16_t x = 0; x < width; x++) {
 
                     jitter_idx++;
                     // v = data + addr + oe
-                    const uint32_t v = bcm_signal[offset] | addr_bits | jitter_mask[jitter_idx];
+                    //const uint32_t v = bcm_signal[offset] | addr_bits | jitter_mask[jitter_idx];
+                    uint32_t v = bcm_signal[offset] | addr_bits | jitter_mask[jitter_idx];
                     *reg_out = v;                 // set data + addr + oe, clk low
                     *reg_out = v | PIN_CLK;       // clk high 
                     /* advance after full edge */
-                    offset += stride;
-               }
+                    offset ++;
+                }
+
+                __asm__ __volatile__("" ::: "memory");
 
                 // latch the complete row into the display
                 *reg_set = PIN_LATCH | PIN_OE;     // latch high
                 *reg_clr = PIN_LATCH;              // latch low
             }
 
-        }
+            // phase += 8; if (phase >= max_phase) { phase = 0; }
 
-        if (is_realtime) {
-            usleep(1000); // yield
-            sched_yield();
         }
+        full_frame++;
+
+        //if (is_realtime) {
+            if (full_frame & 1) {
+                usleep(3500); // yield
+                sched_yield();
+            }
+        //}
+
+        // only hit the sys call after about 4.5 seconds or so
+        if (frame_count > 15000) {
         time_t current_time_s = time(NULL);
         if (UNLIKELY(current_time_s >= last_time_s + 5)) {
             if (scene->show_fps) {
@@ -556,6 +576,7 @@ void* render_forever(const scene_info *scene) {
             }
             frame_count = 0;
             last_time_s = current_time_s;
+        }
         }
     }
 

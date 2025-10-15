@@ -20,21 +20,30 @@
  *
  * NOTE: parse_scene() supplies many more options (see -h output).
  */
-
-#define _GNU_SOURCE
-#include <pthread.h>
-#include <signal.h>
-#include <stdio.h>
-#include <stdint.h>
 #include <stddef.h>
+#include <signal.h>
+#include <bits/types/sig_atomic_t.h>
+#include <stdio.h>
 #include <stdbool.h>
+#include <stddef.h>
+
+// #define _GNU_SOURCE
+#include <pthread.h>
+#include <stdint.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
 
 #include <rpihub75/hub75gpu.h>
+
+#ifndef true
+#define true	1
+#define false	0
+#endif
 
 // Global scene pointer for signal handler access
 extern scene_info *g_scene;
@@ -70,20 +79,13 @@ static bool has_extension(const char *filename, const char *extension) {
 static void hub75_signal_handler(int sig) {
     printf("\nSignal %d received, shutting down [%x]...\n", sig, g_scene); 
 
-    g_scene->do_render = false;
+    if (g_scene != nullptr) {
+        g_scene->do_render = false;
+    }
     if (g_sigpipe[1] != -1) {
         uint8_t b = (uint8_t)sig;
         (void)!write(g_sigpipe[1], &b, 1); // async-signal-safe
     }
-
-
-    /*
-    (void)sig; // unused parameter
-    if (g_scene) {
-        fprintf(stderr, "\nSignal received, requesting shutdown...\n");
-        hub75_request_shutdown(g_scene);
-    }
-    */
 }
 
 static void install_signal_handlers(void) {
@@ -97,8 +99,8 @@ static void install_signal_handlers(void) {
     sa.sa_handler = hub75_signal_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART;
-    sigaction(SIGINT,  &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT,  &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
 }
 
 
@@ -111,8 +113,6 @@ static void *render_cpu(void *arg) {
     const float Wf = (float)W-2;
     const float Hf = (float)H-2;
     const size_t image_sz = (size_t)(W * H * scene->stride);
-    printf("W: %f, H: %f\n", Wf, Hf);
-    // memset(scene->image, 0, image_sz);
 
     // Initialize triangle vertices at random positions
     float px[3] = { (float)ri(W), (float)ri(W), (float)ri(W) };
@@ -123,53 +123,53 @@ static void *render_cpu(void *arg) {
 
     // Random velocities (pixels/frame), small magnitudes
     float vx[3], vy[3];
+
+    Polygonf_t tri;
+    tri.num_points = 3;
+
     for (int i = 0; i < 3; ++i) {
         float ang = (float)rand() / (float)RAND_MAX * 6.28318530718f;
-        float speed = -2.5f + 5.0f * ((float)rand() / (float)RAND_MAX); // allow >1 px/frame
-        //vx[i] = cosf(ang) * speed;
-        //vy[i] = sinf(ang) * speed;
-        vx[i] = speed;
-        vy[i] = speed;
-        printf("  v[%d] = %.2f, %.2f\n", i, vx[i], vy[i]);
+        float speed = .01f * ((float)rand() / (float)RAND_MAX); // allow >1 px/frame
+        vx[i] = cosf(ang) * speed;
+        vy[i] = sinf(ang) * speed;
+        tri.points[i].x = ((float)rand() / (float)RAND_MAX);
+        tri.points[i].y = ((float)rand() / (float)RAND_MAX);
+
+        printf("  v[%d] = (%3.3f / %3.3f) %.2f, %.2f\n", i, tri.points[i].x, tri.points[i].y, vx[i], vy[i]);
     }
 
     // Triangle base color
     RGB color = { 255, 160, 32 };
     RGB color1 = { 32, 255, 160 };
-    RGB color2 = { 160, 232, 255 };
+    RGB color2 = { 160, 232, 32 };
 
+    hub75gpu_t api = hub75gpu(scene);
+
+    uint32_t frame = 0;
     while (scene->do_render) {
-        uint8_t *image = spsc_push_ptr_begin(scene->ring_buf_mapper, 200);
-        scene->image = image;
-        memset(image, 0, image_sz);
-        // Fade previous frame (trail)
-        for (size_t i = 0; i < image_sz; ++i) {
-            image[i] = (uint8_t)(image[i] - (image[i] ? 1 : 0));
-        }
+        frame++;
+        api.begin_frame(); 
+        api.clear();
 
-        // Update positions with bounce on edges
         for (int i = 0; i < 3; ++i) {
-            px[i] += vx[i];
-            py[i] += vy[i];
-            if (px[i] < 2.0f)  { px[i] = 2.0f;  vx[i] = -vx[i]; }
-            if (px[i] >= Wf)  { px[i] = Wf; vx[i] = -vx[i]; }
-            if (py[i] < 2.0f)  { py[i] = 2.0f;  vy[i] = -vy[i]; }
-            if (py[i] >= Hf)  { py[i] = Hf; vy[i] = -vy[i]; }
+            tri.points[i].x += vx[i];
+            tri.points[i].y += vy[i];
+            if (tri.points[i].x < 0.01f)  { tri.points[i].x = 0.01f;  vx[i] = -vx[i]; }
+            if (tri.points[i].x >= 0.99f)  { tri.points[i].x = 0.99f; vx[i] = -vx[i]; }
+            if (tri.points[i].y < 0.01f)  { tri.points[i].y = 0.01f;  vy[i] = -vy[i]; }
+            if (tri.points[i].y >= 0.99f)  { tri.points[i].y = 0.99f; vy[i] = -vy[i]; }
         }
 
-        uint16_t x1 = (uint16_t)(px[0]);
-        uint16_t y1 = (uint16_t)(py[0]);
-        uint16_t x2 = (uint16_t)(px[1]);
-        uint16_t y2 = (uint16_t)(py[1]);
-        uint16_t x3 = (uint16_t)(px[2]);
-        uint16_t y3 = (uint16_t)(py[2]);
+        color1.r = (uint8_t)(128 + 127 * sinf((float)frame * 0.02f));
+        color1.g = (uint8_t)(128 + 127 * sinf((float)frame * 0.03f));
+        color1.b = (uint8_t)(128 + 127 * sinf((float)frame * 0.04f));
 
-        hub_line_aa(scene, x1, y1, x2, y2, color);
-        hub_line_aa(scene, x2, y2, x3, y3, color1);
-        hub_line_aa(scene, x3, y3, x1, y1, color2);
+        color2.r = (uint8_t)(128 + 127 * sinf((float)frame * 0.04f + 2.0f));
+        color2.g = (uint8_t)(128 + 127 * sinf((float)frame * 0.02f + 2.0f));
+        color2.b = (uint8_t)(128 + 127 * sinf((float)frame * 0.03f + 2.0f));
 
-        //map_byte_image_to_bcm(scene, NULL);
-        spsc_push_ptr_commit(scene->ring_buf_mapper);
+        api.poly(&tri, color1, color2);
+        api.end_frame();
 
         // Small sleep to tame CPU
         usleep(2000);
@@ -186,169 +186,6 @@ static void *render_cpu(void *arg) {
 // ...existing code...
 
 
-
-static void *render_cpu3(void *arg) {
-    scene_info *scene = (scene_info*)arg;
-    printf("[CPU] cpu3 Single moving triangle (Ctrl+C to exit)\n");
-
-    const uint16_t W = scene->width;
-    const uint16_t H = scene->height;
-    const size_t image_sz = (size_t)(W * H * scene->stride);
-
-    // Initialize triangle vertices at random positions
-    float px[3] = { (float)ri(W), (float)ri(W), (float)ri(W) };
-    float py[3] = { (float)ri(H), (float)ri(H), (float)ri(H) };
-
-    // Random velocities (pixels/frame), small magnitudes
-    float vx[3], vy[3];
-    for (int i = 0; i < 3; ++i) {
-        // random direction unit vector
-        float ang = (float)rand() / (float)RAND_MAX * 6.28318530718f;
-        // random speed in [0.5, 2.0]
-        float speed = 0.5f + 1.5f * ((float)rand() / (float)RAND_MAX);
-        vx[i] = cosf(ang) * speed;
-        vy[i] = sinf(ang) * speed;
-    }
-
-    // Triangle color (constant); tweak if you want cycling
-    RGB color1 = { 255, 160, 32 };
-    RGB color2 = { 32, 160, 255 };
-    RGB color3 = { 160, 32, 160 };
-
-    while (scene->do_render) {
-        // 1) Clear frame (single triangle, no trails)
-        //memset(scene->image, 0, image_sz);
-
-        // 1. Fade previous frame (simple exponential decay)
-        //for (size_t i = 0; i < image_sz; ++i) {
-        //    scene->image[i] = scene->image[i] - 1;//(uint8_t)((float)scene->image[i] * 0.94f);
-        //}
-        uint8_t *image = spsc_push_ptr_begin(scene->ring_buf_mapper, 200);
-        scene->image = image;
-        memset(image, 0, image_sz);
-
-
-        // 2) Update positions with bounce on edges
-        for (int i = 0; i < 3; ++i) {
-            float x = px[i] + vx[i];
-            float y = py[i] + vy[i];
-
-            // Bounce on X edges
-            if (x < 0.0f) {
-                x = 0.0f;
-                vx[i] = -vx[i];
-            } else if (x > (float)(W - 1)) {
-                x = (float)(W - 1);
-                vx[i] = -vx[i];
-            }
-
-            // Bounce on Y edges
-            if (y < 0.0f) {
-                y = 0.0f;
-                vy[i] = -vy[i];
-            } else if (y > (float)(H - 1)) {
-                y = (float)(H - 1);
-                vy[i] = -vy[i];
-            }
-
-            px[i] = x;
-            py[i] = y;
-        }
-
-        // 3) Draw the triangle (anti-aliased)
-        const uint16_t x1 = (uint16_t)(px[0] + 0.5f);
-        const uint16_t y1 = (uint16_t)(py[0] + 0.5f);
-        const uint16_t x2 = (uint16_t)(px[1] + 0.5f);
-        const uint16_t y2 = (uint16_t)(py[1] + 0.5f);
-        const uint16_t x3 = (uint16_t)(px[2] + 0.5f);
-        const uint16_t y3 = (uint16_t)(py[2] + 0.5f);
-        //hub_triangle_aa(scene, x1, y1, x2, y2, x3, y3, color);
-
-
-        hub_line(scene, x1, y1, x2, y2, color1);
-        /*
-        hub_line(scene, x2, y2, x3, y3, color2);
-        hub_line(scene, x3, y3, x1, y1, color3);
-        */
-
-        // 4) Map the CPU image to BCM output buffers
-        map_byte_image_to_bcm(scene, NULL);
-
-        spsc_push_ptr_commit(scene->ring_buf_mapper);
-        // 5) Small sleep to tame CPU; adjust as desired
-        //usleep(5000);
-
-        // 6) FPS calculation (optional verbose controlled by scene->show_fps)
-        calculate_fps(scene->fps, scene->show_fps);
-    }
-
-    printf("CPU render thread exiting...\n");
-    render_loop_shutdown(scene);
-    return NULL;
-}
-// ...existing code...
-
-
-
-// --------------- Example CPU Renderer Thread --------------------
-/**
- * A very small demo CPU renderer that:
- *   * Fades the previous frame slightly
- *   * Draws a random anti‑aliased triangle each frame
- *   * Maps the image to BCM output
- *   * Sleeps to maintain target FPS
- *
- * You can replace this entire function with your own drawing logic. The
- * framebuffer for CPU rendering is available at scene->image (size
- * width*height*stride bytes). Stride is 3 (RGB) or 4 (RGBA).
- */
-static void *render_cpu2(void *arg) {
-    scene_info *scene = (scene_info*)arg;
-    printf("[CPU] cpu2 Rendering random triangles (Ctrl+C to exit)\n");
-
-    const size_t image_sz = (size_t)(scene->width * scene->height * scene->stride);
-
-    //const hub75_api *api = hub75_get_api(scene);
-
-    RGB color1 = { rnd8(), rnd8(), rnd8() };
-    RGB color2 = { rnd8(), rnd8(), rnd8() };
-    RGB color3 = { rnd8(), rnd8(), rnd8() };
-    while (scene->do_render) {
-        // 1. Fade previous frame (simple exponential decay)
-        for (size_t i = 0; i < image_sz; ++i) {
-            scene->image[i] = (uint8_t)((float)scene->image[i] * 0.94f);
-        }
-
-        // 2. Draw a random anti‑aliased triangle
-        const uint16_t x0 = rnd16(scene->width);
-        const uint16_t x1 = rnd16(scene->width);
-        const uint16_t x2 = rnd16(scene->width);
-        const uint16_t y0 = rnd16(scene->height);
-        const uint16_t y1 = rnd16(scene->height);
-        const uint16_t y2 = rnd16(scene->height);
-        //hub_triangle_aa(scene, x1, y1, x2, y2, x3, y3, color);
-
-        hub_line_aa(scene, x0, y0, x1, y1, color1);
-        hub_line_aa(scene, x1, y1, x2, y2, color2);
-        hub_line_aa(scene, x2, y2, x0, y0, color3);
-
-        // 3. Map the CPU image to BCM output buffers
-        map_byte_image_to_bcm(scene, NULL);
-        usleep(5000);
-
-        // 4. Regulate FPS & optionally print frame rate (-v to enable dispaly in parse_scene)
-        calculate_fps(scene->fps, scene->show_fps);
-    }
-
-    printf("CPU render thread exiting...\n");
-
-    // Free all allocated memory
-    // TODO: create renderer shutdown function
-    render_loop_shutdown(scene);
-
-    return NULL;
-}
-
 // --------------- Main Entry Point --------------------------------
 int main(int argc, char **argv) {
     printf("rpi-gpu-hub75 example PI Hardware \"hat\": (%s)\n", ADDRESS_TYPE);
@@ -358,11 +195,22 @@ int main(int argc, char **argv) {
     scene_info *scene = parse_scene(argc, argv);
     g_scene = scene;
 
+    // Install Ctrl+C handler after scene is ready
+    install_signal_handlers();
+
     // Validate configuration, allocate internal buffers, etc.
     start_scene(scene);
 
-    // Install Ctrl+C handler after scene is ready
-    install_signal_handlers();
+    pthread_create(&scene->render_thread, NULL, render_shader, scene);
+
+    while(scene->do_render) {
+        sleep(1);
+    }
+    //mini_gpu(scene);
+
+    return 0;
+
+
 
     // Decide what to render:
     //  * No -s : run CPU demo
@@ -374,8 +222,7 @@ int main(int argc, char **argv) {
         if (has_extension(scene->shader_file, "glsl")) {
             printf("[GPU] Shader: %s\n", scene->shader_file);
             // If your shader needs RGBA (alpha), adjust stride if desired:
-            scene->stride = 4; // uncomment if needed for specific shaders
-            pthread_create(&scene->render_thread, NULL, render_shader, scene);
+            pthread_create(&scene->render_thread, NULL, render_shader_minimal, scene);
         } else {
             printf("[GPU] Video: %s\n", scene->shader_file);
             pthread_create(&scene->render_thread, NULL, render_video_fn, scene);
@@ -385,31 +232,14 @@ int main(int argc, char **argv) {
         pthread_create(&scene->render_thread, NULL, render_cpu, scene);
     }
 
-    printf("\ng_scene: [%x]...\n", g_scene); 
-    // This call never returns; it drives the BCM output loop.
-    render_forever(scene);
-    /*
     while(scene->do_render) {
-        usleep(100000);
+        sleep(1);
     }
-    */
-    //printf("\nrender forever quit, g_scene: [%x]...\n", g_scene); 
-    //pthread_join(scene->render_thread, NULL);
-    //pthread_join(scene->mapper_thread, NULL);
-    //printf("\nall threads complete, g_scene: [%x]...\n", g_scene);
-    // Wait for signal (non-busy)
-    /*
-    if (g_sigpipe[0] != -1) {
-        uint8_t b;
-        (void)read(g_sigpipe[0], &b, 1); // blocks until signal arrives
-    } else {
-        while (!g_stop) { usleep(10000); }
-    }
-    */
+
+    // This call never returns; it drives the BCM output loop.
+    // render_forever(scene);
 
     // wait on threads...
     hub75_wait_shutdown(scene);
-
-
     return 0; // not reached
 }

@@ -1,3 +1,5 @@
+
+#define _GNU_SOURCE
 #include <termios.h>
 #include <unistd.h>
 #include <stdint.h>
@@ -11,6 +13,8 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <time.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/param.h>
 #include <sys/types.h>
@@ -1206,7 +1210,7 @@ void *calibrate_panels(void *arg) {
     */
 
     // const scene_info *scene = (scene_info*)arg;
-    const size_t image_size = (size_t)(scene->width * scene->height * scene->stride);
+    const size_t image_size = (size_t)(scene->width * scene->height * 4);
     uint8_t *image          = (uint8_t*)malloc(image_size);
     memset(image, 0, image_size);
     uint8_t j = 0, num_col = 5;
@@ -1360,4 +1364,20 @@ void* receive_udp_data(void *arg) {
 
     close(sock);
     return NULL;
+}
+
+
+/* pin current thread to one CPU, returns 0 on success */
+int pin_thread_to_cpu(int cpu_id) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu_id, &set);
+
+    pthread_t self = pthread_self();
+    int rc = pthread_setaffinity_np(self, sizeof(set), &set);
+    if (rc != 0) {
+        fprintf(stderr, "pthread_setaffinity_np failed: %s\n", strerror(rc));
+        return -1;
+    }
+    return 0;
 }
