@@ -5,6 +5,8 @@
 #include "hub75gpu.h"
 #include "pixels.h"
 
+extern scene_info *g_scene;
+
 /* Forward declarations */
 extern scene_info *new_scene();
 extern scene_info *parse_scene(int argc, char **argv);
@@ -12,7 +14,7 @@ extern void start_scene(scene_info *scene);
 extern void hub75_request_shutdown(scene_info *scene);
 extern void hub75_wait_shutdown(scene_info *scene);
 //extern void map_byte_image_to_bcm(scene_info *scene, uint8_t *image);
-extern long calculate_fps(uint16_t target_fps, bool show_fps);
+extern unsigned long calculate_fps(uint16_t target_fps, bool show_fps);
 
 /* Drawing helpers */
 extern void hub_pixel(scene_info *scene, int x, int y, RGB pixel);
@@ -21,10 +23,7 @@ extern void hub_pixel_alpha(scene_info *scene, int x, int y, RGBA pixel);
 extern void hub_fill(scene_info *scene, uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB color);
 extern void hub_line(scene_info *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, RGB color);
 extern void hub_line_aa(scene_info *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, const RGB color);
-extern void hub_triangle(scene_info *scene, uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB color);
-extern void hub_triangle_aa(scene_info *scene, uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB color);
 extern void hub_circle(scene_info *scene, uint16_t cx, uint16_t cy, uint16_t radius, RGB color);
-extern void hub_fill_grad(scene_info *scene, uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, Gradient gradient);
 
 /* Singleton instance (mutable scene + function pointers) */
 static hub75_api g_api;
@@ -40,11 +39,9 @@ static void api_pixel_factor(int x, int y, RGB p, float f)    { if (g_api.scene)
 static void api_pixel_alpha(int x, int y, RGBA p)             { if (g_api.scene) hub_pixel_alpha(g_api.scene, x, y, p); }
 static void api_fill(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB c) { if (g_api.scene) hub_fill(g_api.scene, x1, y1, x2, y2, c); }
 static void api_line(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, RGB c)   { if (g_api.scene) hub_line(g_api.scene, x0, y0, x1, y1, c); }
-static void api_line_aa(int x0, int y0, int x1, int y1, RGB c){ if (g_api.scene) hub_line_aa(g_api.scene, x0, y0, x1, y1, c); }
-static void api_triangle(uint16_t x0,uint16_t y0,uint16_t x1,uint16_t y1,uint16_t x2,uint16_t y2, RGB c) { if (g_api.scene) hub_triangle(g_api.scene,x0,y0,x1,y1,x2,y2,c); }
-static void api_triangle_aa(uint16_t x0,uint16_t y0,uint16_t x1,uint16_t y1,uint16_t x2,uint16_t y2, RGB c){ if (g_api.scene) hub_triangle_aa(g_api.scene,x0,y0,x1,y1,x2,y2,c); }
+static void api_line_aa(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, RGB c){ if (g_api.scene) hub_line_aa(g_api.scene, x0, y0, x1, y1, c); }
 static void api_circle(uint16_t cx,uint16_t cy,uint16_t r, RGB c){ if (g_api.scene) hub_circle(g_api.scene,cx,cy,r,c); }
-static void api_fill_grad(uint16_t x0,uint16_t y0,uint16_t x1,uint16_t y1, Gradient g){ if (g_api.scene) hub_fill_grad(g_api.scene,x0,y0,x1,y1,g); }
+static int api_fps_get() { return (int)calculate_fps(g_scene->fps, g_scene->show_fps); }
 
 const hub75_api *hub75_get_api(scene_info *scene) {
     if (g_api.version == 0) {
@@ -55,17 +52,15 @@ const hub75_api *hub75_get_api(scene_info *scene) {
         g_api.request_shutdown = api_request_shutdown;
         g_api.wait_shutdown    = api_wait_shutdown;
         g_api.map_image        = api_map_image;
-        g_api.calculate_fps    = calculate_fps;
+        g_api.fps_calculate    = calculate_fps;
         g_api.pixel            = api_pixel;
         g_api.pixel_factor     = api_pixel_factor;
         g_api.pixel_alpha      = api_pixel_alpha;
         g_api.fill             = api_fill;
         g_api.line             = api_line;
         g_api.line_aa          = api_line_aa;
-        g_api.triangle         = api_triangle;
-        g_api.triangle_aa      = api_triangle_aa;
         g_api.circle           = api_circle;
-        g_api.fill_grad        = api_fill_grad;
+        g_api.fps_get          = api_fps_get;
     }
     if (scene) g_api.scene = scene;
     return &g_api;

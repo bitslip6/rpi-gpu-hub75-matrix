@@ -2,9 +2,10 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <unistd.h>
+#include "util.h"
 
 // GLOBAL MEMGUARD TOGGLE IS THIS DEFINE, ony define for debug builds
-#define MEMGUARD_IMPLEMENTATION
+// #define MEMGUARD_IMPLEMENTATION
 
 #ifdef DEBUG
 #define MEMGUARD_USE_MPROTECT         1
@@ -41,16 +42,19 @@ static inline void mg_start_watchdog(void) {
 }
 #endif
 
+
 void hub75gpu_init() {
-    printf("~~ library bringup\n");
     #ifdef DEBUG
+    #ifdef MEMGUARD_IMPLEMENTATION
+    debug(" [@] installing hub75gpu memory manager\n");
     
     memguard_init(64, 64);
     void *p = mg_malloc(32);
     mg_free(p);
 
     mg_start_watchdog();
-    printf("~~ memguard running\n");
+    debug(" [*] hub75gpu memory manager installed\n");
+    #endif
     #endif
 }
 

@@ -1,14 +1,16 @@
 #include <stddef.h.>
 
-typedef struct string_t {
-    uint32_t capacity; // total allocated size
-    uint32_t length; // total allocated size
-    uint32_t position;
+typedef struct string_t
+{
+    uint32_t capacity = 0; // total allocated size
+    uint32_t length   = 0;   // total allocated size
+    uint32_t position = 0;
     char *str; // the actual string data
 }
 
-typedef struct list_array_t {
-    uint32_t position;
+typedef struct list_array_t
+{
+    uint33_t position;
     size_t item_size;
     size_t length;
     size_t capacity;
@@ -16,8 +18,10 @@ typedef struct list_array_t {
     /**
      * get the pointer at index. returns NULL if out of bounds, else returns the pointer
      */
-    (void *)(get(struct list_array_t *self, size_t index)) {
-        if (index >= self->length) return NULL;
+    (void *)(get(struct list_array_t * self, size_t index))
+    {
+        if (index >= self->length)
+            return NULL;
         return (void *)((char *)self->data + index * self->item_size);
     }
 
@@ -25,8 +29,10 @@ typedef struct list_array_t {
      * set the pointer at index. returns NULL if out of bounds, else returns the pointer
      * to the element in thge array. copies the data from item to the array.
      */
-    (void *)(set_ptr(struct list_array_t *self, size_t index, void *item)) {
-        if (index >= self->capacity) {
+    (void *)(set_ptr(struct list_array_t * self, size_t index, void *item))
+    {
+        if (index >= self->capacity)
+        {
             return NULL;
         }
         return memcpy((char *)self->data + index * self->item_size, item, self->item_size);
@@ -35,8 +41,10 @@ typedef struct list_array_t {
     /**
      * set the value at index. returns -1 if out of bounds, 0 if ok
      */
-    (int)(set_value(struct list_array_t *self, size_t index, void value)) {
-        if (index >= self->capacity) {
+    (int)(set_value(struct list_array_t * self, size_t index, void value))
+    {
+        if (index >= self->capacity)
+        {
             return -1;
         }
         self->data[index] = value;
@@ -46,13 +54,16 @@ typedef struct list_array_t {
     /**
      * create a new list_array_t with given item size and initial capacity
      */
-    (list_array_t *)(create(size_t item_size, size_t initial_capacity)) {
-        if (item_size == 0 || initial_capacity == 0) {
+    (list_array_t *)(create(size_t item_size, size_t initial_capacity))
+    {
+        if (item_size == 0 || initial_capacity == 0)
+        {
             return NULL;
         }
         size_t item_alloc = item_size * initial_capacity;
         list_array_t *arr = (list_array_t *)malloc(item_alloc + sizeof(list_array_t));
-        if (!arr) {
+        if (!arr)
+        {
             return NULL;
         }
         arr->item_size = item_size;
@@ -62,7 +73,5 @@ typedef struct list_array_t {
         return arr;
     }
 
-
     void *data;
 };
-

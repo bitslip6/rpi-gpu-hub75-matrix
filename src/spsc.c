@@ -148,6 +148,7 @@ spsc_semring_t *spsc_create(size_t capacity, size_t item_size_bytes)
     // can_pop: initially 0 (cannot pop from empty buffer)
     if (sem_init(&q->can_push, 0, (unsigned)capacity) != 0 ||
         sem_init(&q->can_pop,  0, 0) != 0) {
+        printf("failed to init semaphores\n");
         free(q);
         return NULL;
     }
@@ -203,15 +204,7 @@ void spsc_destroy(spsc_semring_t *q)
 void *spsc_push_ptr_begin(spsc_semring_t *q, long timeout_ms)
 {
     if (!q) return NULL;
-    static uint32_t ctr = 0;
-    ctr++;
 
-    if (ctr >= 30) {
-        size_t c = spsc_count(q);
-        printf("spsc count: %zu\n", c);
-        ctr = 0;
-    }
-    
     // Wait for available space in the buffer
     // If timeout_ms > 0: block with timeout
     // If timeout_ms <= 0: non-blocking (try once)
@@ -288,7 +281,7 @@ void spsc_push_ptr_commit(spsc_semring_t *q)
  * 
  * Note: Must be followed by spsc_pop_ptr_commit() to release the slot
  */
-const void *spsc_pop_ptr_begin(spsc_semring_t *q, long timeout_ms)
+void *spsc_pop_ptr_begin(spsc_semring_t *q, long timeout_ms)
 {
     if (!q) return NULL;
     

@@ -111,6 +111,9 @@ static inline uint8x16_t reverse16_u8(uint8x16_t v) {
 #endif
 
 
+/**
+ * @brief mirror flip the image horizontally
+ */
 __attribute__((hot, flatten))
 uint8_t *mirror_mapper(const uint8_t *image,
                        uint8_t *image_out,
@@ -198,6 +201,9 @@ uint8_t *mirror_mapper(const uint8_t *image,
 
 
 
+/**
+ * @brief mirror flip the image both horizontally and vertically
+ */
 __attribute__((hot, flatten))
 uint8_t *mirror_flip_mapper(const uint8_t *image,
                             uint8_t *image_out,

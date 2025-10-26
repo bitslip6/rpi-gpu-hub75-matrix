@@ -16,8 +16,7 @@
 #include <string.h>
 #include <assert.h>
 
-
-#define MEMGUARD_OVERRIDE_STDLIB
+//#define MEMGUARD_OVERRIDE_STDLIB
 #include "memguard2.h"
 
 #include "rpihub75.h"
@@ -42,15 +41,13 @@ void *mapper_thread_main(void *arg)
 
     while (scene->do_render)
     {
-        const uint8_t *src = spsc_pop_ptr_begin(scene->ring_buf_mapper, 200);
+        uint8_t *src = spsc_pop_ptr_begin(scene->ring_buf_mapper, 200);
         if (src == NULL) {
             continue;
         }
 
         // map the linear rgba image to bcm mapping
-        // Don't push onto the render ring just testing recieving frames
-        // XXX
-        // map_byte_image_to_bcm(scene, src);
+        map_byte_image_to_bcm(scene, src);
 
         spsc_pop_ptr_commit(scene->ring_buf_mapper);
     }
@@ -274,74 +271,11 @@ void copy_tone_mapperF(const RGBF *__restrict__ in, RGBF *__restrict__ out, cons
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 
-/**
- * @brief map an input byte to a 32 bit pwm signal
- * 
- */
-__attribute__((cold, pure))
-uint32_t byte_to_bcm32(const uint8_t input, const uint8_t num_bits) {
-    ASSERT((num_bits <= 32));
 
-    // Calculate the number of '1's in the 11-bit result based on the 8-bit input
-    uint32_t num_ones = (uint8_t)(((float)(input * num_bits)) / 255);  // Map 0-255 input to 0-num_bits ones
-    //uint8_t  num_ones = (uint8_t)floorf(roundf((float)(input * num_bits) / 255.0f));  // Map 0-255 input to 0-num_bits ones
-    uint32_t bcm_signal = 0;
-    // bit mask that matches the number of bits we want to output
-    // uint32_t result_mask = (1U << num_bits) - 1;
-
-
-    // quant error for dithering is (input / 255) - (num_ones/num_bits);
-    // TODO: keep this in floating point space for more precision!
-
-    // dont divide by 0!
-    if (num_ones == 0) {
-        return bcm_signal;
-    }
-    //num_ones++;
-
-    float step = (float)num_bits / ((float)num_ones);  // Step for evenly distributing 1's
-    for (uint16_t i = 0; i < num_ones && i < 32; i++) {
-        int shift = (int)((i + 0.0f) * step);
-        bcm_signal |= (1 << (shift));
-    }
-
-    //printf("  BCM> @%d G:%d ONES:%d ", index, input, num_ones);
-    //binary32(stdout, bcm_signal);
-    //printf("\n");
-
-    return bcm_signal;// & result_mask;
-}
 
 /**
- * @brief calculate the dither error for a given input byte.
- * reduces input to a bcm value (0-num_bits) and returns the quantization error.
- * 
- * @param input - normalized tone mapped, gamma corrected input value 0.0-1.0
- * @param num_bits - number of bits of BCM output (8-64)
- * @param index - the linear index of the pixel we are calculating
- * @return float - the quantization error (input - output) 0.0-1.0
+ * @brief calculate the BCM to quantization error for a given BCM value                                     
  */
-float byte_to_dither(const Normal input, const uint8_t num_bits, int index) {
-    ASSERT((num_bits <= 64));
-    ASSERT(input >= 0.0f && input <= 1.0f);
-
-    //uint8_t value = (uint8_t)(input * 255.0f);
-
-    // Calculate the number of '1's in the 11-bit result based on the 8-bit input
-    //uint8_t num_ones = (uint8_t)floorf(roundf((float)(value * num_bits) / 255.0f));  // Map 0-255 input to 0-num_bits ones
-    uint8_t num_ones = (uint8_t)(((float)(input * num_bits)) / 255);  // Map 0-255 input to 0-num_bits ones
-    if (num_ones == 0) {
-        if (index < 1) {
-            return 0.0f;
-        }
-    }
-    //num_ones++;
-
-    float quant_error = input - normalize_any(num_ones, num_bits);  // divide num_ones by num_bits to get normalized value
-    // printf("   input -- (%f):%d:(%f)  QUANT:%f\n", input, num_ones, normalize_any(num_ones, num_bits), quant_error);
-    return quant_error;
-}
-
 uint16_t bcm_to_quant(const uint64_t bcm_value, const uint8_t num_bits, uint8_t tone_val, uint8_t brightness) {
     ASSERT((num_bits <= 64));
 
@@ -358,7 +292,7 @@ uint16_t bcm_to_quant(const uint64_t bcm_value, const uint8_t num_bits, uint8_t 
 
 /**
  * @brief map an input byte to a 64 bit bcm signal
- * 
+ * used in tone mapper 
  */
 __attribute__((cold, pure))
 uint64_t byte_to_bcm64(const uint8_t input, const uint8_t bit_depth) {
@@ -397,17 +331,14 @@ uint64_t byte_to_bcm64(const uint8_t input, const uint8_t bit_depth) {
 
 
 
-// helper: add and wrap an index 0..bit_depth-1
-static inline uint8_t wrap_add_u8(uint8_t idx, uint8_t add, uint8_t mod) {
-    uint8_t s = (uint8_t)(idx + add);
-    return (s >= mod) ? (uint8_t)(s - mod) : s;  // mod is small (<=32), predictable
-}
-
-
 // build at init
 static int32_t mid_dn_tbl[258], mid_up_tbl[258];  // +2  to handle the +1W access, +1 more for good measure
 
-/* optional: keep a sanitized monotonic copy if you also use W elsewhere */
+/**
+ * @brief build the mid-point tables for fast dithering
+ * 
+ * @param W_in - input weight table, 257 entries
+ */
 static inline void sd_build_mid_tables(const uint16_t *W_in) {
     /* 1) sanitize W to monotonic nondecreasing in 0..65535 */
     uint32_t W[258];
@@ -495,8 +426,12 @@ static uint8_t IDX_REMAP[6][64];
 static int idx_remap_built_mask = 0;
 
 
-// Build a 6-bit index remap for the given order.
-// Canonical idx layout is [R1,G1,B1,R2,G2,B2] with bit 0 = R1, 5 = B2.
+/**
+ * @brief build an index remap table for a given panel order
+ * 
+ * @param order - the panel order to build the remap for
+ * @param remap - output remap table, 64 bytes
+ */
 static inline void build_idx_remap(panel_order_t order, uint8_t remap[64]) {
     // src_pos[wire] = which logical bit position supplies that wire for pixel1
     // wire: 0=Rwire, 1=Gwire, 2=Bwire
@@ -539,6 +474,11 @@ static inline void build_idx_remap(panel_order_t order, uint8_t remap[64]) {
 
 
 
+/**
+ * @brief build the port LUTs for all 64 possible 6-bit combinations
+ * this allows us to do a single lookup per port per BCM bit instead of calculating
+ * the conditional bit positions on the fly.
+ */
 static inline void build_port_luts(void) {
     if (port_lut_built) return;
     for (uint32_t i = 0; i < 64; ++i) {
@@ -589,12 +529,16 @@ static inline const uint8_t* get_idx_remap(panel_order_t order) {
 }
 
 
-
-
+/**
+ * @brief initialize the bit mask for the given phase and bit depth
+ */
 static inline uint64_t init_mask(uint8_t phase, uint8_t bit_depth) {
     return 1ull << ((bit_depth == 64) ? (phase & 63) : (phase % bit_depth));
 }
 
+/**
+ * @brief rotate left by 1 with wrap for bit_depth
+ */
 static inline uint64_t rotl1_mask(uint64_t m, uint8_t bit_depth) {
     if (bit_depth == 64) {
         return (m << 1) | (m >> 63);
@@ -604,6 +548,10 @@ static inline uint64_t rotl1_mask(uint64_t m, uint8_t bit_depth) {
     }
 }
 
+/**
+ * @brief rotate left by 2 with wrap for bit_depth
+ * 
+ */
 static inline uint64_t rotl2_mask(uint64_t m, uint8_t bit_depth) {
     if (bit_depth == 64) {
         return (m << 2) | (m >> 62);
@@ -615,6 +563,9 @@ static inline uint64_t rotl2_mask(uint64_t m, uint8_t bit_depth) {
 
 
 
+/**
+ * @brief 8x8 Bayer dither matrix with values 0..63
+ */
 static const uint8_t bayer8x8_u0_63[64] = {
      0,48,12,60, 3,51,15,63,
     32,16,44,28,35,19,47,31,
@@ -626,6 +577,12 @@ static const uint8_t bayer8x8_u0_63[64] = {
     42,26,38,22,41,25,37,21
 };
 
+/**
+ * @brief clamp an integer to the range 1..250
+ * 
+ * @param v 
+ * @return uint8_t 
+ */
 static inline uint8_t clamp_u8_int(int v) {
     if (v < 0) return 1;
     if (v > 250) return 250;
@@ -664,6 +621,13 @@ void dither_spatial_bayer8_low(uint8_t *img, const int width, const int height,
     }
 }
 
+/**
+ * @brief  a simple 2D integer hash function for spatial dithering
+ * 
+ * @param x 
+ * @param y 
+ * @return uint32_t 
+ */
 static inline uint32_t u32_hash(uint32_t x, uint32_t y) {
     uint32_t h = x * 0x9E3779B1u ^ (y + 0x7F4A7C15u);
     h ^= h >> 16; h *= 0x7FEB352Du;
@@ -672,6 +636,14 @@ static inline uint32_t u32_hash(uint32_t x, uint32_t y) {
     return h;
 }
 
+
+/**
+ * @brief Spatial hash dithering on dark values only.
+ * img: interleaved RGB8 buffer
+ * stride_bytes: bytes per row
+ * cutoff: apply only when channel < cutoff, suggest 100
+ * max_amp: maximum +/- offset in u8 units, suggest 1..3 (start with 2)
+ */
 void dither_spatial_hash_low(uint8_t *img, int width, int height,
                              uint8_t stride_bytes, int cutoff, int max_amp)
 {
@@ -701,6 +673,15 @@ void dither_spatial_hash_low(uint8_t *img, int width, int height,
 
 
 
+/**
+ * @brief update the bcm signal for 64 bit depth RGB panels with optional temporal dithering
+ * 
+ * @param scene 
+ * @param void_bits pointer tone mapped bit buffer 
+ * @param bcm_signal output bcm signal buffer
+ * @param image pointer to source image datpixel a
+ * @param phase 
+ */
 __attribute__((hot))
 void update_bcm_signal_64_rgb(
     const scene_info *scene,
@@ -733,12 +714,12 @@ void update_bcm_signal_64_rgb(
 
 
     // p*_px are pixel indices, not byte offsets // we advance in units of pixels from one output signal to the next 
-    const int p0t_px = 0;
-    const int p0b_px = p0t_px + panel_stride_px;
-    const int p1t_px = p0b_px + panel_stride_px;
-    const int p1b_px = p1t_px + panel_stride_px;
-    const int p2t_px = p1b_px + panel_stride_px;
-    const int p2b_px = p2t_px + panel_stride_px;
+    const unsigned int p0t_px = 0;
+    const unsigned int p0b_px = p0t_px + panel_stride_px;
+    const unsigned int p1t_px = p0b_px + panel_stride_px;
+    const unsigned int p1b_px = p1t_px + panel_stride_px;
+    const unsigned int p2t_px = p1b_px + panel_stride_px;
+    const unsigned int p2b_px = p2t_px + panel_stride_px;
 
 
     // 5) locate the six pixel base pointers once
@@ -749,7 +730,7 @@ void update_bcm_signal_64_rgb(
     const uint8_t *p2t_ptr = PIX_PTR(p2t_px);
     const uint8_t *p2b_ptr = PIX_PTR(p2b_px);
 
-    uint32_t *accum = scene->accum;
+    int32_t *accum = scene->accum;
 
     // 6) fetch with correct accum indexing; ternary evaluates only one side
     const uint8_t r0  = scene->quant_dither ? sd_weight_step_fast(p0t_ptr[0], &accum[ACC_IDX(p0t_px,0)], Wr) : p0t_ptr[0];
@@ -973,10 +954,24 @@ void *tone_map_rgb_bits(const scene_info *scene, const uint8_t bit_depth, uint16
 
 
 
-// scale then offset per channel:
-// out = clamp_u8( ((in * q8 + 128) >> 8) + off )
-// pixels layout: [R,G,B,A] per pixel, A copied unchanged.
-// image_stride is bytes per pixel, expected 4 for RGBA8.
+/**
+ * @brief scale and offset a rectangle region of an RGB(A) image in place.
+ * 
+ * @param pixels pointer to the image pixel buffer
+ * @param mapped_pixels pointer to the output image pixel buffer
+ * @param width image width in pixels
+ * @param height image height in pixels
+ * @param image_stride bytes per pixel, expected 4 for RGBA8
+ * @param x0 left of rectangle to scale
+ * @param y0 top of rectangle to scale
+ * @param w width of rectangle to scale
+ * @param h height of rectangle to scale
+ * @param red_q8 scaling factor for red channel in Q8 format
+ * @param green_q8 scaling factor for green channel in Q8 format
+ * @param blue_q8 scaling factor for blue channel in Q8 format
+ * @param red_off signed offset for red channel after scaling
+ * @param green_off signed offset for green channel after scaling                                           
+ */
 static inline void scale_rect_rgb_q8_offset(uint8_t *pixels, uint8_t *mapped_pixels,
                                             int width, int height, uint8_t image_stride,
                                             int x0, int y0, int w, int h,
@@ -1094,7 +1089,8 @@ static inline void scale_rect_rgb_q8_offset(uint8_t *pixels, uint8_t *mapped_pix
 }
 
 
-/* Copy an axis-aligned rectangle from pixels -> mapped_pixels using memcpy only.
+/**
+ * @brief Copy an axis-aligned rectangle from pixels -> mapped_pixels using memcpy only.
  * pixels layout: interleaved, image_stride bytes per pixel (typically 4 for RGBA8).
  */
 static inline void copy_rect_rgb(const uint8_t *pixels, uint8_t *mapped_pixels,
@@ -1122,6 +1118,13 @@ static inline void copy_rect_rgb(const uint8_t *pixels, uint8_t *mapped_pixels,
 }
 
 
+/**
+ * @brief apply per-panel brightness scaling and offset to the image.
+ * 
+ * @param pixels the source image pixels
+ * @param mapped_pixels the destination image pixels
+ * @param scene the scene information
+ */
 static inline void apply_panel_brightness_q8(uint8_t * pixels, uint8_t *mapped_pixels, const scene_info *scene) {
     for (int py = 0; py < scene->num_ports; ++py) {
         for (int px = 0; px < scene->num_chains; ++px) {
@@ -1172,7 +1175,7 @@ static inline void apply_panel_brightness_q8(uint8_t * pixels, uint8_t *mapped_p
  * @param image the image to map to the scene bcm data. if NULL scene->image will be used
  */
 __attribute__((hot))
-void map_byte_image_to_bcm(const scene_info *scene, const uint8_t *image) {
+void map_byte_image_to_bcm(const scene_info *scene, uint8_t *image) {
 
     // tone map the bits for the current scene, update if the lookup table if scene tone mapping changes....
     // TODO: create per panel tone mapping tables if panels have different characteristics
@@ -1241,7 +1244,7 @@ void map_byte_image_to_bcm(const scene_info *scene, const uint8_t *image) {
 
     // convenience variables
     const uint16_t stride     = scene->stride;
-    const uint8_t  bit_depth  = scene->bit_depth;
+    //const uint8_t  bit_depth  = scene->bit_depth;
 
     // we only need to process half the height of the first panel, since we are clocking in
     // 2 rows at a time (upper and lower) aand 3 ports at a time
@@ -1285,7 +1288,8 @@ float gradient_quad(uint16_t p1, uint16_t p2, uint16_t p3, uint16_t p4 __attribu
 
 void hub_clear(scene_info *scene) {
     if (scene->image) {
-        memset(scene->image, 0, scene->width * scene->height * 4); // always clear in case image is RGBA
+        size_t img_size = (size_t)(scene->width * scene->height * scene->stride);
+        memset(scene->image, 0, img_size); // always clear in case image is RGBA
     }
 }
 
@@ -1389,57 +1393,6 @@ void hub_fill(scene_info *scene, const uint16_t x1, const uint16_t y1, const uin
     }
 }
 
-/**
- * @brief fill in a rectangle of width,height at x,y with the specified color
- * 
- * @param scene 
- * @param x 
- * @param y 
- * @param width 
- * @param height 
- * @param color 
- */
-void hub_fill_grad(scene_info *scene, uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, Gradient gradient) {
-    if (x1 < x0) {
-        uint16_t temp = x0;
-        x0 = x1;
-        x1 = temp;
-    }
-    if (y1 < y0) {
-        uint16_t temp = y0;
-        y0 = y1;
-        y1 = temp;
-    }
-    ASSERT(y1 < scene->height);
-    ASSERT(x1 < scene->width);
-    if (CONSOLE_DEBUG) {
-        printf("%dx%d, %dx%d\n", x0, y0, x1, y1);
-    }
-
-    RGB left, right, final;
-    float h_ratio, v_ratio = 0.0f;
-    for (int y = y0; y < y1; y++) {
-        v_ratio = (float)(y - y0) / (y1 - y0);
-
-        //float vertical = gradient.type(y0, y1, x0, x1, v_ratio, 0);
-        float vertical = gradient.type(x0, y0, x1, y1, v_ratio, 0);
-        interpolate_rgb(&left, gradient.colorA1, gradient.colorA2, vertical);
-        interpolate_rgb(&right, gradient.colorB1, gradient.colorB2, vertical);
-
-        for (int x = x0; x < x1; x++) {
-            h_ratio = (float)(x - x0) / (x1 - x0);
-
-            //float horizontal = gradient.type(y0, y1, x0, x1, v_ratio, h_ratio);
-            float horizontal = gradient.type(y0, y1, x0, x1, v_ratio, h_ratio);
-            if (CONSOLE_DEBUG) {
-                printf("v: %f, h: %f\n", (double)vertical, (double)horizontal);
-            }
-            interpolate_rgb(&final, left, right, horizontal);
-
-            hub_pixel(scene, x, y, final);
-        }
-    }
-}
 
 
 // Draw an unfilled circle using Bresenham's algorithm
@@ -1606,30 +1559,4 @@ void hub_line_aa(scene_info *scene, const uint16_t x0, const uint16_t y0, const 
         }
     }
 }
-
-
-/**
- * @brief  draw an un-anti aliased triangle
- * 
- * @param scene 
- * @param x0 
- * @param y0 
- * @param x1 
- * @param y1 
- * @param x2 
- * @param y2 
- * @param color 
- */
-void hub_triangle(scene_info *scene, uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB color) {
-    hub_line(scene, x0, y0, x1, y1, color);
-    hub_line(scene, x1, y1, x2, y2, color);
-    hub_line(scene, x2, y2, x0, y0, color);
-}
-
-void hub_triangle_aa(scene_info *scene, uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB color) {
-    hub_line_aa(scene, x0, y0, x1, y1, color);
-    hub_line_aa(scene, x1, y1, x2, y2, color);
-    hub_line_aa(scene, x2, y2, x0, y0, color);
-}
-
 

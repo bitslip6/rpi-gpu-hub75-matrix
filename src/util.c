@@ -33,7 +33,7 @@
 #include "transformers.h"
 #include "scene.h"
 
-#define MEMGUARD_OVERRIDE_STDLIB
+//#define MEMGUARD_OVERRIDE_STDLIB
 #include "memguard2.h"
 
 
@@ -572,6 +572,8 @@ scene_info *parse_scene(int argc, char **argv) {
 
 
 
+extern scene_info *g_scene;
+
 /**
  * @brief die with a message
  * 
@@ -772,8 +774,8 @@ static void rotate_u32(uint32_t *a, size_t n, size_t rot) {
  *
  * Returns malloc()'d array of uint32_t, caller must free().
  */
-uint32_t *create_jitter_mask(const uint16_t jitter_size, const uint8_t brightness) {
-    const size_t n = (size_t)jitter_size + 1024*16; // add extra to avoid modulo bias 
+uint32_t *jitter_create(const uint16_t jitter_size, const uint8_t brightness, bool jitter_brightness) {
+    const size_t n = (size_t)jitter_size + 1024*16; // add extra to avoid modulo bias
     uint32_t *jitter = (uint32_t*)malloc(n * sizeof(uint32_t));
     if (!jitter) return NULL;
 
@@ -832,6 +834,12 @@ uint32_t *create_jitter_mask(const uint16_t jitter_size, const uint8_t brightnes
         size_t rot = (size_t)(rot16 % n);
         rotate_u32(jitter, n, rot);
     }
+
+    if (jitter_brightness == false) {
+        memset(jitter, 0, JITTER_SIZE * sizeof(*jitter));
+    }
+
+
 
     return jitter;
 }
@@ -918,7 +926,7 @@ long calculate_fps_old(const uint16_t target_fps, const bool show_fps) {
 }
 
 
-long calculate_fps(const uint16_t target_fps, const bool show_fps) {
+unsigned long calculate_fps(const uint16_t target_fps, const bool show_fps) {
     static bool           inited = false;
     static struct timespec last_ts;          /* last frame timestamp */
     static struct timespec window_start_ts;  /* start of current 1 s window */
@@ -972,7 +980,8 @@ long calculate_fps(const uint16_t target_fps, const bool show_fps) {
         frame_count = 0;
     }
 
-    return sleep_time_us;
+
+    return frame_count;
 }
 
 
@@ -1366,18 +1375,3 @@ void* receive_udp_data(void *arg) {
     return NULL;
 }
 
-
-/* pin current thread to one CPU, returns 0 on success */
-int pin_thread_to_cpu(int cpu_id) {
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    CPU_SET(cpu_id, &set);
-
-    pthread_t self = pthread_self();
-    int rc = pthread_setaffinity_np(self, sizeof(set), &set);
-    if (rc != 0) {
-        fprintf(stderr, "pthread_setaffinity_np failed: %s\n", strerror(rc));
-        return -1;
-    }
-    return 0;
-}

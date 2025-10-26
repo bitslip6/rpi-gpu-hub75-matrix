@@ -8,7 +8,7 @@
 #include <libavutil/imgutils.h>
 
 
-#define MEMGUARD_OVERRIDE_STDLIB
+//#define MEMGUARD_OVERRIDE_STDLIB
 #include "memguard2.h"
 
 #include "rpihub75.h"
