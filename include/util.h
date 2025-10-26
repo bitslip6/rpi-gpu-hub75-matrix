@@ -87,7 +87,7 @@ void safe_free(void **pp);
  * @param brightness   larger values produce brighter output, max 255
  * @return uint32_t*   a pointer to the jitter mask. caller must release memory
  */
-uint32_t *create_jitter_mask(const uint16_t jitter_size, const uint8_t brightness);
+uint32_t *jitter_create(const uint16_t jitter_size, const uint8_t brightness, bool jitter_brightness);
 
 /**
  * @brief write data to a file, exit on any failure
@@ -202,7 +202,5 @@ void* receive_udp_data(void *arg);
  */
 bool file_exists(const char *filename);
 
-
-int pin_thread_to_cpu(int cpu_id);
 
 #endif

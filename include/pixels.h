@@ -70,7 +70,7 @@ void update_bcm_signal_64_rgb(
  * @param scene the scene information
  * @param image the image to map to the scene bcm data. if NULL scene->image will be used
  */
-void map_byte_image_to_bcm(const scene_info *scene, const uint8_t *image);
+void map_byte_image_to_bcm(const scene_info *scene, uint8_t *image);
 
 
 /**
@@ -252,19 +252,6 @@ void *tone_map_rgb_bits(const scene_info *scene, const uint8_t num_bits, uint16_
 void hub_line_aa(scene_info *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, const RGB color);
 
 
-/**
- * @brief draw an unfilled aliased triangle using Xiolin Wu's line drawing algorithm
- * 
- * @param scene 
- * @param x0  p0 x
- * @param y0  p0 y
- * @param x1  p1 x
- * @param y1  p2 y
- * @param x2  p3 x
- * @param y2  p3 y
- * @param color 
- */
-void hub_triangle(scene_info *scene, uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB color);
 
 
 /**
@@ -328,8 +315,6 @@ void hub_fill(scene_info *scene, const uint16_t x1, const uint16_t y1, const uin
  * @param color 
  */
 void hub_circle(scene_info *scene, const uint16_t centerX, const uint16_t centerY, const uint16_t radius, const RGB color);
-
-void hub_fill_grad(scene_info *scene, uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, Gradient gradient); 
 
 float gradient_horiz(uint16_t p1, uint16_t p2, uint16_t p3, uint16_t p4, float r0, float r1);
 float gradient_vert(uint16_t p1, uint16_t p2, uint16_t p3, uint16_t p4, float r0, float r1);

@@ -109,25 +109,37 @@ typedef struct panel_rgb_offset {
 } panel_rgb_offset;
 
 /**
- * @brief a gradient function defines the direction of the gradient
- * you can implement your own gradient function and pass it to the gradient struct
+ * @brief Gradient direction for simple gradients
  */
-typedef float (*Gradient_func)(uint16_t p1, uint16_t p2, uint16_t p3, uint16_t p4, float r1, float r2);
-
+typedef enum {
+    GRADIENT_HORIZONTAL,    /**< Left to right */
+    GRADIENT_VERTICAL,      /**< Top to bottom */
+    GRADIENT_DIAGONAL,      /**< Top-left to bottom-right */
+    GRADIENT_RADIAL         /**< From center outward */
+} gradient_direction_t;
 
 /**
- * @brief define a gradient between two colors, the blending will be defined
- * in the direction of type
+ * @brief Easing functions for smooth gradient transitions
+ */
+typedef enum {
+    EASE_LINEAR,            /**< Linear interpolation */
+    EASE_IN_QUAD,          /**< Quadratic ease-in */
+    EASE_OUT_QUAD,         /**< Quadratic ease-out */
+    EASE_IN_OUT_QUAD       /**< Quadratic ease-in-out */
+} easing_function_t;
+
+/**
+ * @brief Simple two-color gradient definition
  * 
+ * A simplified gradient system that takes two colors, a direction,
+ * and an easing function for smooth color transitions.
  */
 typedef struct {
-    RGB colorA1;
-    RGB colorA2;
-    RGB colorB1;
-    RGB colorB2;
-    Gradient_func type;
-} Gradient;
-
+    RGB start_color;                /**< Starting color of the gradient */
+    RGB end_color;                  /**< Ending color of the gradient */
+    gradient_direction_t direction; /**< Direction of the gradient */
+    easing_function_t easing;       /**< Easing function for transitions */
+} SimpleGradient;
 
 
 // panel order describes which logical color drives panel wires R,G,B respectively
@@ -287,7 +299,9 @@ typedef struct scene_info {
  * @param scene the scene information
  * @param image the image to map to the scene bcm data. if NULL scene->image will be used
  */
-void map_byte_image_to_bcm(const scene_info *scene, const uint8_t *image);
+void map_byte_image_to_bcm(const scene_info *scene, uint8_t *image);
+
+void *mapper_thread_main(void *arg);
 
 /**
  * must be called on the main thread to start the renderer. it never returns
@@ -298,6 +312,7 @@ void *render_forever(const scene_info *scene);
  * @brief render the shader arg->shader_file shader on the GPU
  */
 void *render_shader(void *arg);
+void *render_shader_old(void *arg);
 void *render_shader_minimal(void *arg);
 
 /**
@@ -328,29 +343,19 @@ bool hub_render_video(scene_info *scene, const char *filename);
  * @param target_fps - target a sleep time to achieve this fps
  * @return long - returns sleep time in microseconds
  */
-long calculate_fps(const uint16_t target_fps, const bool show_fps);
+unsigned long calculate_fps(const uint16_t target_fps, const bool show_fps);
 
 
 // graceful shutdown helpers
-void render_loop_shutdown(struct scene_info *scene);
 void hub75_request_shutdown(struct scene_info *scene);
 void hub75_wait_shutdown(struct scene_info *scene);
-void draw_polygon(scene_info *scene, Polygonf_t *poly, RGB color1, RGB color2);
 
+void draw_polygon_fill(scene_info *scene, Polygonf_t *poly, RGB color);
+void gradient_polygon(scene_info *scene, Polygonf_t *poly, SimpleGradient gradient);
 
-/**
- * @brief draw an unfilled anti-aliased triangle using Xiolin Wu's line drawing algorithm
- * 
- * @param scene 
- * @param x0  p0 x
- * @param y0  p0 y
- * @param x1  p1 x
- * @param y1  p2 y
- * @param x2  p3 x
- * @param y2  p3 y
- * @param color 
- */
-void hub_triangle_aa(scene_info *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, const uint16_t x2, const uint16_t y2, RGB color);
+/* Easing function implementations */
+float apply_easing(float t, easing_function_t easing);
+
 
 void hub_line_aa(scene_info *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, const RGB color);
 void hub_line(scene_info *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, RGB color);
@@ -376,6 +381,13 @@ scene_info *new_scene();
  */
 void start_scene(scene_info *scene);
 
+/**
+ * @brief install signal handlers for graceful shutdown on SIGINT/SIGTERM
+ * 
+ */
+void signal_handler_install(void);
+
+
 /* --------------------------------------------------------------
  * OPTIONAL: Public function table for FFI (e.g. Python / Rust / Go)
  * --------------------------------------------------------------
@@ -384,54 +396,147 @@ void start_scene(scene_info *scene);
  * multiple headers.  Versioning can be added later by extending the
  * struct (always append new fields) and bumping hub75_api.version.
  */
+/*
 typedef struct hub75_api {
-    uint32_t version;      /* struct version for compatibility */
-    scene_info *scene;     /* active scene (set via hub75_get_api(scene)) */
+    uint32_t version;      // struct version for compatibility 
+    scene_info *scene;     // active scene (set via hub75_get_api(scene)) 
 
-    /* Scene creation helpers (do NOT use internal scene pointer) */
+    // Scene creation helpers (do NOT use internal scene pointer) 
     scene_info *(*new_scene)(void);
     scene_info *(*parse_scene)(int argc, char **argv);
 
-    /* Lifecycle operating on api->scene (scene must be set) */
+    // Lifecycle operating on api->scene (scene must be set) 
     void (*start)(void);
     void (*request_shutdown)(void);
     void (*wait_shutdown)(void);
-    void (*map_image)(uint8_t *image); /* NULL -> use scene->image */
+    void (*map_image)(uint8_t *image); // NULL -> use scene->image 
 
-    /* Timing (independent of scene except show_fps flag consumed inside) */
-    long (*calculate_fps)(uint16_t target_fps, bool show_fps);
+    // Timing (independent of scene except show_fps flag consumed inside) 
+    unsigned long (*fps_calculate)(uint16_t target_fps, bool show_fps);
 
-    /* Drawing primitives (use api->scene internally) */
+    // Drawing primitives (use api->scene internally)
     void (*pixel)(int x, int y, RGB pixel);
     void (*pixel_factor)(int x, int y, RGB pixel, float factor);
     void (*pixel_alpha)(int x, int y, RGBA pixel);
     void (*fill)(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB color);
     void (*line)(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, RGB color);
-    void (*line_aa)(int x0, int y0, int x1, int y1, RGB color);
+    void (*line_aa)(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, RGB color);
     void (*triangle)(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB color);
     void (*triangle_aa)(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB color);
     void (*circle)(uint16_t cx, uint16_t cy, uint16_t radius, RGB color);
-    void (*fill_grad)(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, Gradient gradient);
+    int (*fps_get)();
 } hub75_api;
+ */
 
-/* Obtain & initialize (or re-point) the singleton API to a scene. */
-const hub75_api *hub75_get_api(scene_info *scene);
+// Obtain & initialize (or re-point) the singleton API to a scene. 
+// const hub75_api *hub75_get_api(scene_info *scene);
 
-poly_winding_t polygon_winding(const Polygonf_t *poly);
+// poly_winding_t polygon_winding(const Polygonf_t *poly);
+
+typedef struct { float x, y; } vec2;
+typedef struct { float x, y, z; } vec3;
+typedef struct { float m[16]; }   mat4;  // row-major, m[row*4 + col] 
+
+typedef struct {
+    vec3 position;     // world position 
+    vec3 rotation;     // Euler angles in radians, x=pitch, y=yaw, z=roll 
+    vec3 scale;        // per-axis scale 
+} transform_t;
+
+typedef struct {
+    vec3 position;     // camera position 
+    vec3 target;       // look-at target 
+    vec3 up;           // usually {0,1,0} 
+    float fov_y;       // radians 
+    float aspect;      // width / height 
+    float z_near, z_far;
+} camera_t;
+
+typedef struct {
+    uint16_t length;
+    vec3 *list;
+} vert_list_t;
+
+typedef struct {
+    uint16_t length;
+    RGB *list;
+} color_list_t;
+
+typedef struct {
+    uint16_t length;
+    vec2 *list;
+} edge_list_t;
+
+typedef struct {
+    uint16_t length;
+    vec3 *list;  /* triangle indices: each vec3 contains 3 vertex indices (x,y,z) */
+} face_list_t;
+
+typedef struct {
+    uint16_t length;
+    vec3 *list;  /* normal vectors: one per face for flat shading */
+} normal_list_t;
+
+typedef struct {
+    vert_list_t *verticies;
+    edge_list_t *edges;
+    face_list_t *faces;       /* NEW: triangle definitions */
+    normal_list_t *normals;   /* NEW: face normals */
+    color_list_t *edge_colors;
+
+    vec3 *rendered_vertices;
+} object_t;
+
+
+
+object_t* object_cube(void);
+object_t* object_tetrahedron(void);
+object_t* object_octahedron(void);
+object_t* object_pyramid(void);
+object_t* object_cylinder(uint16_t segments);
+object_t* object_sphere(uint16_t subdivisions);
+object_t* object_torus(uint16_t major_segments, uint16_t minor_segments);
+object_t* object_plane(uint16_t width_segments, uint16_t height_segments);
+mat4 camera_project(const camera_t *cam, const transform_t *obj_xform);
+void transform_mesh_to_ndc(const vec3 *in_vertices, size_t n, mat4 mvp, vec3 *out_ndc);
+object_t* object_new(uint16_t num_vertices, uint16_t num_edges, uint16_t num_faces);
+
 
 typedef struct {
     void (*clear)();
     void (*pixel)(const uint16_t x, const uint16_t y, RGB c);
+    void (*pixel_factor)(int x, int y, RGB pixel, float factor);
+    void (*pixel_alpha)(int x, int y, RGBA pixel);
     void (*line)(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, RGB c);
     void (*line_aa)(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, RGB c);
-    void (*poly)(Polygonf_t *poly, RGB color1, RGB color2);
+    void (*poly)(Polygonf_t *poly, RGB color1);
+    void (*poly_gradient)(Polygonf_t *poly, SimpleGradient gradient);
+    void (*fill_gradient)(int y, int x0, int x1, const SimpleGradient *gradient, 
+                            int minx, int miny, int maxx, int maxy);
+    void (*shutdown)();
     void (*begin_frame)();
     void (*end_frame)();
+
+    mat4 (*geo_render)(camera_t *cam, transform_t *obj_xform);
+    mat4 (*geo_project)(camera_t *cam, transform_t *obj_xform);
+    void (*geo_render_wire)(const camera_t *cam, object_t *obj, const transform_t *obj_xform);
+    void (*geo_render_filled)(const camera_t *cam, object_t *obj, const transform_t *obj_xform);
+
+    camera_t* (*geo_camera)();
+    transform_t* (*geo_transform)();
+    object_t* (*geo_object)(const uint16_t num_vertices, const uint16_t num_edges, const uint16_t num_faces);
+    object_t* (*geo_cube)();
+    object_t* (*geo_tetrahedron)();
+    object_t* (*geo_octahedron)();
+    object_t* (*geo_pyramid)();
+    object_t* (*geo_cylinder)(uint16_t segments);
+    object_t* (*geo_sphere)(uint16_t subdivisions);
+    object_t* (*geo_torus)(uint16_t major_segments, uint16_t minor_segments);
+    object_t* (*geo_plane)(uint16_t width_segments, uint16_t height_segments);
+
 } hub75gpu_t;
 
 /* set the current thread's scene and get an API whose functions do not take a scene */
 hub75gpu_t hub75gpu(scene_info *s);
-
-void* mini_gpu (void *arg);
 
 #endif

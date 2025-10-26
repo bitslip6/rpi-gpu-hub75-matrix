@@ -42,7 +42,7 @@ spsc_semring_t *spsc_create(size_t capacity, size_t item_size_bytes);
 void spsc_destroy(spsc_semring_t *q);
 void *spsc_push_ptr_begin(spsc_semring_t *q, long timeout_ms);
 void spsc_push_ptr_commit(spsc_semring_t *q);
-const void *spsc_pop_ptr_begin(spsc_semring_t *q, long timeout_ms);
+void *spsc_pop_ptr_begin(spsc_semring_t *q, long timeout_ms);
 void spsc_pop_ptr_commit(spsc_semring_t *q);
 
 // Return the approximate number of items in the queue (producer head - consumer tail).
