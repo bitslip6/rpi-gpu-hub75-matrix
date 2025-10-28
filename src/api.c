@@ -676,7 +676,6 @@ void api_geo_render_wire(const camera_t *cam, object_t *obj, const transform_t *
 
 void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene_lighting_t *lighting) {
     if (!obj || !obj->faces || !obj->verticies) return;
-
     mat4 mvp = camera_project(cam, obj_xform);
     
     /* Transform vertices to NDC space */
@@ -780,7 +779,29 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
     }
 }
 
-
+/* Render a list of object instances with per-object draw mode */
+static void api_render_object_scene(const camera_t *cam, const object_scene_t *os, const scene_lighting_t *lighting) {
+    if (!os || !os->instances || os->count == 0) return;
+    for (uint16_t i = 0; i < os->count; ++i) {
+        const object_instance_t *inst = &os->instances[i];
+        object_t *obj = inst->object;
+        const transform_t *xf = inst->xform;
+        if (!obj || !xf) continue;
+        switch (obj->draw_mode) {
+            case DRAW_WIRE:
+                api_geo_render_wire(cam, obj, xf, lighting);
+                break;
+            case DRAW_FILLED:
+                api_geo_render_filled(cam, obj, xf, lighting);
+                break;
+            case DRAW_BOTH:
+            default:
+                api_geo_render_wire(cam, obj, xf, lighting);
+                api_geo_render_filled(cam, obj, xf, lighting);
+                break;
+        }
+    }
+}
 
 
 /**
@@ -817,6 +838,7 @@ static const hub75gpu_t api_table = {
     .geo_project = api_geo_project,
     .geo_render_wire = api_geo_render_wire,
     .geo_render_filled = api_geo_render_filled,
+    .render_scene = api_render_object_scene,
 
     .end_frame = api_end_frame,
     .shutdown = api_shutdown,

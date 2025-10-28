@@ -514,6 +514,13 @@ typedef struct {
     vec3 *list;  /* normal vectors: one per face for flat shading */
 } normal_list_t;
 
+/* Per-object drawing mode */
+typedef enum {
+    DRAW_WIRE = 0,
+    DRAW_FILLED = 1,
+    DRAW_BOTH = 2
+} object_draw_mode_t;
+
 typedef struct {
     vert_list_t *verticies;
     edge_list_t *edges;
@@ -523,6 +530,7 @@ typedef struct {
 
     vec3 *rendered_vertices;
     bool cull_backface;    /* toggle backface culling for wireframe/fill */
+    object_draw_mode_t draw_mode; /* how to render this object */
 } object_t;
 
 
@@ -547,6 +555,17 @@ void normal_matrix_from_model(const mat4 model, float out3x3[9]);
 /* Multiply a 3x3 (column-major) with a vec3 */
 vec3 mat3_mul_vec3(const float M[9], vec3 v);
 
+/* Scene of object instances */
+typedef struct {
+    object_t *object;             /* mesh + material/state */
+    const transform_t *xform;     /* object transform (external owner) */
+} object_instance_t;
+
+typedef struct {
+    uint16_t count;
+    const object_instance_t *instances; /* array of count instances */
+} object_scene_t;
+
 
 typedef struct {
     void (*clear)();
@@ -567,6 +586,7 @@ typedef struct {
     mat4 (*geo_project)(camera_t *cam, transform_t *obj_xform);
     void (*geo_render_wire)(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene_lighting_t *lighting);
     void (*geo_render_filled)(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene_lighting_t *lighting);
+    void (*render_scene)(const camera_t *cam, const object_scene_t *scene, const scene_lighting_t *lighting);
 
     camera_t* (*geo_camera)();
     transform_t* (*geo_transform)();
