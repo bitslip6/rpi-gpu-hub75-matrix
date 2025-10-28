@@ -572,7 +572,8 @@ void debug_object(object_t *obj) {
     }
 }
 
-void api_geo_render_wire(const camera_t *cam, object_t *obj, const transform_t *obj_xform) {
+void api_geo_render_wire(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene_lighting_t *lighting) {
+    (void)lighting; /* allow NULL; lighting not used in wireframe */
 
     // Debug camera and transform
     printf("Camera: pos(%.3f, %.3f, %.3f), target(%.3f, %.3f, %.3f), fov=%.3f, aspect=%.3f, near=%.3f, far=%.3f\n", 
@@ -673,7 +674,7 @@ void api_geo_render_wire(const camera_t *cam, object_t *obj, const transform_t *
     if (front_face) free(front_face);
 }
 
-void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t *obj_xform) {
+void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene_lighting_t *lighting) {
     if (!obj || !obj->faces || !obj->verticies) return;
 
     mat4 mvp = camera_project(cam, obj_xform);
@@ -684,6 +685,13 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
     const uint16_t w = (uint16_t)(tls_scene->width * 0.5f);
     const uint16_t h = (uint16_t)(tls_scene->height * 0.5f);
     
+    /* Precompute world normal matrix only if lighting is provided */
+    float N3[9];
+    if (lighting) {
+        mat4 M_model = model_matrix(obj_xform);
+        normal_matrix_from_model(M_model, N3);
+    }
+
     /* Render each triangle face */
     for (size_t i = 0; i < obj->faces->length; i++) {
         vec3 face = obj->faces->list[i];
@@ -720,16 +728,55 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
     triangle.points[1] = (Pointf_t){nx2, ny2};
     triangle.points[2] = (Pointf_t){nx3, ny3};
         
-        /* Use edge color for face color (index by face) */
-        RGB face_color = (i < obj->edge_colors->length) ? 
-                        obj->edge_colors->list[i] : 
-                        (RGB){255, 255, 255}; /* default white */
+        /* Base face/albedo color (index by face; fallback white) */
+        RGB base_rgb = (i < obj->edge_colors->length) ? obj->edge_colors->list[i] : (RGB){255,255,255};
+
+        /* Flat Lambert shading (world space): N from model normal matrix, lights from `lighting` */
+        RGB shaded_rgb = base_rgb;
+        if (lighting) {
+
+            vec3 n_obj = (obj->normals && i < obj->normals->length) ? obj->normals->list[i] : (vec3){0,0,1};
+            /* transform and normalize */
+            vec3 n_world = mat3_mul_vec3(N3, n_obj);
+            float n_len = sqrtf(n_world.x*n_world.x + n_world.y*n_world.y + n_world.z*n_world.z);
+            if (n_len > 1e-6f) { n_world.x/=n_len; n_world.y/=n_len; n_world.z/=n_len; }
+
+            /* convert base color to [0,1] */
+            float br = base_rgb.r/255.0f, bg = base_rgb.g/255.0f, bb = base_rgb.b/255.0f;
+            float lr = lighting->ambient.r, lg = lighting->ambient.g, lb = lighting->ambient.b; /* start with ambient */
+
+            for (uint16_t li = 0; li < lighting->num_lights; ++li) {
+                const light_t *L = &lighting->lights[li];
+                if (L->intensity <= 0.0f) continue;
+                if (L->type == LIGHT_DIRECTIONAL) {
+                    /* Treat direction as the direction the light shines; vector to light is -direction */
+                    float Lx = -L->direction.x, Ly = -L->direction.y, Lz = -L->direction.z;
+                    float Llen = sqrtf(Lx*Lx + Ly*Ly + Lz*Lz);
+                    if (Llen > 1e-6f) { Lx/=Llen; Ly/=Llen; Lz/=Llen; }
+                    float ndotl = n_world.x*Lx + n_world.y*Ly + n_world.z*Lz;
+                    if (ndotl > 0.0f) {
+                        lr += L->color.r * L->intensity * ndotl;
+                        lg += L->color.g * L->intensity * ndotl;
+                        lb += L->color.b * L->intensity * ndotl;
+                    }
+                }
+                /* POINT and SPOT can be added later */
+            }
+
+            /* modulate base by lighting and clamp */
+            float cr = fminf(fmaxf(br * lr, 0.0f), 1.0f);
+            float cg = fminf(fmaxf(bg * lg, 0.0f), 1.0f);
+            float cb = fminf(fmaxf(bb * lb, 0.0f), 1.0f);
+            shaded_rgb.r = (uint8_t)(cr * 255.0f);
+            shaded_rgb.g = (uint8_t)(cg * 255.0f);
+            shaded_rgb.b = (uint8_t)(cb * 255.0f);
+        }
 
      printf("Filling triangle p1 (%.3f, %.3f), p2 (%.3f, %.3f), p3 (%.3f, %.3f)\n",
          (double)nx1, (double)ny1, (double)nx2, (double)ny2, (double)nx3, (double)ny3);
         
      /* Render the filled triangle */
-     draw_polygon_fill(tls_scene, &triangle, face_color);
+    draw_polygon_fill(tls_scene, &triangle, shaded_rgb);
     }
 }
 

@@ -744,3 +744,75 @@ mat4 camera_project(const camera_t *cam, const transform_t *obj_xform) {
     mat4 mvp   = mat4_mul(proj, mv);
     return mvp;
 }
+
+/* =========================
+   Exported normal utilities
+   ========================= */
+
+mat4 model_matrix(const transform_t *t) {
+    return transform_model_matrix(t);
+}
+
+/* Extract upper-left 3x3 from a 4x4 (column-major) into 3x3 (column-major) */
+static inline void mat3_from_mat4(const mat4 m, float out[9]) {
+    out[0] = m.m[0];  out[1] = m.m[1];  out[2] = m.m[2];
+    out[3] = m.m[4];  out[4] = m.m[5];  out[5] = m.m[6];
+    out[6] = m.m[8];  out[7] = m.m[9];  out[8] = m.m[10];
+}
+
+/* Compute inverse of a 3x3 column-major matrix. Returns false if singular. */
+static bool mat3_inverse(const float a[9], float inv_out[9]) {
+    /* Map to row-major names for readability */
+    float m00 = a[0], m01 = a[3], m02 = a[6];
+    float m10 = a[1], m11 = a[4], m12 = a[7];
+    float m20 = a[2], m21 = a[5], m22 = a[8];
+
+    float c00 =  (m11*m22 - m12*m21);
+    float c01 = -(m10*m22 - m12*m20);
+    float c02 =  (m10*m21 - m11*m20);
+    float c10 = -(m01*m22 - m02*m21);
+    float c11 =  (m00*m22 - m02*m20);
+    float c12 = -(m00*m21 - m01*m20);
+    float c20 =  (m01*m12 - m02*m11);
+    float c21 = -(m00*m12 - m02*m10);
+    float c22 =  (m00*m11 - m01*m10);
+
+    float det = m00*c00 + m01*c01 + m02*c02;
+    if (fabsf(det) < 1e-8f) return false;
+    float inv_det = 1.0f / det;
+
+    /* inverse = (1/det) * adjugate = (1/det) * transpose(C) */
+    /* store back in column-major */
+    inv_out[0] = c00 * inv_det;  inv_out[1] = c10 * inv_det;  inv_out[2] = c20 * inv_det;
+    inv_out[3] = c01 * inv_det;  inv_out[4] = c11 * inv_det;  inv_out[5] = c21 * inv_det;
+    inv_out[6] = c02 * inv_det;  inv_out[7] = c12 * inv_det;  inv_out[8] = c22 * inv_det;
+    return true;
+}
+
+static inline void mat3_transpose(const float in[9], float out[9]) {
+    out[0] = in[0]; out[1] = in[3]; out[2] = in[6];
+    out[3] = in[1]; out[4] = in[4]; out[5] = in[7];
+    out[6] = in[2]; out[7] = in[5]; out[8] = in[8];
+}
+
+void normal_matrix_from_model(const mat4 model, float out3x3[9]) {
+    float m3[9];
+    mat3_from_mat4(model, m3);
+    float inv3[9];
+    if (!mat3_inverse(m3, inv3)) {
+        /* fallback to identity */
+        out3x3[0]=1; out3x3[1]=0; out3x3[2]=0;
+        out3x3[3]=0; out3x3[4]=1; out3x3[5]=0;
+        out3x3[6]=0; out3x3[7]=0; out3x3[8]=1;
+        return;
+    }
+    mat3_transpose(inv3, out3x3);
+}
+
+vec3 mat3_mul_vec3(const float M[9], vec3 v) {
+    return (vec3){
+        M[0]*v.x + M[3]*v.y + M[6]*v.z,
+        M[1]*v.x + M[4]*v.y + M[7]*v.z,
+        M[2]*v.x + M[5]*v.y + M[8]*v.z
+    };
+}

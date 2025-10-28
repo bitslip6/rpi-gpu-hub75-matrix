@@ -156,6 +156,43 @@ typedef void (*func_tone_mapper_t)(const RGBF *in, RGBF *out, const float level)
 typedef uint8_t *(*func_image_mapper_t)(const uint8_t *image_in, uint8_t *image_out, const struct scene_info *scene);
 typedef uint8_t *(image_mapper_t)(const uint8_t *image_in, uint8_t *image_out, const struct scene_info *scene);
 
+/* --------------------------------------------------------------
+ * Lighting types and scene lighting configuration
+ * (definitions appear before scene_info usage)
+ * -------------------------------------------------------------- */
+typedef enum {
+    LIGHT_DIRECTIONAL = 0,
+    LIGHT_POINT       = 1,
+    LIGHT_SPOT        = 2
+} light_type_t;
+
+/* local 3-float vector for lighting (avoid dependency on vec3 defined later) */
+typedef struct { float x, y, z; } light_vec3;
+
+typedef struct light_t {
+    light_type_t type;     /* light category */
+
+    /* Common parameters */
+    RGBF   color;          /* light color (0..1 per channel) */
+    float  intensity;      /* scalar multiplier for brightness */
+    bool   casts_shadows;  /* whether this light should cast shadows */
+
+    /* Geometric parameters (interpreted by type) */
+    light_vec3 position;   /* for point/spot lights */
+    light_vec3 direction;  /* for directional/spot lights */
+
+    /* Optional falloff / cone controls (POINT/SPOT) */
+    float  range;          /* effective radius for point/spot; 0 => infinite */
+    float  inner_cos;      /* spot inner cone (cosine of angle); 1 => no cone */
+    float  outer_cos;      /* spot outer cone (cosine of angle); must be <= inner_cos */
+} light_t;
+
+typedef struct scene_lighting_t {
+    RGBF     ambient;      /* ambient light color (0..1 per channel) */
+    uint16_t num_lights;   /* number of active lights */
+    light_t *lights;       /* dynamic array of lights (NULL when num_lights == 0) */
+} scene_lighting_t;
+
 
 
 
@@ -485,7 +522,7 @@ typedef struct {
     color_list_t *edge_colors;
 
     vec3 *rendered_vertices;
-    bool cull_backface;
+    bool cull_backface;    /* toggle backface culling for wireframe/fill */
 } object_t;
 
 
@@ -501,6 +538,14 @@ object_t* object_plane(uint16_t width_segments, uint16_t height_segments);
 mat4 camera_project(const camera_t *cam, const transform_t *obj_xform);
 void transform_mesh_to_ndc(const vec3 *in_vertices, size_t n, mat4 mvp, vec3 *out_ndc);
 object_t* object_new(uint16_t num_vertices, uint16_t num_edges, uint16_t num_faces);
+
+/* 3D math utilities (normals) */
+/* Build model matrix (T * Rz * Ry * Rx * S) */
+mat4 model_matrix(const transform_t *t);
+/* Extract world-space normal matrix from model (inverse-transpose of upper-left 3x3) */
+void normal_matrix_from_model(const mat4 model, float out3x3[9]);
+/* Multiply a 3x3 (column-major) with a vec3 */
+vec3 mat3_mul_vec3(const float M[9], vec3 v);
 
 
 typedef struct {
@@ -520,8 +565,8 @@ typedef struct {
 
     mat4 (*geo_render)(camera_t *cam, transform_t *obj_xform);
     mat4 (*geo_project)(camera_t *cam, transform_t *obj_xform);
-    void (*geo_render_wire)(const camera_t *cam, object_t *obj, const transform_t *obj_xform);
-    void (*geo_render_filled)(const camera_t *cam, object_t *obj, const transform_t *obj_xform);
+    void (*geo_render_wire)(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene_lighting_t *lighting);
+    void (*geo_render_filled)(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene_lighting_t *lighting);
 
     camera_t* (*geo_camera)();
     transform_t* (*geo_transform)();

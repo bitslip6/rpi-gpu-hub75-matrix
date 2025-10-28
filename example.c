@@ -106,11 +106,26 @@ static void *render_3d(void *arg) {
     scene->stride = 3;
 
     for (int i=0; i<cube->edge_colors->length; ++i) {
-        cube->edge_colors->list[i] = (RGB){ rnd8(), rnd8(), rnd8() };
+        cube->edge_colors->list[i] = (RGB){ 250, 64, 64 };
     }
 
     cam->position.y = -2.0f;
     /* animate few steps, replace with your app loop */
+    /* simple lighting setup: white directional with gentle ambient */
+    light_t dir;
+    dir.type = LIGHT_DIRECTIONAL;
+    dir.color = (RGBF){1.0f, 1.0f, 1.0f};
+    dir.intensity = 1.0f;
+    dir.casts_shadows = false;
+    dir.direction = (light_vec3){ -0.5f, 1.0f, 0.2f };
+    dir.position.y = -3.0f;
+    dir.position.x = 0.0f;
+    dir.position.z = 10.0f;
+    scene_lighting_t lighting = {0};
+    lighting.ambient = (RGBF){0.25f, 0.25f, 0.25f};
+    lighting.num_lights = 1;
+    lighting.lights = &dir; /* valid for duration of the call below */
+
     for (int frame = 0; frame < 1; ++frame) {
         float t = (float)frame * 0.016f;
 
@@ -125,7 +140,7 @@ static void *render_3d(void *arg) {
         cam->position.z = 5.0f * sinf(t * 0.3f);  /* Reduced distance with wider FOV for better fit */
         cam->target     = cube_xform->position;
 
-        api.geo_render_filled(cam, cube, cube_xform);
+        api.geo_render_filled(cam, cube, cube_xform, &lighting);
     }
 
     stbi_write_png("out2.png", scene->width, scene->height, 3, scene->image, scene->width * scene->stride);
