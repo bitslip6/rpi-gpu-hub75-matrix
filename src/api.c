@@ -276,6 +276,21 @@ void draw_polygon_fill(scene_info *scene, Polygonf_t *poly, RGB color)
         return;
     }
 
+    /* Debug: verify coordinates look normalized (0..1). If they don't, log once per call. */
+    {
+        float minx =  1e9f, maxx = -1e9f, miny =  1e9f, maxy = -1e9f;
+        for (size_t i = 0; i < poly->num_points; ++i) {
+            if (poly->points[i].x < minx) minx = poly->points[i].x;
+            if (poly->points[i].x > maxx) maxx = poly->points[i].x;
+            if (poly->points[i].y < miny) miny = poly->points[i].y;
+            if (poly->points[i].y > maxy) maxy = poly->points[i].y;
+        }
+        if (minx < -0.01f || maxx > 1.01f || miny < -0.01f || maxy > 1.01f) {
+            printf("[draw_polygon_fill] Warning: coordinates not normalized. min(%.3f,%.3f) max(%.3f,%.3f)\n",
+                   (double)minx, (double)miny, (double)maxx, (double)maxy);
+        }
+    }
+
     size_t n = poly->num_points;
     if (n > MAX_POLY_POINTS) n = MAX_POLY_POINTS;   /* truncate safely */
 
@@ -685,34 +700,36 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
             float bx = v3.x - v1.x;
             float by = v3.y - v1.y;
             float area = ax * by - ay * bx; /* signed area in NDC (y up) */
-            if (area <= 0.0f) {
+            if (area > 0.0f) {
                 continue; /* back-facing */
             }
         }
         
-        /* Convert NDC to screen coordinates */
-        uint16_t x1 = (uint16_t)(w * (v1.x + 1.0f));
-        uint16_t y1 = (uint16_t)(h * (v1.y + 1.0f));
-        uint16_t x2 = (uint16_t)(w * (v2.x + 1.0f));
-        uint16_t y2 = (uint16_t)(h * (v2.y + 1.0f));
-        uint16_t x3 = (uint16_t)(w * (v3.x + 1.0f));
-        uint16_t y3 = (uint16_t)(h * (v3.y + 1.0f));
-        
-        
-        /* Create a triangle polygon for rendering */
-        Polygonf_t triangle;
-        triangle.num_points = 3;
-        triangle.points[0] = (Pointf_t){(float)x1, (float)y1};
-        triangle.points[1] = (Pointf_t){(float)x2, (float)y2};
-        triangle.points[2] = (Pointf_t){(float)x3, (float)y3};
+    /* Convert NDC to normalized screen coordinates [0,1] */
+    float nx1 = 0.5f * (v1.x + 1.0f);
+    float ny1 = 0.5f * (v1.y + 1.0f);
+    float nx2 = 0.5f * (v2.x + 1.0f);
+    float ny2 = 0.5f * (v2.y + 1.0f);
+    float nx3 = 0.5f * (v3.x + 1.0f);
+    float ny3 = 0.5f * (v3.y + 1.0f);
+
+    /* Create a triangle polygon for rendering (expects normalized 0..1) */
+    Polygonf_t triangle;
+    triangle.num_points = 3;
+    triangle.points[0] = (Pointf_t){nx1, ny1};
+    triangle.points[1] = (Pointf_t){nx2, ny2};
+    triangle.points[2] = (Pointf_t){nx3, ny3};
         
         /* Use edge color for face color (index by face) */
         RGB face_color = (i < obj->edge_colors->length) ? 
                         obj->edge_colors->list[i] : 
                         (RGB){255, 255, 255}; /* default white */
+
+     printf("Filling triangle p1 (%.3f, %.3f), p2 (%.3f, %.3f), p3 (%.3f, %.3f)\n",
+         (double)nx1, (double)ny1, (double)nx2, (double)ny2, (double)nx3, (double)ny3);
         
-        /* Render the filled triangle */
-        draw_polygon_fill(tls_scene, &triangle, face_color);
+     /* Render the filled triangle */
+     draw_polygon_fill(tls_scene, &triangle, face_color);
     }
 }
 

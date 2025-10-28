@@ -105,6 +105,10 @@ static void *render_3d(void *arg) {
     cube->cull_backface = true;
     scene->stride = 3;
 
+    for (int i=0; i<cube->edge_colors->length; ++i) {
+        cube->edge_colors->list[i] = (RGB){ rnd8(), rnd8(), rnd8() };
+    }
+
     cam->position.y = -2.0f;
     /* animate few steps, replace with your app loop */
     for (int frame = 0; frame < 1; ++frame) {
@@ -121,7 +125,7 @@ static void *render_3d(void *arg) {
         cam->position.z = 5.0f * sinf(t * 0.3f);  /* Reduced distance with wider FOV for better fit */
         cam->target     = cube_xform->position;
 
-        api.geo_render_wire(cam, cube, cube_xform);
+        api.geo_render_filled(cam, cube, cube_xform);
     }
 
     stbi_write_png("out2.png", scene->width, scene->height, 3, scene->image, scene->width * scene->stride);
