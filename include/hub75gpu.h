@@ -435,7 +435,7 @@ typedef struct hub75_api {
 
 typedef struct { float x, y; } vec2;
 typedef struct { float x, y, z; } vec3;
-typedef struct { float m[16]; }   mat4;  // row-major, m[row*4 + col] 
+typedef struct { float m[16]; }   mat4;  // column-major, m[col*4 + row]
 
 typedef struct {
     vec3 position;     // world position 
@@ -485,6 +485,7 @@ typedef struct {
     color_list_t *edge_colors;
 
     vec3 *rendered_vertices;
+    bool cull_backface;
 } object_t;
 
 

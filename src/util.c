@@ -1158,6 +1158,7 @@ void usage(__attribute__((unused))int argc, char **argv) {
         // "     -z                run LED calibration script\n"
         // "     -n                display data from UDP server on port %d (untested)\n"
         "     -v                display current FPS and Panel refresh Hz\n"
+    "     -K                enable backface culling for filled geometry\n"
         "     -O <r:g:b,r:g:b>  panel color correction offset ammount, +-128 for each color, comma delimited\n"
         "                       add or subtract this ammount to each panels rgb channels\n"
         "                       example '-O 0:10:5,0:0:0'  adds 10 to green and 5 to blue on panel type 0\n\n"

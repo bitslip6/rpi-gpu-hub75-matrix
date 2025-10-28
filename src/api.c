@@ -19,6 +19,74 @@
 /* Thread-local storage for the current scene being processed by this thread */
 static _Thread_local scene_info *tls_scene = NULL;
 
+/* Minimal 3D helpers for normal-based culling */
+static inline vec3 v3_add(vec3 a, vec3 b){ return (vec3){a.x+b.x,a.y+b.y,a.z+b.z}; }
+static inline vec3 v3_sub(vec3 a, vec3 b){ return (vec3){a.x-b.x,a.y-b.y,a.z-b.z}; }
+static inline float v3_dot(vec3 a, vec3 b){ return a.x*b.x + a.y*b.y + a.z*b.z; }
+static inline vec3 v3_cross(vec3 a, vec3 b){
+    return (vec3){ a.y*b.z - a.z*b.y,
+                   a.z*b.x - a.x*b.z,
+                   a.x*b.y - a.y*b.x };
+}
+static inline vec3 v3_norm(vec3 v){ float d = sqrtf(v3_dot(v,v)); return d>0? (vec3){v.x/d,v.y/d,v.z/d} : (vec3){0,0,0}; }
+
+/* Build model rotation 3x3 (column-major) from Euler angles, order Rz*Ry*Rx */
+static inline void mat3_model_rotation(const vec3 euler, float Rm[9]){
+    float cx = cosf(euler.x), sx = sinf(euler.x);
+    float cy = cosf(euler.y), sy = sinf(euler.y);
+    float cz = cosf(euler.z), sz = sinf(euler.z);
+
+    /* Column-major rotation matrices matching 3d.c (column vectors) */
+    /* Rx */
+    float Rx[9] = { 1, 0, 0,
+                    0, cx, -sx,
+                    0, sx,  cx };
+    /* Ry */
+    float Ry[9] = {  cy, 0, sy,
+                     0,  1, 0,
+                    -sy, 0, cy };
+    /* Rz */
+    float Rz[9] = {  cz, -sz, 0,
+                     sz,  cz, 0,
+                     0,   0,  1 };
+
+    /* temp = Ry*Rx, then Rm = Rz*temp (column-major multiply) */
+    float T[9];
+    for(int col=0; col<3; ++col){
+        for(int row=0; row<3; ++row){
+            T[col*3+row] = Ry[0*3+row]*Rx[col*3+0]
+                         + Ry[1*3+row]*Rx[col*3+1]
+                         + Ry[2*3+row]*Rx[col*3+2];
+        }
+    }
+    for(int col=0; col<3; ++col){
+        for(int row=0; row<3; ++row){
+            Rm[col*3+row] = Rz[0*3+row]*T[col*3+0]
+                          + Rz[1*3+row]*T[col*3+1]
+                          + Rz[2*3+row]*T[col*3+2];
+        }
+    }
+}
+
+/* Build view rotation 3x3 (column-major) using look-at axes: columns = s, u, -f */
+static inline void mat3_view_rotation(const camera_t *cam, float Rv[9]){
+    vec3 f = v3_norm(v3_sub(cam->target, cam->position));
+    vec3 up = cam->up.x==0 && cam->up.y==0 && cam->up.z==0 ? (vec3){0,1,0} : cam->up;
+    vec3 s = v3_norm(v3_cross(f, up));
+    vec3 u = v3_cross(s, f);
+    vec3 mf = (vec3){-f.x, -f.y, -f.z};
+    /* columns: s, u, -f */
+    Rv[0]=s.x; Rv[3]=s.y; Rv[6]=s.z;
+    Rv[1]=u.x; Rv[4]=u.y; Rv[7]=u.z;
+    Rv[2]=mf.x;Rv[5]=mf.y;Rv[8]=mf.z;
+}
+
+static inline vec3 mat3_mul_v3(const float M[9], vec3 v){
+    return (vec3){ M[0]*v.x + M[3]*v.y + M[6]*v.z,
+                   M[1]*v.x + M[4]*v.y + M[7]*v.z,
+                   M[2]*v.x + M[5]*v.y + M[8]*v.z };
+}
+
 /**
  * @brief Clear the current scene's image buffer by setting all pixels to black
  * 
@@ -511,17 +579,59 @@ void api_geo_render_wire(const camera_t *cam, object_t *obj, const transform_t *
 
     const uint16_t w = (uint16_t)(tls_scene->width * 0.5f);
     const uint16_t h = (uint16_t)(tls_scene->height * 0.5f);
+
+    /* If enabled, compute front-facing faces using normals in view space.
+       We'll still render as edges, filtering edges that do not belong to any front-facing face. */
+    bool do_cull_edges = false;
+    bool *front_face = NULL;
+    if (obj->cull_backface && obj->faces && obj->normals && obj->faces->length == obj->normals->length) {
+        float Rm[9], Rv[9];
+        mat3_model_rotation(obj_xform->rotation, Rm);
+        mat3_view_rotation(cam, Rv);
+        size_t nf = obj->faces->length;
+        front_face = (bool*)calloc(nf, sizeof(bool));
+        if (front_face) {
+            for (size_t i = 0; i < nf; ++i) {
+                vec3 n_obj = obj->normals->list[i];
+                vec3 n_world = mat3_mul_v3(Rm, n_obj);
+                vec3 n_view  = mat3_mul_v3(Rv, n_world);
+                front_face[i] = (n_view.z > 0.0f);
+            }
+            do_cull_edges = true;
+        }
+    }
+
     for (size_t i = 0; i < obj->edges->length; i++) {
         //debug("Vertex %zu: NDC (%.3f, %.3f, %.3f)\n", i, obj->rendered_vertices[i].x, obj->rendered_vertices[i].y, obj->rendered_vertices[i].z);
         vec2 edge = obj->edges->list[i];
         vec3 v1 = obj->rendered_vertices[(size_t)edge.x];
         vec3 v2 = obj->rendered_vertices[(size_t)edge.y];
 
-        // Skip edges where vertices are outside the view frustum (z clipping) - temporarily disabled for debugging
-        /*if (v1.z < -1.0f || v1.z > 1.0f || v2.z < -1.0f || v2.z > 1.0f) {
+        /* If culling, only draw this edge if it belongs to any front-facing face */
+        if (do_cull_edges) {
+            uint16_t a = (uint16_t)edge.x;
+            uint16_t b = (uint16_t)edge.y;
+            bool draw_edge = false;
+            for (size_t fi = 0; fi < obj->faces->length; ++fi) {
+                if (!front_face[fi]) continue;
+                vec3 f = obj->faces->list[fi];
+                uint16_t i0 = (uint16_t)f.x, i1 = (uint16_t)f.y, i2 = (uint16_t)f.z;
+                /* unordered edge match against triangle edges */
+                if ((a==i0 && b==i1) || (a==i1 && b==i0) ||
+                    (a==i1 && b==i2) || (a==i2 && b==i1) ||
+                    (a==i2 && b==i0) || (a==i0 && b==i2)) {
+                    draw_edge = true;
+                    break;
+                }
+            }
+            if (!draw_edge) continue;
+        }
+
+        // Skip edges where vertices are outside the view frustum (simple z clipping)
+        if (v1.z < -1.0f || v1.z > 1.0f || v2.z < -1.0f || v2.z > 1.0f) {
             printf("Skipping edge %zu due to z clipping: V1.z=%.3f, V2.z=%.3f\n", i, v1.z, v2.z);
             continue;
-        }*/
+        }
 
         // print out debugging info for each point
         printf("Edge %zu: V1 NDC (%.3f, %.3f, %.3f), V2 NDC (%.3f, %.3f, %.3f)\n", i, v1.x, v1.y, v1.z, v2.x, v2.y, v2.z);
@@ -538,10 +648,14 @@ void api_geo_render_wire(const camera_t *cam, object_t *obj, const transform_t *
         x2 = (x2 < 0) ? 0 : (x2 >= tls_scene->width) ? tls_scene->width - 1 : x2;
         y2 = (y2 < 0) ? 0 : (y2 >= tls_scene->height) ? tls_scene->height - 1 : y2;
         
+
+
         printf("line: (%d, %d) to (%d, %d)\n", x1, y1, x2, y2);
         
         hub_line(tls_scene, (uint16_t)x1, (uint16_t)y1, (uint16_t)x2, (uint16_t)y2, obj->edge_colors->list[i]);
     }
+
+    if (front_face) free(front_face);
 }
 
 void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t *obj_xform) {
@@ -563,6 +677,18 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
         vec3 v1 = obj->rendered_vertices[(size_t)face.x];
         vec3 v2 = obj->rendered_vertices[(size_t)face.y];
         vec3 v3 = obj->rendered_vertices[(size_t)face.z];
+
+        /* Optional backface culling using NDC winding (CCW = front) */
+        if (obj->cull_backface) {
+            float ax = v2.x - v1.x;
+            float ay = v2.y - v1.y;
+            float bx = v3.x - v1.x;
+            float by = v3.y - v1.y;
+            float area = ax * by - ay * bx; /* signed area in NDC (y up) */
+            if (area <= 0.0f) {
+                continue; /* back-facing */
+            }
+        }
         
         /* Convert NDC to screen coordinates */
         uint16_t x1 = (uint16_t)(w * (v1.x + 1.0f));
@@ -572,12 +698,6 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
         uint16_t x3 = (uint16_t)(w * (v3.x + 1.0f));
         uint16_t y3 = (uint16_t)(h * (v3.y + 1.0f));
         
-        /* Backface culling - check if triangle is facing away */
-        if (obj->normals && obj->normals->list) {
-            vec3 normal = obj->normals->list[i];
-            /* Simple backface culling: if normal.z < 0, triangle faces away */
-            if (normal.z < 0.0f) continue;
-        }
         
         /* Create a triangle polygon for rendering */
         Polygonf_t triangle;

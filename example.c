@@ -93,7 +93,7 @@ static void *render_3d(void *arg) {
     cube_xform->scale.y = 1.25;
     cube_xform->scale.z = 1.25f;
 
-    cube_xform->rotation.x = 2.5f;  /* Initial rotation for better view angle */
+    //cube_xform->rotation.x = 2.5f;  /* Initial rotation for better view angle */
 
     // create a cube object
     object_t *cube = api.geo_cube();
@@ -102,6 +102,7 @@ static void *render_3d(void *arg) {
         return NULL;
     }
 
+    cube->cull_backface = true;
     scene->stride = 3;
 
     cam->position.y = -2.0f;
@@ -111,7 +112,7 @@ static void *render_3d(void *arg) {
 
         // rotate cube and move it a bit 
         cube_xform->rotation.x = t * 0.7f;
-        cube_xform->rotation.y = 2.14f;//t * 1.1f;
+        cube_xform->rotation.y = 1.14f;//t * 1.1f;
         //cube_xform->position.x = 0.75f * sinf(t * 0.5f);
         //cube_xform->position.y = 0.50f * cosf(t * 0.4f);
 
