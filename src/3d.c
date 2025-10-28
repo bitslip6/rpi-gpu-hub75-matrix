@@ -48,24 +48,26 @@ static inline mat4 mat4_identity(void) {
 }
 
 static inline mat4 mat4_mul(mat4 a, mat4 b) {
+    /* Column-major matrix multiply: r = a * b */
     mat4 r = {0};
     for (int row = 0; row < 4; ++row) {
         for (int col = 0; col < 4; ++col) {
-            r.m[row*4 + col] =
-                a.m[row*4 + 0] * b.m[0*4 + col] +
-                a.m[row*4 + 1] * b.m[1*4 + col] +
-                a.m[row*4 + 2] * b.m[2*4 + col] +
-                a.m[row*4 + 3] * b.m[3*4 + col];
+            r.m[col*4 + row] =
+                a.m[0*4 + row] * b.m[col*4 + 0] +
+                a.m[1*4 + row] * b.m[col*4 + 1] +
+                a.m[2*4 + row] * b.m[col*4 + 2] +
+                a.m[3*4 + row] * b.m[col*4 + 3];
         }
     }
     return r;
 }
 
 static inline vec3 mat4_mul_point(const mat4 m, const vec3 p) {
-    float x = m.m[0]*p.x + m.m[1]*p.y + m.m[2]*p.z + m.m[3];
-    float y = m.m[4]*p.x + m.m[5]*p.y + m.m[6]*p.z + m.m[7];
-    float z = m.m[8]*p.x + m.m[9]*p.y + m.m[10]*p.z + m.m[11];
-    float w = m.m[12]*p.x + m.m[13]*p.y + m.m[14]*p.z + m.m[15];
+    /* Column-major multiply with column vector: clip = M * [p.x, p.y, p.z, 1]^T */
+    float x = m.m[0]*p.x + m.m[4]*p.y + m.m[8]*p.z + m.m[12];
+    float y = m.m[1]*p.x + m.m[5]*p.y + m.m[9]*p.z + m.m[13];
+    float z = m.m[2]*p.x + m.m[6]*p.y + m.m[10]*p.z + m.m[14];
+    float w = m.m[3]*p.x + m.m[7]*p.y + m.m[11]*p.z + m.m[15];
     if (w != 0.0f) { x /= w; y /= w; z /= w; }
     return (vec3){x, y, z};
 }
@@ -75,10 +77,11 @@ static inline vec3 mat4_mul_point(const mat4 m, const vec3 p) {
    ========================= */
 
 static inline mat4 mat4_translate(const vec3 t) {
+    /* Column-major translation: last column holds translation */
     mat4 r = mat4_identity();
-    r.m[3]  = t.x;
-    r.m[7]  = t.y;
-    r.m[11] = t.z;
+    r.m[12]  = t.x;
+    r.m[13]  = t.y;
+    r.m[14] = t.z;
     return r;
 }
 
@@ -114,29 +117,31 @@ static inline mat4 mat4_scale(vec3 s) {
 
 /* perspective matrix, right-handed, depth in [+znear, +zfar] */
 static inline mat4 mat4_perspective(const float fovy_radians, const float aspect, const float znear, const float zfar) {
+    /* Column-major, right-handed, OpenGL-style NDC z in [-1,1] */
     float f = 1.0f / tanf(fovy_radians * 0.5f);
-    mat4 r = {0};
-    r.m[0]  = f / aspect;
-    r.m[5]  = f;
-    r.m[10] = (zfar + znear) / (znear - zfar);
-    r.m[11] = (2.0f * zfar * znear) / (znear - zfar);
-    r.m[14] = -1.0f;
+    mat4 r = (mat4){0};
+    r.m[0]  = f / aspect;                      /* col0,row0 */
+    r.m[5]  = f;                               /* col1,row1 */
+    r.m[10] = (zfar + znear) / (znear - zfar); /* col2,row2 */
+    r.m[14] = (2.0f * zfar * znear) / (znear - zfar); /* col3,row2 */
+    r.m[11] = -1.0f;                           /* col2,row3 */
+    /* r.m[15] stays 0 */
     return r;
 }
 
 /* view matrix using eye, target, up, right-handed */
 static inline mat4 mat4_look_at(const vec3 eye, const vec3 target, const vec3 up) {
+    /* Column-major view matrix */
     vec3 f = vec3_norm(vec3_sub(target, eye)); /* forward */
     vec3 s = vec3_norm(vec3_cross(f, up));     /* right */
     vec3 u = vec3_cross(s, f);                 /* true up */
 
-    /* row-major view */
-    mat4 r = { .m = {
-        s.x, u.x, -f.x, 0.0f,
-        s.y, u.y, -f.y, 0.0f,
-        s.z, u.z, -f.z, 0.0f,
-        -vec3_dot(s, eye), -vec3_dot(u, eye), vec3_dot(f, eye), 1.0f
-    }};
+    mat4 r = mat4_identity();
+    /* basis vectors in columns 0..2 */
+    r.m[0] = s.x;   r.m[4] = s.y;   r.m[8]  = s.z;   r.m[12] = -vec3_dot(s, eye);
+    r.m[1] = u.x;   r.m[5] = u.y;   r.m[9]  = u.z;   r.m[13] = -vec3_dot(u, eye);
+    r.m[2] = -f.x;  r.m[6] = -f.y;  r.m[10] = -f.z;  r.m[14] =  vec3_dot(f, eye);
+    r.m[3] = 0.0f;  r.m[7] = 0.0f;  r.m[11] = 0.0f;  r.m[15] = 1.0f;
     return r;
 }
 
@@ -172,6 +177,7 @@ vert_list_t* vert_list_new(uint16_t num_vertices) {
     vert_list_t *vlist = calloc(1, total);
     if (!vlist) return NULL;
     vlist->length = num_vertices;
+    vlist->list = (vec3*)(vlist + 1);  /* Point to memory after the struct */
     return vlist;
 }
 
@@ -180,14 +186,16 @@ edge_list_t* edge_list_new(const uint16_t num_edges) {
     edge_list_t *elist = calloc(1, total);
     if (!elist) return NULL;
     elist->length = num_edges;
+    elist->list = (vec2*)(elist + 1);  /* Point to memory after the struct */
     return elist;
 }
 
 color_list_t* color_list_new(const uint16_t length) {
-    size_t total = sizeof(edge_list_t) + sizeof(RGB) * length;
+    size_t total = sizeof(color_list_t) + sizeof(RGB) * length;
     color_list_t *clist = calloc(1, total);
     if (!clist) return NULL;
     clist->length = length;
+    clist->list = (RGB*)(clist + 1);  /* Point to memory after the struct */
     return clist;
 }
 
@@ -196,6 +204,7 @@ face_list_t* face_list_new(const uint16_t num_faces) {
     face_list_t *flist = calloc(1, total);
     if (!flist) return NULL;
     flist->length = num_faces;
+    flist->list = (vec3*)(flist + 1);  /* Point to memory after the struct */
     return flist;
 }
 
@@ -204,6 +213,7 @@ normal_list_t* normal_list_new(const uint16_t num_normals) {
     normal_list_t *nlist = calloc(1, total);
     if (!nlist) return NULL;
     nlist->length = num_normals;
+    nlist->list = (vec3*)(nlist + 1);  /* Point to memory after the struct */
     return nlist;
 }
 
@@ -213,13 +223,24 @@ object_t* object_new(const uint16_t num_vertices, const uint16_t num_edges, cons
 
     object_t *obj = calloc(1, total);
     if (!obj) return NULL;
+    
     obj->verticies = vert_list_new(num_vertices);
     obj->rendered_vertices = calloc(num_vertices, sizeof(vec3));
-    obj->edge_colors = color_list_new(num_vertices);
+    obj->edge_colors = color_list_new(num_edges);  /* Should be num_edges, not num_vertices */
     obj->edges = edge_list_new(num_edges);
     obj->faces = face_list_new(num_faces);
     obj->normals = normal_list_new(num_faces);
-    if (!obj->edges || !obj->faces || !obj->normals) {
+    
+    if (!obj->verticies || !obj->rendered_vertices || !obj->edge_colors || 
+        !obj->edges || !obj->faces || !obj->normals) {
+        /* Cleanup on failure */
+        if (obj->verticies) free(obj->verticies);
+        if (obj->rendered_vertices) free(obj->rendered_vertices);
+        if (obj->edge_colors) free(obj->edge_colors);
+        if (obj->edges) free(obj->edges);
+        if (obj->faces) free(obj->faces);
+        if (obj->normals) free(obj->normals);
+        free(obj);
         return NULL;
     }
 
@@ -268,6 +289,12 @@ object_t* object_cube(void) {
     n[8] = n[9] = (vec3){0,-1,0};   /* bottom face */
     n[10]= n[11]= (vec3){0,+1,0};   /* top face */
 
+    /* fill edge colors - make all edges white */
+    RGB *c = obj->edge_colors->list;
+    for (int i = 0; i < 12; i++) {
+        c[i] = (RGB){255, 255, 255};  /* white edges */
+    }
+
     return obj;
 }
 
@@ -305,6 +332,12 @@ object_t* object_tetrahedron(void) {
         vec3 v1 = vec3_sub(v[(int)f[i].y], v[(int)f[i].x]);
         vec3 v2 = vec3_sub(v[(int)f[i].z], v[(int)f[i].x]);
         n[i] = vec3_norm(vec3_cross(v1, v2));
+    }
+
+    /* fill edge colors - make all edges white */
+    RGB *c = obj->edge_colors->list;
+    for (int i = 0; i < 6; i++) {
+        c[i] = (RGB){255, 255, 255};  /* white edges */
     }
 
     return obj;
@@ -402,13 +435,13 @@ object_t* object_cylinder(uint16_t segments) {
     
     // top circle edges 
     for (uint16_t i = 0; i < segments; ++i) {
-        e[edge_idx++] = (vec2){i, (i + 1) % segments};
+        e[edge_idx++] = (vec2){(float)i, (float)((i + 1) % segments)};
     }
     
     // bottom circle edges 
     for (uint16_t i = 0; i < segments; ++i) {
         uint16_t bottom_i = i + segments;
-        uint16_t bottom_next = ((i + 1) % segments) + segments;
+        uint16_t bottom_next = (uint16_t)((i + 1) % segments) + segments;
         e[edge_idx++] = (vec2){bottom_i, bottom_next};
     }
     
@@ -586,9 +619,9 @@ object_t* object_torus(uint16_t major_segments, uint16_t minor_segments) {
     if (major_segments > 16) major_segments = 16;  /* practical limits */
     if (minor_segments > 16) minor_segments = 16;
 
-    uint16_t num_vertices = major_segments * minor_segments;
-    uint16_t num_edges = major_segments * minor_segments * 2;  /* both directions */
-    uint16_t num_faces = major_segments * minor_segments * 2;  /* 2 triangles per quad */
+    uint16_t num_vertices = (uint16_t)(major_segments * minor_segments);
+    uint16_t num_edges = (uint16_t)(major_segments * minor_segments * 2);  /* both directions */
+    uint16_t num_faces = (uint16_t)(major_segments * minor_segments * 2);  /* 2 triangles per quad */
     
     object_t *obj = object_new(num_vertices, num_edges, num_faces);
     if (!obj) return NULL;
@@ -608,7 +641,7 @@ object_t* object_torus(uint16_t major_segments, uint16_t minor_segments) {
             float minor_radius_offset = minor_radius * cosf(minor_angle);
             float y = minor_radius * sinf(minor_angle);
             
-            uint16_t idx = i * minor_segments + j;
+            uint16_t idx = (uint16_t)(i * minor_segments + j);
             v[idx] = (vec3){
                 (major_radius + minor_radius_offset) * major_x,
                 y,
@@ -623,9 +656,9 @@ object_t* object_torus(uint16_t major_segments, uint16_t minor_segments) {
     
     for (uint16_t i = 0; i < major_segments; ++i) {
         for (uint16_t j = 0; j < minor_segments; ++j) {
-            uint16_t current = i * minor_segments + j;
-            uint16_t next_major = ((i + 1) % major_segments) * minor_segments + j;
-            uint16_t next_minor = i * minor_segments + ((j + 1) % minor_segments);
+            uint16_t current = (uint16_t)(i * minor_segments + j);
+            uint16_t next_major = (uint16_t)(((i + 1) % major_segments) * minor_segments + j);
+            uint16_t next_minor = (uint16_t)(i * minor_segments + ((j + 1) % minor_segments));
             
             /* edge along major direction */
             e[edge_idx++] = (vec2){current, next_major};
@@ -646,9 +679,9 @@ object_t* object_plane(uint16_t width_segments, uint16_t height_segments) {
     if (width_segments < 1) width_segments = 1;
     if (height_segments < 1) height_segments = 1;
     
-    uint16_t num_vertices = (width_segments + 1) * (height_segments + 1);
-    uint16_t num_edges = width_segments * (height_segments + 1) + height_segments * (width_segments + 1);
-    uint16_t num_faces = width_segments * height_segments * 2;  /* 2 triangles per quad */
+    uint16_t num_vertices = (uint16_t)((width_segments + 1) * (height_segments + 1));
+    uint16_t num_edges = (uint16_t)(width_segments * (height_segments + 1) + height_segments * (width_segments + 1));
+    uint16_t num_faces = (uint16_t)(width_segments * height_segments * 2);  /* 2 triangles per quad */
     
     object_t *obj = object_new(num_vertices, num_edges, num_faces);
     if (!obj) return NULL;
@@ -657,7 +690,7 @@ object_t* object_plane(uint16_t width_segments, uint16_t height_segments) {
     vec3 *v = obj->verticies->list;
     for (uint16_t z = 0; z <= height_segments; ++z) {
         for (uint16_t x = 0; x <= width_segments; ++x) {
-            uint16_t idx = z * (width_segments + 1) + x;
+            uint16_t idx = (uint16_t)(z * (width_segments + 1) + x);
             v[idx] = (vec3){
                 2.0f * (float)x / (float)width_segments - 1.0f,   /* -1 to +1 */
                 0.0f,                                             /* y = 0 (flat) */
@@ -673,7 +706,7 @@ object_t* object_plane(uint16_t width_segments, uint16_t height_segments) {
     /* horizontal edges */
     for (uint16_t z = 0; z <= height_segments; ++z) {
         for (uint16_t x = 0; x < width_segments; ++x) {
-            uint16_t current = z * (width_segments + 1) + x;
+            uint16_t current = (uint16_t)(z * (width_segments + 1) + x);
             uint16_t next = current + 1;
             e[edge_idx++] = (vec2){current, next};
         }

@@ -61,6 +61,32 @@ static inline float clampf(const float x, const float lower, const float upper) 
 	return fmaxf(lower, fminf(x, upper));
 }
 
+/**
+ * @brief  clamp an integer between >= lo and <= hi
+ */
+__attribute__((pure))
+static inline int clamp_int(const int v, const int lo, const int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+
+/**
+ * @brief Convert normalized coordinate to pixel coordinate
+ * 
+ * @param nx Normalized coordinate (0.0 to 1.0)
+ * @param width Width of the display in pixels
+ * @return int Pixel coordinate (0 to width-1)
+ * 
+ * Converts a normalized coordinate (0.0 = left edge, 1.0 = right edge)
+ * to a pixel coordinate. Includes rounding and clamping to valid range.
+ */
+__attribute__((pure))
+static inline int norm_to_px(const Normal nx, const int width) {
+    float fx = nx * (float)(width  - 1);
+    int   ix = (int)(fx + 0.5f);
+    return clamp_int(ix, 0, width - 1);
+}
+
 
 /**
  * @brief hardware saturated addition of two int32_t values

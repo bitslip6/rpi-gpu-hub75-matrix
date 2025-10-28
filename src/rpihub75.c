@@ -172,8 +172,10 @@ void start_scene(scene_info *scene) {
     SAFE_FREE(scene->quant_errors_lut);
 
     // force the buffers to be 16 byte aligned to improve auto vectorization
-    size_t image_alloc = (size_t)((scene->width + scene->height) * 4);
+    size_t image_alloc = (size_t)((scene->width * scene->height) * 4);
     scene->image = aligned_alloc(16, image_alloc);
+    memset(scene->image, 0, image_alloc);
+
     // bcm mapper ring, always allocate for RGBA
     if (!(scene->ring_buf_mapper = spsc_create(8, (size_t)(scene->width * scene->height * 4)))) {
         die("failed to create mapper ring buffer\n");

@@ -6,6 +6,7 @@
 #include "hub75gpu.h"
 #include "pixels.h"
 #include "gradient.h"
+#include "mymath.h"
 
 #include "debug.h"
 
@@ -148,37 +149,7 @@ static void api_end_frame() {
 }
 
 
-/* helpers */
-/**
- * @brief Clamp an integer value to a specified range
- * 
- * @param v Value to clamp
- * @param lo Lower bound (inclusive)
- * @param hi Upper bound (inclusive)
- * @return int Clamped value between lo and hi
- * 
- * Ensures the value v is within the range [lo, hi]. If v is less than lo,
- * returns lo. If v is greater than hi, returns hi. Otherwise returns v.
- */
-static inline int clamp_int(int v, int lo, int hi) {
-    return v < lo ? lo : (v > hi ? hi : v);
-}
 
-/**
- * @brief Convert normalized coordinate to pixel coordinate
- * 
- * @param nx Normalized coordinate (0.0 to 1.0)
- * @param width Width of the display in pixels
- * @return int Pixel coordinate (0 to width-1)
- * 
- * Converts a normalized coordinate (0.0 = left edge, 1.0 = right edge)
- * to a pixel coordinate. Includes rounding and clamping to valid range.
- */
-static inline int norm_to_px(Normal nx, int width) {
-    float fx = nx * (float)(width  - 1);
-    int   ix = (int)(fx + 0.5f);
-    return clamp_int(ix, 0, width - 1);
-}
 
 
 /**
@@ -492,8 +463,45 @@ object_t* api_new_torus(uint16_t major_segments, uint16_t minor_segments) {
     return object_torus(major_segments, minor_segments);
 }
 
+void debug_object(object_t *obj) {
+    if (!obj) {
+        printf("printf_object: null object\n");
+        return;
+    }
+
+    printf("Object printfg Info:\n");
+    printf("Vertices (%zu):\n", obj->verticies->length);
+    for (size_t i = 0; i < obj->verticies->length; i++) {
+        vec3 v = obj->verticies->list[i];
+        printf("  Vertex %zu: (%.3f, %.3f, %.3f)\n", i, v.x, v.y, v.z);
+    }
+
+    printf("Edges (%zu):\n", obj->edges->length);
+    for (size_t i = 0; i < obj->edges->length; i++) {
+        vec2 e = obj->edges->list[i];
+        printf("  Edge %zu: Vertex %u to Vertex %u\n", i, (uint16_t)e.x, (uint16_t)e.y);
+    }
+
+    printf("Faces (%zu):\n", obj->faces->length);
+    for (size_t i = 0; i < obj->faces->length; i++) {
+        vec3 f = obj->faces->list[i];
+        printf("  Face %zu: Vertex %u, Vertex %u, Vertex %u\n", i, (uint16_t)f.x, (uint16_t)f.y, (uint16_t)f.z);
+    }
+}
+
 void api_geo_render_wire(const camera_t *cam, object_t *obj, const transform_t *obj_xform) {
 
+    // Debug camera and transform
+    printf("Camera: pos(%.3f, %.3f, %.3f), target(%.3f, %.3f, %.3f), fov=%.3f, aspect=%.3f, near=%.3f, far=%.3f\n", 
+           cam->position.x, cam->position.y, cam->position.z, 
+           cam->target.x, cam->target.y, cam->target.z,
+           cam->fov_y, cam->aspect, cam->z_near, cam->z_far);
+    printf("Transform: pos(%.3f, %.3f, %.3f), rot(%.3f, %.3f, %.3f), scale(%.3f, %.3f, %.3f)\n",
+           obj_xform->position.x, obj_xform->position.y, obj_xform->position.z,
+           obj_xform->rotation.x, obj_xform->rotation.y, obj_xform->rotation.z,
+           obj_xform->scale.x, obj_xform->scale.y, obj_xform->scale.z);
+
+    //debug_object(obj);
     mat4 mvp = camera_project(cam, obj_xform);
 
     //vec3 ndc[8];
@@ -509,12 +517,30 @@ void api_geo_render_wire(const camera_t *cam, object_t *obj, const transform_t *
         vec3 v1 = obj->rendered_vertices[(size_t)edge.x];
         vec3 v2 = obj->rendered_vertices[(size_t)edge.y];
 
-        const uint16_t x1 = (uint16_t)(w * (v1.x + 1.0f));
-        const uint16_t y1 = (uint16_t)(h * (v1.y + 1.0f));
-        const uint16_t x2 = (uint16_t)(w * (v2.x + 1.0f));
-        const uint16_t y2 = (uint16_t)(w * (v2.x + 1.0f));
+        // Skip edges where vertices are outside the view frustum (z clipping) - temporarily disabled for debugging
+        /*if (v1.z < -1.0f || v1.z > 1.0f || v2.z < -1.0f || v2.z > 1.0f) {
+            printf("Skipping edge %zu due to z clipping: V1.z=%.3f, V2.z=%.3f\n", i, v1.z, v2.z);
+            continue;
+        }*/
+
+        // print out debugging info for each point
+        printf("Edge %zu: V1 NDC (%.3f, %.3f, %.3f), V2 NDC (%.3f, %.3f, %.3f)\n", i, v1.x, v1.y, v1.z, v2.x, v2.y, v2.z);
         
-        hub_line(tls_scene, x1, y1, x2, y2, obj->edge_colors->list[i]);
+        // Convert NDC to screen coordinates with clamping
+        int x1 = (int)(w * (v1.x + 1.0f));
+        int y1 = (int)(h * (v1.y + 1.0f));
+        int x2 = (int)(w * (v2.x + 1.0f));
+        int y2 = (int)(h * (v2.y + 1.0f));
+        
+        // Clamp to screen bounds
+        x1 = (x1 < 0) ? 0 : (x1 >= tls_scene->width) ? tls_scene->width - 1 : x1;
+        y1 = (y1 < 0) ? 0 : (y1 >= tls_scene->height) ? tls_scene->height - 1 : y1;
+        x2 = (x2 < 0) ? 0 : (x2 >= tls_scene->width) ? tls_scene->width - 1 : x2;
+        y2 = (y2 < 0) ? 0 : (y2 >= tls_scene->height) ? tls_scene->height - 1 : y2;
+        
+        printf("line: (%d, %d) to (%d, %d)\n", x1, y1, x2, y2);
+        
+        hub_line(tls_scene, (uint16_t)x1, (uint16_t)y1, (uint16_t)x2, (uint16_t)y2, obj->edge_colors->list[i]);
     }
 }
 

@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <math.h>
 #include "hub75gpu.h"
+#include "mymath.h"
 
 /**
  * @brief Apply easing function to a normalized value
@@ -92,22 +93,22 @@ static float calculate_gradient_factor(int x, int y, int minx, int miny, int max
 }
 
 /**
- * @brief Fill a horizontal span with simple gradient colors
+ * @brief Fill a horizontal span with a simple gradient 
  * 
- * @param scene Scene containing the image buffer
- * @param y Y coordinate (row) to fill
+ * @param scene Scene to draw into
+ * @param y Row to fill
  * @param x0 Starting X coordinate (inclusive)
  * @param x1 Ending X coordinate (inclusive)
- * @param gradient Simple gradient definition
+ * @param gradient Simple gradient configuration
  * @param minx Polygon bounding box minimum X
- * @param miny Polygon bounding box minimum Y  
+ * @param miny Polygon bounding box minimum Y
  * @param maxx Polygon bounding box maximum X
  * @param maxy Polygon bounding box maximum Y
  * 
  * Fills pixels from x0 to x1 (inclusive) on row y with gradient colors.
  * Uses the simple gradient system with two colors, direction, and easing.
  */
-static inline void gradient_fill(scene_info *scene, int y, int x0, int x1, 
+void gradient_fill(scene_info *scene, int y, int x0, int x1, 
                                              const SimpleGradient *gradient, 
                                              int minx, int miny, int maxx, int maxy) {
     if ((unsigned)y >= (unsigned)scene->height) return;
