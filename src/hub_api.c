@@ -8,9 +8,9 @@
 extern scene_info *g_scene;
 
 /* Forward declarations */
-extern scene_info *new_scene();
-extern scene_info *parse_scene(int argc, char **argv);
-extern void start_scene(scene_info *scene);
+extern scene_info *scene_new();
+extern scene_info *scene_parse(int argc, char **argv);
+extern void scene_start(scene_info *scene);
 extern void hub75_request_shutdown(scene_info *scene);
 extern void hub75_wait_shutdown(scene_info *scene);
 //extern void map_byte_image_to_bcm(scene_info *scene, uint8_t *image);
@@ -29,7 +29,7 @@ extern void hub_circle(scene_info *scene, uint16_t cx, uint16_t cy, uint16_t rad
 static hub75_api g_api;
 
 /* ---- Wrapper implementations that capture g_api.scene ---- */
-static void api_start(void)                 { if (g_api.scene) start_scene(g_api.scene); }
+static void api_start(void)                 { if (g_api.scene) scene_start(g_api.scene); }
 static void api_request_shutdown(void)      { if (g_api.scene) hub75_request_shutdown(g_api.scene); }
 static void api_wait_shutdown(void)         { if (g_api.scene) hub75_wait_shutdown(g_api.scene); }
 static void api_map_image(uint8_t *image)   { if (g_api.scene) map_byte_image_to_bcm(g_api.scene, image); }
@@ -46,8 +46,8 @@ static int api_fps_get() { return (int)calculate_fps(g_scene->fps, g_scene->show
 const hub75_api *hub75_get_api(scene_info *scene) {
     if (g_api.version == 0) {
         g_api.version = 2; /* new layout with wrappers */
-        g_api.new_scene        = new_scene;
-        g_api.parse_scene      = parse_scene;
+        g_api.new_scene        = scene_new;
+        g_api.parse_scene      = scene_parse;
         g_api.start            = api_start;
         g_api.request_shutdown = api_request_shutdown;
         g_api.wait_shutdown    = api_wait_shutdown;

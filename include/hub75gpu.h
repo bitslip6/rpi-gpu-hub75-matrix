@@ -188,9 +188,12 @@ typedef struct light_t {
 } light_t;
 
 typedef struct scene_lighting_t {
-    RGBF     ambient;      /* ambient light color (0..1 per channel) */
-    uint16_t num_lights;   /* number of active lights */
-    light_t *lights;       /* dynamic array of lights (NULL when num_lights == 0) */
+    RGBF     ambient;      // ambient light color (0..1 per channel)
+    uint16_t num_lights;   // number of active lights
+    light_t *lights;       // dynamic array of lights (NULL when num_lights == 0)
+
+    void (*set_directional)(uint16_t index, light_vec3 direction,
+                                RGBF color, float intensity, bool casts_shadows);
 } scene_lighting_t;
 
 
@@ -316,6 +319,12 @@ typedef struct scene_info {
     bool show_fps;
 
     /**
+     * When true, enable extra verbose debug prints in CPU rendering paths
+     * (camera, transform, per-edge/triangle diagnostics). Default: false.
+     */
+    bool enhanced_debug;
+
+    /**
      * @brief current frame index, increments every frame rendered
      */
     uint32_t frame_index;
@@ -404,19 +413,19 @@ void hub_line(scene_info *scene, const uint16_t x0, const uint16_t y0, const uin
  * @param argv command line arguments
  * @return scene_info* the created scene information
  */
-scene_info *parse_scene(int argc, char **argv);
+scene_info *scene_parse(int argc, char **argv);
 
 /**
  * @brief create a default scene
  * 
  * @return scene_info* the created scene information
  */
-scene_info *new_scene();
+scene_info *scene_new();
 
 /**
  * check the scene and start the rendering threads if everying is ok
  */
-void start_scene(scene_info *scene);
+void scene_start(scene_info *scene);
 
 /**
  * @brief install signal handlers for graceful shutdown on SIGINT/SIGTERM
@@ -518,7 +527,6 @@ typedef struct {
 typedef enum {
     DRAW_WIRE = 0,
     DRAW_FILLED = 1,
-    DRAW_BOTH = 2
 } object_draw_mode_t;
 
 typedef struct {
@@ -535,7 +543,7 @@ typedef struct {
 
 
 
-object_t* object_cube(void);
+object_t* object_cube(const object_draw_mode_t mode, const bool cull_backface);
 object_t* object_tetrahedron(void);
 object_t* object_octahedron(void);
 object_t* object_pyramid(void);
@@ -558,12 +566,29 @@ vec3 mat3_mul_vec3(const float M[9], vec3 v);
 /* Scene of object instances */
 typedef struct {
     object_t *object;             /* mesh + material/state */
-    const transform_t *xform;     /* object transform (external owner) */
+    transform_t *xform;           /* object transform (external owner) */
 } object_instance_t;
 
-typedef struct {
-    uint16_t count;
-    const object_instance_t *instances; /* array of count instances */
+typedef struct object_scene_t {
+    uint16_t count;               /* number of active instances */
+    uint16_t capacity;            /* allocated capacity for instances */
+    object_instance_t *instances; /* array of count instances (owned by scene) */
+
+    /* Embedded lighting owned by the scene (no separate lighting object needed) */
+    scene_lighting_t lighting;     /* ambient + dynamic array of lights */
+
+    /* OO-style helpers (method-like function pointers for ease of use / FFI) */
+    void (*set_ambient)(struct object_scene_t *os, RGBF ambient);
+    uint16_t (*add_directional)(struct object_scene_t *os,
+                                light_vec3 direction,
+                                RGBF color,
+                                float intensity,
+                                bool casts_shadows);
+
+    /* Object management helpers */
+    uint16_t (*add_object)(struct object_scene_t *os, object_t *obj, transform_t *xform);
+    object_t *(*get_object)(struct object_scene_t *os, uint16_t id);
+    transform_t *(*get_transform)(struct object_scene_t *os, uint16_t id);
 } object_scene_t;
 
 
@@ -579,19 +604,22 @@ typedef struct {
     void (*fill_gradient)(int y, int x0, int x1, const SimpleGradient *gradient, 
                             int minx, int miny, int maxx, int maxy);
     void (*shutdown)();
-    void (*begin_frame)();
-    void (*end_frame)();
+    void (*frame_begin)();
+    void (*frame_end)();
 
-    mat4 (*geo_render)(camera_t *cam, transform_t *obj_xform);
     mat4 (*geo_project)(camera_t *cam, transform_t *obj_xform);
-    void (*geo_render_wire)(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene_lighting_t *lighting);
-    void (*geo_render_filled)(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene_lighting_t *lighting);
+    void (*render_wire)(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene_lighting_t *lighting);
+    void (*render_filled)(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene_lighting_t *lighting);
     void (*render_scene)(const camera_t *cam, const object_scene_t *scene, const scene_lighting_t *lighting);
 
+    // camera and scene lighting functions
     camera_t* (*geo_camera)();
     transform_t* (*geo_transform)();
+    
+
+    // geometry creation functions
     object_t* (*geo_object)(const uint16_t num_vertices, const uint16_t num_edges, const uint16_t num_faces);
-    object_t* (*geo_cube)();
+    object_t* (*geo_cube)(const object_draw_mode_t mode, const bool cull_backface);
     object_t* (*geo_tetrahedron)();
     object_t* (*geo_octahedron)();
     object_t* (*geo_pyramid)();
@@ -600,9 +628,86 @@ typedef struct {
     object_t* (*geo_torus)(uint16_t major_segments, uint16_t minor_segments);
     object_t* (*geo_plane)(uint16_t width_segments, uint16_t height_segments);
 
+    /* Convenience scene wrappers (avoid passing object_scene repeatedly) */
+    object_scene_t* (*scene_new)(uint16_t count);
+    void (*scene_set_current)(object_scene_t *os);
+    void (*scene_clear_current)(void);
+    void (*scene_set_ambient)(RGBF ambient);
+    uint16_t (*scene_add_directional)(light_vec3 direction, RGBF color, float intensity, bool casts_shadows);
+    uint16_t (*scene_add_object)(object_t *obj, transform_t *xform);
+    object_t* (*scene_get_object)(uint16_t id);
+    transform_t* (*scene_get_transform)(uint16_t id);
+
 } hub75gpu_t;
 
 /* set the current thread's scene and get an API whose functions do not take a scene */
 hub75gpu_t hub75gpu(scene_info *s);
+
+/* -------- Python/FFI-friendly helper API -------- */
+camera_t *api_new_camera(void);
+transform_t *api_new_transform(void);
+
+scene_lighting_t *api_lighting_new(uint16_t num_lights, RGBF ambient);
+void api_lighting_free(scene_lighting_t *l);
+void api_lighting_set_ambient(scene_lighting_t *l, RGBF color);
+void api_lighting_set_directional(scene_lighting_t *l, uint16_t index,
+                                  light_vec3 direction,
+                                  RGBF color,
+                                  float intensity, bool casts_shadows);
+
+object_scene_t *api_object_scene_new(uint16_t count);
+void api_object_scene_set(object_scene_t *os, uint16_t index, object_t *obj, transform_t *xform);
+void api_object_scene_free(object_scene_t *os);
+void api_object_set_draw_mode(object_t *obj, object_draw_mode_t mode);
+void api_render_geo(const camera_t *cam, const object_scene_t *os, const scene_lighting_t *lighting);
+
+/* Convenience scene wrappers (thread-local current object_scene) */
+void api_scene_set_current(object_scene_t *os);
+void api_scene_clear_current(void);
+void api_scene_set_ambient(RGBF ambient);
+uint16_t api_scene_add_directional(light_vec3 direction, RGBF color, float intensity, bool casts_shadows);
+uint16_t api_scene_add_object(object_t *obj, transform_t *xform);
+object_t* api_scene_get_object(uint16_t id);
+transform_t* api_scene_get_transform(uint16_t id);
+
+/* Common web colors (RGBF normalized 0..1) */
+#define COLOR_BLACK        (RGBF){ 0.0f, 0.0f, 0.0f }
+#define COLOR_WHITE        (RGBF){ 1.0f, 1.0f, 1.0f }
+#define COLOR_RED          (RGBF){ 1.0f, 0.0f, 0.0f }
+#define COLOR_GREEN        (RGBF){ 0.0f, 0.501961f, 0.0f }       /* CSS green (0,128,0) */
+#define COLOR_LIME         (RGBF){ 0.0f, 1.0f, 0.0f }           /* CSS lime (0,255,0) */
+#define COLOR_BLUE         (RGBF){ 0.0f, 0.0f, 1.0f }
+#define COLOR_CYAN         (RGBF){ 0.0f, 1.0f, 1.0f }
+#define COLOR_MAGENTA      (RGBF){ 1.0f, 0.0f, 1.0f }
+#define COLOR_YELLOW       (RGBF){ 1.0f, 1.0f, 0.0f }
+#define COLOR_ORANGE       (RGBF){ 1.0f, 0.647059f, 0.0f }      /* (255,165,0) */
+#define COLOR_PURPLE       (RGBF){ 0.5f, 0.0f, 0.5f }           /* (128,0,128) */
+#define COLOR_PINK         (RGBF){ 1.0f, 0.752941f, 0.796078f } /* (255,192,203) */
+#define COLOR_TEAL         (RGBF){ 0.0f, 0.501961f, 0.501961f } /* (0,128,128) */
+#define COLOR_NAVY         (RGBF){ 0.0f, 0.0f, 0.501961f }      /* (0,0,128) */
+#define COLOR_MAROON       (RGBF){ 0.501961f, 0.0f, 0.0f }      /* (128,0,0) */
+#define COLOR_OLIVE        (RGBF){ 0.501961f, 0.501961f, 0.0f } /* (128,128,0) */
+#define COLOR_SILVER       (RGBF){ 0.752941f, 0.752941f, 0.752941f } /* (192,192,192) */
+#define COLOR_GREY         (RGBF){ 0.501961f, 0.501961f, 0.501961f } /* (128,128,128) */
+#define COLOR_LIGHT_GREY   (RGBF){ 0.827451f, 0.827451f, 0.827451f } /* (211,211,211) */
+#define COLOR_DARK_GREY    (RGBF){ 0.25f, 0.25f, 0.25f }
+#define COLOR_BROWN        (RGBF){ 0.647059f, 0.164706f, 0.164706f } /* (165,42,42) */
+#define COLOR_GOLD         (RGBF){ 1.0f, 0.843137f, 0.0f }           /* (255,215,0) */
+#define COLOR_INDIGO       (RGBF){ 0.294118f, 0.0f, 0.509804f }      /* (75,0,130) */
+#define COLOR_VIOLET       (RGBF){ 0.933333f, 0.509804f, 0.933333f } /* (238,130,238) */
+#define COLOR_CORAL        (RGBF){ 1.0f, 0.498039f, 0.313725f }      /* (255,127,80) */
+#define COLOR_TURQUOISE    (RGBF){ 0.250980f, 0.878431f, 0.815686f } /* (64,224,208) */
+#define COLOR_SALMON       (RGBF){ 0.980392f, 0.501961f, 0.447059f } /* (250,128,114) */
+#define COLOR_SKY_BLUE     (RGBF){ 0.529412f, 0.807843f, 0.921569f } /* (135,206,235) */
+#define COLOR_DEEPSKY_BLUE (RGBF){ 0.0f, 0.749020f, 1.0f }           /* (0,191,255) */
+#define COLOR_ORANGERED    (RGBF){ 1.0f, 0.270588f, 0.0f }           /* (255,69,0) */
+#define COLOR_HOTPINK      (RGBF){ 1.0f, 0.411765f, 0.705882f }      /* (255,105,180) */
+
+/* Common aliases */
+#define COLOR_AQUA         COLOR_CYAN
+#define COLOR_FUCHSIA      COLOR_MAGENTA
+#define COLOR_GRAY         COLOR_GREY
+#define COLOR_LIGHT_GRAY   COLOR_LIGHT_GREY
+#define COLOR_DARK_GRAY    COLOR_DARK_GREY
 
 #endif

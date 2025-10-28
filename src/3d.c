@@ -67,8 +67,13 @@ static inline vec3 mat4_mul_point(const mat4 m, const vec3 p) {
     float x = m.m[0]*p.x + m.m[4]*p.y + m.m[8]*p.z + m.m[12];
     float y = m.m[1]*p.x + m.m[5]*p.y + m.m[9]*p.z + m.m[13];
     float z = m.m[2]*p.x + m.m[6]*p.y + m.m[10]*p.z + m.m[14];
-    float w = m.m[3]*p.x + m.m[7]*p.y + m.m[11]*p.z + m.m[15];
-    if (w != 0.0f) { x /= w; y /= w; z /= w; }
+
+    const float w = m.m[3]*p.x + m.m[7]*p.y + m.m[11]*p.z + m.m[15];
+    /* Branchless safe divide by w: clamp |w| to epsilon and preserve sign */
+    const float eps = 1e-8f;
+    const float denom = copysignf(fmaxf(fabsf(w), eps), w);
+    const float inv_w = 1.0f / denom;
+    x *= inv_w; y *= inv_w; z *= inv_w;
     return (vec3){x, y, z};
 }
 
@@ -251,7 +256,7 @@ object_t* object_new(const uint16_t num_vertices, const uint16_t num_edges, cons
 /** 
  * @brief Create a unit cube object centered at origin
  */
-object_t* object_cube(void) {
+object_t* object_cube(const object_draw_mode_t mode, const bool cull_backface) {
     object_t *obj = object_new(8, 12, 12);  /* 8 vertices, 12 edges, 12 triangles (2 per face) */
     if (!obj) return NULL;
 
@@ -295,6 +300,8 @@ object_t* object_cube(void) {
         c[i] = (RGB){255, 255, 255};  /* white edges */
     }
 
+    obj->draw_mode = mode;
+    obj->cull_backface = cull_backface;
     return obj;
 }
 
@@ -729,8 +736,8 @@ object_t* object_plane(uint16_t width_segments, uint16_t height_segments) {
    World → clip pipeline
    ========================= */
 
-void transform_mesh_to_ndc(const vec3 *in_vertices, size_t n,
-                                  mat4 mvp, vec3 *out_ndc) {
+void transform_mesh_to_ndc(const vec3 *in_vertices, const size_t n,
+                                  const mat4 mvp, vec3 *out_ndc) {
     for (size_t i = 0; i < n; ++i) {
         out_ndc[i] = mat4_mul_point(mvp, in_vertices[i]); /* perspective divide inside */
     }

@@ -278,7 +278,7 @@ int parse_panel_offsets(const char *arg,
 /**
  * @brief creae a new scene with default values
  */
-scene_info *new_scene() {
+scene_info *scene_new() {
     // setup all scene configuration info
     scene_info *scene = (scene_info*)malloc(sizeof(scene_info));
     memset(scene, 0, sizeof(scene_info));
@@ -314,6 +314,7 @@ scene_info *new_scene() {
     // default to 60 fps
     scene->fps = 60;
     scene->show_fps = FALSE;
+    scene->enhanced_debug = false;
 
     return scene;
 }
@@ -363,10 +364,10 @@ char *get_nth_token(const char *str, char delimiter, int position) {
  * @param argv 
  * @return scene_info* 
  */
-scene_info *parse_scene(int argc, char **argv) {
+scene_info *scene_parse(int argc, char **argv) {
 
     // initialize the new scene
-    scene_info *scene = new_scene();
+    scene_info *scene = scene_new();
 
     // print usage if no arguments
     if (argc < 2) { 

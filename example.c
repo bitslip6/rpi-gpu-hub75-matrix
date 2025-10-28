@@ -79,71 +79,49 @@ static void *render_3d(void *arg) {
 
     scene_info *scene = (scene_info*)arg;
     hub75gpu_t api = hub75gpu(scene);
+    scene->stride = 3;
 
     // camera setup 
     camera_t *cam = api.geo_camera();
-    cam->aspect = (float)scene->width / (float)scene->height;  /* Use actual image aspect ratio */
-    cam->fov_y = (float)M_PI / 4.0f;  /* 45 degrees - balanced FOV */
-    cam->position.z = 5.0f;   /* Move camera back to see the cube */
-    cam->target = (vec3){0, 0, 0};  /* Look at origin */
-
-    // object transform 
-    transform_t *cube_xform = api.geo_transform();
-    cube_xform->scale.x = 1.5f;  /* Scale down the cube even more to fit in view frustum */
-    cube_xform->scale.y = 1.25;
-    cube_xform->scale.z = 1.25f;
-
-    //cube_xform->rotation.x = 2.5f;  /* Initial rotation for better view angle */
 
     // create a cube object
-    object_t *cube = api.geo_cube();
-    if (!cube) {
-        printf("Failed to create cube!\n");
-        return NULL;
-    }
+    object_t    *cube       = api.geo_cube(DRAW_FILLED, true);
+    transform_t *cube_xform = api.geo_transform();
+    cube_xform->scale       = (vec3){1.5f, 1.5f, 1.5f};  // Scale up the cube 
 
-    cube->cull_backface = true;
-    scene->stride = 3;
-
+    // set cube edge color to red
     for (int i=0; i<cube->edge_colors->length; ++i) {
         cube->edge_colors->list[i] = (RGB){ 250, 64, 64 };
     }
 
-    cam->position.y = -2.0f;
-    /* animate few steps, replace with your app loop */
-    /* simple lighting setup: white directional with gentle ambient */
-    light_t dir;
-    dir.type = LIGHT_DIRECTIONAL;
-    dir.color = (RGBF){1.0f, 1.0f, 1.0f};
-    dir.intensity = 1.0f;
-    dir.casts_shadows = false;
-    dir.direction = (light_vec3){ -0.5f, 1.0f, 0.2f };
-    dir.position.y = -3.0f;
-    dir.position.x = 0.0f;
-    dir.position.z = 10.0f;
-    scene_lighting_t lighting = {0};
-    lighting.ambient = (RGBF){0.25f, 0.25f, 0.25f};
-    lighting.num_lights = 1;
-    lighting.lights = &dir; /* valid for duration of the call below */
+    // build an object scene and use convenience wrappers (no need to pass os repeatedly)
+    object_scene_t *os = api.scene_new(1);
+    api.scene_set_current(os);
+    api.scene_set_ambient(COLOR_DARK_GREY);
+    uint16_t light1_id = api.scene_add_directional((light_vec3){-0.5f, 1.0f, 0.2f}, COLOR_WHITE, 1.0f, false);
+    uint16_t cube_id = api.scene_add_object(cube, cube_xform);
 
     for (int frame = 0; frame < 1; ++frame) {
         float t = (float)frame * 0.016f;
 
         // rotate cube and move it a bit 
         cube_xform->rotation.x = t * 0.7f;
-        cube_xform->rotation.y = 1.14f;//t * 1.1f;
-        //cube_xform->position.x = 0.75f * sinf(t * 0.5f);
-        //cube_xform->position.y = 0.50f * cosf(t * 0.4f);
+        cube_xform->rotation.y = 1.14f;
 
         // orbit camera around origin while looking at cube - closer distance with wider FOV
-        cam->position.x = 5.0f * cosf(t * 0.3f);  /* Reduced distance with wider FOV for better fit */
-        cam->position.z = 5.0f * sinf(t * 0.3f);  /* Reduced distance with wider FOV for better fit */
+        cam->position.x = 5.0f * cosf(t * 0.3f);  // Reduced distance with wider FOV for better fit 
+        cam->position.z = 5.0f * sinf(t * 0.3f);  // Reduced distance with wider FOV for better fit 
         cam->target     = cube_xform->position;
 
-        api.geo_render_filled(cam, cube, cube_xform, &lighting);
+    // Render using scene-owned lighting (pass NULL)
+    api.render_scene(cam, os, NULL);
     }
 
     stbi_write_png("out2.png", scene->width, scene->height, 3, scene->image, scene->width * scene->stride);
+    
+    /* cleanup */
+    api.scene_clear_current();
+    api_object_scene_free(os);
 
     return NULL;
 }
@@ -180,7 +158,7 @@ static void *render_cpu(void *arg) {
     uint32_t frame = 0;
     while (scene->do_render) {
         frame++;
-        api.begin_frame(); 
+        api.frame_begin(); 
         api.clear();
 
         for (int i = 0; i < 3; ++i) {
@@ -203,7 +181,7 @@ static void *render_cpu(void *arg) {
         */
 
         api.poly(&tri, color1);
-        api.end_frame();
+        api.frame_end();
 
         // FPS calculation
         calculate_fps(scene->fps, scene->show_fps);
@@ -223,12 +201,12 @@ int main(int argc, char **argv) {
     srand((unsigned)time(NULL));
 
     // Parse command line into a new scene. Use -h to see available options.
-    scene_info *scene = parse_scene(argc, argv);
+    scene_info *scene = scene_parse(argc, argv);
 
     scene->stride = 4;
 
     // Validate configuration, allocate internal buffers, etc.
-    start_scene(scene);
+    scene_start(scene);
 
     render_3d(scene);
     exit(1);

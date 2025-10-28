@@ -126,7 +126,7 @@ extern scene_info *g_scene;
  * will die() if invalid configuration is found
  * @param scene 
  */
-void start_scene(scene_info *scene) {
+void scene_start(scene_info *scene) {
     debug("ports: %d, chains: %d, width: %d, height: %d, stride: %d, bit_depth: %d\n", 
         scene->num_ports, scene->num_chains, scene->width, scene->height, scene->stride, scene->bit_depth);
 

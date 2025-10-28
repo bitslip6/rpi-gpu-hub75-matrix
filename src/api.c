@@ -18,6 +18,7 @@
 
 /* Thread-local storage for the current scene being processed by this thread */
 static _Thread_local scene_info *tls_scene = NULL;
+static _Thread_local object_scene_t *tls_current_os = NULL;
 
 /* Minimal 3D helpers for normal-based culling */
 static inline vec3 v3_add(vec3 a, vec3 b){ return (vec3){a.x+b.x,a.y+b.y,a.z+b.z}; }
@@ -164,12 +165,12 @@ static void api_line_aa(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB 
  * @brief Begin a new frame for drawing operations
  * 
  * Acquires a new frame buffer from the ring buffer for drawing operations.
- * This must be called before any drawing operations and paired with api_end_frame().
+ * This must be called before any drawing operations and paired with api_frame_end().
  * Waits up to 10ms for a buffer to become available.
  * 
  * Sets tls_scene->frame_ready to false and updates tls_scene->image pointer.
  */
-static void api_begin_frame() {
+static void api_frame_begin() {
     if (tls_scene == NULL) {
         debug("no scene set\n");
         return;
@@ -197,11 +198,11 @@ static void api_begin_frame() {
  * @brief Complete the current frame and submit it for display
  * 
  * Finalizes the current frame and commits it to the ring buffer for display.
- * This must be called after api_begin_frame() and all drawing operations are complete.
+ * This must be called after api_frame_begin() and all drawing operations are complete.
  * 
  * Sets tls_scene->frame_ready to true and commits the buffer to the mapper.
  */
-static void api_end_frame() {
+static void api_frame_end() {
     if (tls_scene == NULL) {
         debug("no scene set\n");
         return;
@@ -474,13 +475,28 @@ void api_pixel_alpha (int x, int y, RGBA pixel) {
     hub_pixel_alpha(tls_scene, x, y, pixel);
 }   
 
+/**
+ * @brief Create a new camera with default parameters; use current tls_scene if available
+ */
 camera_t *api_new_camera(void) {
     camera_t *cam = calloc(1, sizeof(camera_t));
+    // Use actual image aspect ratio if a scene is set
+    if (tls_scene) {
+        cam->aspect = (float)tls_scene->width / (float)tls_scene->height;
+    } else {
+        cam->aspect = 1.0f;
+    }
+    // 45 degree FOV
+    cam->fov_y = (float)M_PI / 4.0f;
+    // move camera back and up to see the default unit sized scene 
+    cam->position = (vec3){0, -2.0f, 5.0f};
+    // look at origin
+    cam->target = (vec3){0, 0, 0};
 
-    cam->position.z = 5.0f;
+    // default the camera up vector to +Y
     cam->up.y = 1.0f;
-    cam->fov_y = (float)M_PI / 3.0f;
-    cam->aspect = 16.0f / 9.0f;
+
+    // clipping regions
     cam->z_near = 0.1f;
     cam->z_far = 100.0f;
 
@@ -513,8 +529,8 @@ object_t *api_new_object(uint16_t num_vertices, uint16_t num_edges, uint16_t num
     return object_new((uint16_t)num_vertices, (uint16_t)num_edges, (uint16_t)num_faces);
 }
 
-object_t *api_new_cube(void) {
-    return object_cube();
+object_t *api_new_cube(const object_draw_mode_t draw_mode, const bool cull_backface) {
+    return object_cube(draw_mode, cull_backface);
 }
 
 object_t *api_new_tetrahedron(void) {
@@ -553,19 +569,19 @@ void debug_object(object_t *obj) {
     }
 
     printf("Object printfg Info:\n");
-    printf("Vertices (%zu):\n", obj->verticies->length);
+    printf("Vertices (%u):\n", (unsigned)obj->verticies->length);
     for (size_t i = 0; i < obj->verticies->length; i++) {
         vec3 v = obj->verticies->list[i];
-        printf("  Vertex %zu: (%.3f, %.3f, %.3f)\n", i, v.x, v.y, v.z);
+        printf("  Vertex %zu: (%.3f, %.3f, %.3f)\n", i, (double)v.x, (double)v.y, (double)v.z);
     }
 
-    printf("Edges (%zu):\n", obj->edges->length);
+    printf("Edges (%u):\n", (unsigned)obj->edges->length);
     for (size_t i = 0; i < obj->edges->length; i++) {
         vec2 e = obj->edges->list[i];
         printf("  Edge %zu: Vertex %u to Vertex %u\n", i, (uint16_t)e.x, (uint16_t)e.y);
     }
 
-    printf("Faces (%zu):\n", obj->faces->length);
+    printf("Faces (%u):\n", (unsigned)obj->faces->length);
     for (size_t i = 0; i < obj->faces->length; i++) {
         vec3 f = obj->faces->list[i];
         printf("  Face %zu: Vertex %u, Vertex %u, Vertex %u\n", i, (uint16_t)f.x, (uint16_t)f.y, (uint16_t)f.z);
@@ -575,21 +591,22 @@ void debug_object(object_t *obj) {
 void api_geo_render_wire(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene_lighting_t *lighting) {
     (void)lighting; /* allow NULL; lighting not used in wireframe */
 
-    // Debug camera and transform
-    printf("Camera: pos(%.3f, %.3f, %.3f), target(%.3f, %.3f, %.3f), fov=%.3f, aspect=%.3f, near=%.3f, far=%.3f\n", 
-           cam->position.x, cam->position.y, cam->position.z, 
-           cam->target.x, cam->target.y, cam->target.z,
-           cam->fov_y, cam->aspect, cam->z_near, cam->z_far);
-    printf("Transform: pos(%.3f, %.3f, %.3f), rot(%.3f, %.3f, %.3f), scale(%.3f, %.3f, %.3f)\n",
-           obj_xform->position.x, obj_xform->position.y, obj_xform->position.z,
-           obj_xform->rotation.x, obj_xform->rotation.y, obj_xform->rotation.z,
-           obj_xform->scale.x, obj_xform->scale.y, obj_xform->scale.z);
+    // Debug camera and transform (gated behind enhanced_debug)
+    if (tls_scene && tls_scene->enhanced_debug) {
+     printf("Camera: pos(%.3f, %.3f, %.3f), target(%.3f, %.3f, %.3f), fov=%.3f, aspect=%.3f, near=%.3f, far=%.3f\n", 
+         (double)cam->position.x, (double)cam->position.y, (double)cam->position.z, 
+         (double)cam->target.x, (double)cam->target.y, (double)cam->target.z,
+         (double)cam->fov_y, (double)cam->aspect, (double)cam->z_near, (double)cam->z_far);
+     printf("Transform: pos(%.3f, %.3f, %.3f), rot(%.3f, %.3f, %.3f), scale(%.3f, %.3f, %.3f)\n",
+         (double)obj_xform->position.x, (double)obj_xform->position.y, (double)obj_xform->position.z,
+         (double)obj_xform->rotation.x, (double)obj_xform->rotation.y, (double)obj_xform->rotation.z,
+         (double)obj_xform->scale.x, (double)obj_xform->scale.y, (double)obj_xform->scale.z);
 
-    //debug_object(obj);
+        debug_object(obj);
+    }
+
     mat4 mvp = camera_project(cam, obj_xform);
 
-    //vec3 ndc[8];
-    //api.geo_render(obj->vertex_list->vertices, obj->vertex_list->num_vertices, mvp, ndc);
     transform_mesh_to_ndc(obj->verticies->list, obj->verticies->length, mvp, obj->rendered_vertices);
 
 
@@ -645,12 +662,17 @@ void api_geo_render_wire(const camera_t *cam, object_t *obj, const transform_t *
 
         // Skip edges where vertices are outside the view frustum (simple z clipping)
         if (v1.z < -1.0f || v1.z > 1.0f || v2.z < -1.0f || v2.z > 1.0f) {
-            printf("Skipping edge %zu due to z clipping: V1.z=%.3f, V2.z=%.3f\n", i, v1.z, v2.z);
+            if (tls_scene && tls_scene->enhanced_debug) {
+                printf("Skipping edge %zu due to z clipping: V1.z=%.3f, V2.z=%.3f\n", i, (double)v1.z, (double)v2.z);
+            }
             continue;
         }
 
         // print out debugging info for each point
-        printf("Edge %zu: V1 NDC (%.3f, %.3f, %.3f), V2 NDC (%.3f, %.3f, %.3f)\n", i, v1.x, v1.y, v1.z, v2.x, v2.y, v2.z);
+        if (tls_scene && tls_scene->enhanced_debug) {
+            printf("Edge %zu: V1 NDC (%.3f, %.3f, %.3f), V2 NDC (%.3f, %.3f, %.3f)\n", i,
+                   (double)v1.x, (double)v1.y, (double)v1.z, (double)v2.x, (double)v2.y, (double)v2.z);
+        }
         
         // Convert NDC to screen coordinates with clamping
         int x1 = (int)(w * (v1.x + 1.0f));
@@ -664,9 +686,9 @@ void api_geo_render_wire(const camera_t *cam, object_t *obj, const transform_t *
         x2 = (x2 < 0) ? 0 : (x2 >= tls_scene->width) ? tls_scene->width - 1 : x2;
         y2 = (y2 < 0) ? 0 : (y2 >= tls_scene->height) ? tls_scene->height - 1 : y2;
         
-
-
-        printf("line: (%d, %d) to (%d, %d)\n", x1, y1, x2, y2);
+        if (tls_scene && tls_scene->enhanced_debug) {
+            printf("line: (%d, %d) to (%d, %d)\n", x1, y1, x2, y2);
+        }
         
         hub_line(tls_scene, (uint16_t)x1, (uint16_t)y1, (uint16_t)x2, (uint16_t)y2, obj->edge_colors->list[i]);
     }
@@ -678,20 +700,17 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
     if (!obj || !obj->faces || !obj->verticies) return;
     mat4 mvp = camera_project(cam, obj_xform);
     
-    /* Transform vertices to NDC space */
+    // Transform vertices to NDC space
     transform_mesh_to_ndc(obj->verticies->list, obj->verticies->length, mvp, obj->rendered_vertices);
-
-    const uint16_t w = (uint16_t)(tls_scene->width * 0.5f);
-    const uint16_t h = (uint16_t)(tls_scene->height * 0.5f);
     
-    /* Precompute world normal matrix only if lighting is provided */
+    // Precompute world normal matrix only if lighting is provided 
     float N3[9];
     if (lighting) {
         mat4 M_model = model_matrix(obj_xform);
         normal_matrix_from_model(M_model, N3);
     }
 
-    /* Render each triangle face */
+    // Render each triangle face 
     for (size_t i = 0; i < obj->faces->length; i++) {
         vec3 face = obj->faces->list[i];
         
@@ -700,19 +719,19 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
         vec3 v2 = obj->rendered_vertices[(size_t)face.y];
         vec3 v3 = obj->rendered_vertices[(size_t)face.z];
 
-        /* Optional backface culling using NDC winding (CCW = front) */
+        // Optional backface culling using NDC winding (CCW = front) 
         if (obj->cull_backface) {
             float ax = v2.x - v1.x;
             float ay = v2.y - v1.y;
             float bx = v3.x - v1.x;
             float by = v3.y - v1.y;
-            float area = ax * by - ay * bx; /* signed area in NDC (y up) */
+            float area = ax * by - ay * bx; // signed area in NDC (y up) 
             if (area > 0.0f) {
-                continue; /* back-facing */
+                continue; // back-facing
             }
         }
         
-    /* Convert NDC to normalized screen coordinates [0,1] */
+    // Convert NDC to normalized screen coordinates [0,1] 
     float nx1 = 0.5f * (v1.x + 1.0f);
     float ny1 = 0.5f * (v1.y + 1.0f);
     float nx2 = 0.5f * (v2.x + 1.0f);
@@ -720,27 +739,27 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
     float nx3 = 0.5f * (v3.x + 1.0f);
     float ny3 = 0.5f * (v3.y + 1.0f);
 
-    /* Create a triangle polygon for rendering (expects normalized 0..1) */
+    // Create a triangle polygon for rendering (expects normalized 0..1) 
     Polygonf_t triangle;
     triangle.num_points = 3;
     triangle.points[0] = (Pointf_t){nx1, ny1};
     triangle.points[1] = (Pointf_t){nx2, ny2};
     triangle.points[2] = (Pointf_t){nx3, ny3};
         
-        /* Base face/albedo color (index by face; fallback white) */
+        // Base face/albedo color (index by face; fallback white)
         RGB base_rgb = (i < obj->edge_colors->length) ? obj->edge_colors->list[i] : (RGB){255,255,255};
 
-        /* Flat Lambert shading (world space): N from model normal matrix, lights from `lighting` */
+        // Flat Lambert shading (world space): N from model normal matrix, lights from `lighting` 
         RGB shaded_rgb = base_rgb;
         if (lighting) {
 
             vec3 n_obj = (obj->normals && i < obj->normals->length) ? obj->normals->list[i] : (vec3){0,0,1};
-            /* transform and normalize */
+            // transform and normalize 
             vec3 n_world = mat3_mul_vec3(N3, n_obj);
             float n_len = sqrtf(n_world.x*n_world.x + n_world.y*n_world.y + n_world.z*n_world.z);
             if (n_len > 1e-6f) { n_world.x/=n_len; n_world.y/=n_len; n_world.z/=n_len; }
 
-            /* convert base color to [0,1] */
+            // convert base color to [0,1] 
             float br = base_rgb.r/255.0f, bg = base_rgb.g/255.0f, bb = base_rgb.b/255.0f;
             float lr = lighting->ambient.r, lg = lighting->ambient.g, lb = lighting->ambient.b; /* start with ambient */
 
@@ -748,7 +767,7 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
                 const light_t *L = &lighting->lights[li];
                 if (L->intensity <= 0.0f) continue;
                 if (L->type == LIGHT_DIRECTIONAL) {
-                    /* Treat direction as the direction the light shines; vector to light is -direction */
+                    // Treat direction as the direction the light shines; vector to light is -direction 
                     float Lx = -L->direction.x, Ly = -L->direction.y, Lz = -L->direction.z;
                     float Llen = sqrtf(Lx*Lx + Ly*Ly + Lz*Lz);
                     if (Llen > 1e-6f) { Lx/=Llen; Ly/=Llen; Lz/=Llen; }
@@ -759,10 +778,10 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
                         lb += L->color.b * L->intensity * ndotl;
                     }
                 }
-                /* POINT and SPOT can be added later */
+                // TODO: add POINT and SPOT lighting
             }
 
-            /* modulate base by lighting and clamp */
+            // modulate base by lighting and clamp 
             float cr = fminf(fmaxf(br * lr, 0.0f), 1.0f);
             float cg = fminf(fmaxf(bg * lg, 0.0f), 1.0f);
             float cb = fminf(fmaxf(bb * lb, 0.0f), 1.0f);
@@ -771,37 +790,170 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
             shaded_rgb.b = (uint8_t)(cb * 255.0f);
         }
 
-     printf("Filling triangle p1 (%.3f, %.3f), p2 (%.3f, %.3f), p3 (%.3f, %.3f)\n",
-         (double)nx1, (double)ny1, (double)nx2, (double)ny2, (double)nx3, (double)ny3);
-        
-     /* Render the filled triangle */
-    draw_polygon_fill(tls_scene, &triangle, shaded_rgb);
+        if (tls_scene && tls_scene->enhanced_debug) {
+            printf("Filling triangle p1 (%.3f, %.3f), p2 (%.3f, %.3f), p3 (%.3f, %.3f)\n",
+                (double)nx1, (double)ny1, (double)nx2, (double)ny2, (double)nx3, (double)ny3);
+        }
+            
+        // Render the filled triangle
+        draw_polygon_fill(tls_scene, &triangle, shaded_rgb);
     }
 }
 
 /* Render a list of object instances with per-object draw mode */
-static void api_render_object_scene(const camera_t *cam, const object_scene_t *os, const scene_lighting_t *lighting) {
+static void api_render_scene(const camera_t *cam, const object_scene_t *os, const scene_lighting_t *lighting) {
     if (!os || !os->instances || os->count == 0) return;
+    /* Prefer explicitly provided lighting; else fall back to scene-owned lighting */
+    const scene_lighting_t *L = lighting ? lighting : &os->lighting;
     for (uint16_t i = 0; i < os->count; ++i) {
         const object_instance_t *inst = &os->instances[i];
         object_t *obj = inst->object;
         const transform_t *xf = inst->xform;
         if (!obj || !xf) continue;
         switch (obj->draw_mode) {
-            case DRAW_WIRE:
-                api_geo_render_wire(cam, obj, xf, lighting);
-                break;
             case DRAW_FILLED:
-                api_geo_render_filled(cam, obj, xf, lighting);
+                api_geo_render_filled(cam, obj, xf, L);
                 break;
-            case DRAW_BOTH:
+            case DRAW_WIRE:
             default:
-                api_geo_render_wire(cam, obj, xf, lighting);
-                api_geo_render_filled(cam, obj, xf, lighting);
+                api_geo_render_wire(cam, obj, xf, L);
                 break;
         }
     }
 }
+
+/* Public wrappers for scene rendering (FFI-friendly) */
+void api_render_geo(const camera_t *cam, const object_scene_t *os, const scene_lighting_t *lighting) {
+    api_render_scene(cam, os, lighting);
+}
+
+/* -------- Lighting helpers (FFI-friendly) -------- */
+scene_lighting_t *api_lighting_new(uint16_t num_lights, RGBF ambient) {
+    scene_lighting_t *L = (scene_lighting_t*)calloc(1, sizeof(scene_lighting_t));
+    if (!L) return NULL;
+    L->num_lights = num_lights;
+    if (num_lights > 0) {
+        L->lights = (light_t*)calloc(num_lights, sizeof(light_t));
+        if (!L->lights) { free(L); return NULL; }
+    }
+    L->ambient = ambient;
+    return L;
+}
+
+void api_lighting_free(scene_lighting_t *l) {
+    if (!l) return;
+    if (l->lights) free(l->lights);
+    free(l);
+}
+
+void api_lighting_set_directional(scene_lighting_t *l, uint16_t index,
+                                  light_vec3 direction, RGBF color,
+                                  float intensity, bool casts_shadows) {
+    if (!l || !l->lights || index >= l->num_lights) return;
+    light_t *L = &l->lights[index];
+    L->type = LIGHT_DIRECTIONAL;
+    L->direction = direction;
+    L->color = color;
+    L->intensity = intensity;
+    L->casts_shadows = casts_shadows;
+}
+
+/* -------- Object scene helpers (FFI-friendly) -------- */
+/* ---- object_scene OO-style lighting helpers ---- */
+static void os_set_ambient(object_scene_t *os, RGBF ambient) {
+    if (!os) return;
+    os->lighting.ambient = ambient;
+}
+
+static uint16_t os_add_directional(object_scene_t *os,
+                                   light_vec3 direction,
+                                   RGBF color,
+                                   float intensity,
+                                   bool casts_shadows) {
+    if (!os) return UINT16_MAX;
+    uint16_t n = os->lighting.num_lights;
+    light_t *newlights = (light_t*)realloc(os->lighting.lights, (size_t)(n + 1) * sizeof(light_t));
+    if (!newlights) return UINT16_MAX;
+    os->lighting.lights = newlights;
+    light_t *L = &os->lighting.lights[n];
+    L->type = LIGHT_DIRECTIONAL;
+    L->direction = direction;
+    L->color = color;
+    L->intensity = intensity;
+    L->casts_shadows = casts_shadows;
+    L->position = (light_vec3){0,0,0};
+    L->range = 0.0f; L->inner_cos = 1.0f; L->outer_cos = 1.0f;
+    os->lighting.num_lights = (uint16_t)(n + 1);
+    return n;
+}
+
+static uint16_t os_add_object(object_scene_t *os, object_t *obj, transform_t *xform) {
+    if (!os || !obj || !xform) return UINT16_MAX;
+    /* Ensure capacity */
+    if (os->count >= os->capacity) {
+        uint16_t new_cap = (os->capacity == 0) ? 1u : (uint16_t)(os->capacity * 2u);
+        object_instance_t *new_arr = (object_instance_t*)realloc(os->instances, (size_t)new_cap * sizeof(object_instance_t));
+        if (!new_arr) return UINT16_MAX;
+        /* Zero-init new tail */
+        if (new_cap > os->capacity) {
+            size_t old = os->capacity;
+            memset(new_arr + old, 0, (size_t)(new_cap - old) * sizeof(object_instance_t));
+        }
+        os->instances = new_arr;
+        os->capacity = new_cap;
+    }
+    uint16_t id = os->count;
+    os->instances[id].object = obj;
+    os->instances[id].xform = xform;
+    os->count = (uint16_t)(id + 1);
+    return id;
+}
+
+static object_t *os_get_object(object_scene_t *os, uint16_t id) {
+    if (!os || id >= os->count) return NULL;
+    return os->instances[id].object;
+}
+
+static transform_t *os_get_transform(object_scene_t *os, uint16_t id) {
+    if (!os || id >= os->count) return NULL;
+    return os->instances[id].xform;
+}
+
+object_scene_t *api_object_scene_new(uint16_t object_count) {
+    object_scene_t *os = (object_scene_t*)calloc(1, sizeof(object_scene_t));
+    if (!os) return NULL;
+    os->capacity = object_count;
+    os->count = object_count;
+    if (os->capacity > 0) {
+        os->instances = (object_instance_t*)calloc(os->capacity, sizeof(object_instance_t));
+        if (!os->instances) { free(os); return NULL; }
+    }
+    // Initialize embedded lighting to defaults (black ambient, no lights)
+    os->lighting.ambient = (RGBF){0.0f, 0.0f, 0.0f};
+    os->lighting.num_lights = 0;
+    os->lighting.lights = NULL;
+    // Wire OO-style helpers 
+    os->set_ambient = os_set_ambient;
+    os->add_directional = os_add_directional;
+    os->add_object = os_add_object;
+    os->get_object = os_get_object;
+    os->get_transform = os_get_transform;
+    return os;
+}
+
+void api_object_scene_set(object_scene_t *os, uint16_t index, object_t *obj, transform_t *xform) {
+    if (!os || !os->instances || index >= os->count) return;
+    os->instances[index].object = obj;
+    os->instances[index].xform = xform;
+}
+
+void api_object_scene_free(object_scene_t *os) {
+    if (!os) return;
+    if (os->instances) free(os->instances);
+    if (os->lighting.lights) free(os->lighting.lights);
+    free(os);
+}
+
 
 
 /**
@@ -820,7 +972,7 @@ static const hub75gpu_t api_table = {
     .poly = api_poly,
     .poly_gradient = api_poly_gradient,
     .fill_gradient = api_fill_gradient,
-    .begin_frame = api_begin_frame,
+    .frame_begin = api_frame_begin,
 
     .geo_object = api_new_object,
     .geo_cube = api_new_cube,
@@ -836,12 +988,23 @@ static const hub75gpu_t api_table = {
     .geo_camera = api_new_camera,
     .geo_transform = api_new_transform,
     .geo_project = api_geo_project,
-    .geo_render_wire = api_geo_render_wire,
-    .geo_render_filled = api_geo_render_filled,
-    .render_scene = api_render_object_scene,
+    .render_wire = api_geo_render_wire,
+    .render_filled = api_geo_render_filled,
+    .render_scene = api_render_scene,
 
-    .end_frame = api_end_frame,
+    .scene_new = api_object_scene_new,
+
+    .frame_end = api_frame_end,
     .shutdown = api_shutdown,
+
+    /* convenience scene wrappers */
+    .scene_set_current = api_scene_set_current,
+    .scene_clear_current = api_scene_clear_current,
+    .scene_set_ambient = api_scene_set_ambient,
+    .scene_add_directional = api_scene_add_directional,
+    .scene_add_object = api_scene_add_object,
+    .scene_get_object = api_scene_get_object,
+    .scene_get_transform = api_scene_get_transform,
 };
 
 
@@ -859,5 +1022,28 @@ static const hub75gpu_t api_table = {
 hub75gpu_t hub75gpu(scene_info *scene) {
     tls_scene = scene;
     return api_table;
+}
+
+/* -------- Convenience scene wrappers (thread-local current object_scene) -------- */
+void api_scene_set_current(object_scene_t *os) { tls_current_os = os; }
+void api_scene_clear_current(void) { tls_current_os = NULL; }
+void api_scene_set_ambient(RGBF ambient) {
+    if (tls_current_os && tls_current_os->set_ambient) tls_current_os->set_ambient(tls_current_os, ambient);
+}
+uint16_t api_scene_add_directional(light_vec3 direction, RGBF color, float intensity, bool casts_shadows) {
+    if (!tls_current_os || !tls_current_os->add_directional) return UINT16_MAX;
+    return tls_current_os->add_directional(tls_current_os, direction, color, intensity, casts_shadows);
+}
+uint16_t api_scene_add_object(object_t *obj, transform_t *xform) {
+    if (!tls_current_os || !tls_current_os->add_object) return UINT16_MAX;
+    return tls_current_os->add_object(tls_current_os, obj, xform);
+}
+object_t* api_scene_get_object(uint16_t id) {
+    if (!tls_current_os || !tls_current_os->get_object) return NULL;
+    return tls_current_os->get_object(tls_current_os, id);
+}
+transform_t* api_scene_get_transform(uint16_t id) {
+    if (!tls_current_os || !tls_current_os->get_transform) return NULL;
+    return tls_current_os->get_transform(tls_current_os, id);
 }
 
