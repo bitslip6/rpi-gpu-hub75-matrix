@@ -104,7 +104,7 @@ AVUTIL_FOUND    := $(shell $(PKG_CONFIG) --exists libavutil   && echo yes || ech
 EFENCE_FOUND    := $(shell echo "int main(){}" | $(CC) -x c - -o /dev/null -lefence >/dev/null 2>&1 && echo yes || echo no)
 EFENCE_LIB      := $(if $(filter yes,$(EFENCE_FOUND)),-lefence,)
 
-.PHONY: all lib libgpu static clean distclean install uninstall check-libs example scratch print-vars debug perf example-debug example-perf
+.PHONY: all lib libgpu static clean distclean install uninstall check-libs example scratch print-vars debug perf example-debug example-perf example-fast
 
 all: check-libs $(LIB_NO_GPU) $(LIB_GPU) 
 ifeq ($(BUILD),debug)
@@ -168,9 +168,24 @@ $(STATIC_LIB): $(OBJ_COMMON)
 	$(Q)$(AR) rcs $@ $(OBJ_COMMON)
 
 # Example program
+# Fast path: link against already-installed libs (e.g. /usr/local/lib) if USE_SYSTEM_LIBS=1
+#   make USE_SYSTEM_LIBS=1 example
+# Convenience alias:
+example-fast:
+	$(MAKE) USE_SYSTEM_LIBS=1 example
+
+ifeq ($(USE_SYSTEM_LIBS),1)
+SYSTEM_LIBDIR ?= $(LIBDIR)
+example: example.c
+	@echo "[CC ] $@ (system libs)"
+	$(Q)$(CC) $(CFLAGS) -Wl,-rpath,$(SYSTEM_LIBDIR) -o $@ $< \
+		-l$(LIB_BASENAME)_gpu$(VARIANT_SUFFIX) $(LDLIBS_COMMON) $(LDLIBS_FFMPEG) $(LDLIBS_GPU)
+else
 example: example.c $(LIB_GPU)
-	@echo "[CC ] $@"
-	$(Q)$(CC) $(CFLAGS) -L. -Wl,-rpath,'$$ORIGIN' -o $@ $< -l$(LIB_BASENAME)_gpu$(VARIANT_SUFFIX) $(LDLIBS_COMMON) $(LDLIBS_FFMPEG) $(LDLIBS_GPU)
+	@echo "[CC ] $@ (local libs)"
+	$(Q)$(CC) $(CFLAGS) -L. -Wl,-rpath,'$$ORIGIN' -o $@ $< \
+		-l$(LIB_BASENAME)_gpu$(VARIANT_SUFFIX) $(LDLIBS_COMMON) $(LDLIBS_FFMPEG) $(LDLIBS_GPU)
+endif
 
 # Debug example (links with Electric Fence if available)
 # Convenience wrappers that invoke recursive make with BUILD override
