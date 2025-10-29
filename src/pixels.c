@@ -15,6 +15,7 @@
 #include <math.h>
 #include <string.h>
 #include <assert.h>
+#include <sched.h>
 
 //#define MEMGUARD_OVERRIDE_STDLIB
 #include "memguard2.h"
@@ -1165,6 +1166,30 @@ static inline void apply_panel_brightness_q8(uint8_t * pixels, uint8_t *mapped_p
 }
 
 
+void remap_interleaved_to_plane_major(const scene_info *scene,
+                                      const uint32_t *restrict src,
+                                      uint32_t *restrict dst,
+                                    const size_t dst_bytes)
+{
+    const unsigned bit_planes   = scene->bit_depth;
+    const size_t   half_height  = (size_t)scene->panel_height / 2;   /* or scene->half_height */
+    const size_t   pixels       = (size_t)scene->width * half_height;
+    const size_t   plane_stride = pixels;
+
+    /* if the interleaved blocks include padding, keep +1, else set to bit_planes */
+    const size_t   stride_words = (size_t)bit_planes + 1;
+
+    assert(src != NULL && dst != NULL);
+
+    for (size_t p = 0; p < pixels; ++p) {
+        const uint32_t *block = src + p * stride_words;   /* block[0..bit_planes-1] are planes */
+        for (unsigned b = 0; b < bit_planes; ++b) {
+            const uint32_t sval = block[b];
+            const uint32_t dst_off = b * plane_stride + p;
+            dst[dst_off] = sval;
+        }
+    }
+}
 
 /**
  * @brief this function takes the image data and maps it to the bcm signal.
@@ -1182,6 +1207,7 @@ void hub75_display_map_image_to_bcm(const hub75_display_t *scene, uint8_t *image
     static void     *bits = NULL;
     static uint8_t  *mapped_image = NULL;
     static uint8_t  *mapped_image2 = NULL;
+    static uint32_t *tmp_bcm = NULL;
     static uint8_t  phase = 1;
     phase = phase + 1;
 
@@ -1248,6 +1274,7 @@ void hub75_display_map_image_to_bcm(const hub75_display_t *scene, uint8_t *image
 
     // we only need to process half the height of the first panel, since we are clocking in
     // 2 rows at a time (upper and lower) aand 3 ports at a time
+    uint32_t *tmp_dst_ptr = tmp_bcm;
     for (uint16_t y=0; y < half_height; y ++) {
         for (uint16_t x=0; x < width; x++) {
 

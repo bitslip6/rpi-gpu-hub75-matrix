@@ -137,9 +137,14 @@ void binary64(FILE *fd, const uint64_t number);
 int rnd(unsigned char *buffer, const size_t size);
 
 /**
- * @brief compute exponential moving average
+ * @brief count number of times this function is called, 1 every second output
+ * the number of times called and reset the counter. This function can not
+ * be called from multiple locations. Not thread safe. Call from main drawing code
+ * 
+ * @param scene - compute frame rate, and adjust as necessary if auto_fps is true
+ * @return long - returns sleep time in microseconds
  */
-float math_ema(float new_value, float old_value, float alpha);
+long calculate_fps(scene_info *scene);
 
 /**
  * @brief map the gpio pins to memory
@@ -200,7 +205,14 @@ void* receive_udp_data(void *arg);
 /**
  * @brief test if a file exists
  */
-bool file_exists(const char *filename);
+bool has_extension(const char *filename, const char *extension);
 
+/**
+ * @brief get the cpu model (3,4,5)
+ * will die with error message if unsupported chip is found
+ * 
+ * @return int 0 = unsupported, 3 = pi3, 4 = pi4, 5 =
+ */
+int get_cpu_model();
 
 #endif

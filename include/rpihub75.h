@@ -10,10 +10,14 @@
 #include <pthread.h>
 #include <stdatomic.h>
 
-#include "hub75gpu.h"
+#ifdef RENDER_USE_PBO
+#include <GLES3/gl3.h>
+#endif
+#include "spsc.h"
 
-#ifndef __RPIHUB75_H__
-#define __RPIHUB75_H__
+
+#ifndef _RPIHUB75_H
+#define _RPIHUB75_H 1
 
 #define LIKELY(x)   __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
@@ -79,7 +83,10 @@
 // global OE jitter mask, should be a prime >1031 and <=4093
 // we don't want to make this too large, as it will consume memory
 // and decrease L1-L3 cache locality of other data
-#define JITTER_SIZE 65521 
+#define JITTER_SIZE 2048
+
+// number of bcm buffers to allocate
+#define BCM_BUFFERS 3 
 
 #define JITTER_MAX_RUN_LEN 4
 #define JITTER_PASSES 3
@@ -237,6 +244,74 @@
 #define ADDRESS_LINES_MASK (0 | 1 << ADDRESS_A | 1 << ADDRESS_B | 1 << ADDRESS_C | 1 << ADDRESS_D | 1 << ADDRESS_E)
 #define ADDRESS_COLOR_MASK (0 | 1 << ADDRESS_P0_B1 | 1 << ADDRESS_P0_B2 | 1 << ADDRESS_P0_G1 | 1 << ADDRESS_P0_G2 | 1 << ADDRESS_P0_R1 | 1 << ADDRESS_P0_R2)
 
+
+
+/**
+ * @brief just a float, should be normalized to 0-1
+ */
+typedef float Normal;
+
+/**
+ * @brief pointer to a single 24bpp RGB pixel (3 bytes)
+ * RGB *pixel = (RGB *)(image + offset)
+ */
+typedef struct {
+    uint8_t r;
+    uint8_t g; 
+    uint8_t b; 
+} RGB;
+
+/**
+ * @brief pointer to a single 24bpp RGBA pixel (4 bytes)
+ * RGBA *pixel = (RGBA *)(image + offset)
+ */
+typedef struct {
+    uint8_t r;
+    uint8_t g; 
+    uint8_t b; 
+    uint8_t a; 
+} RGBA;
+
+
+/**
+ * @brief pointer to a single 24bpp RGB pixel normalized as floats (0-1)
+ * RGBF *pixel_norm = normalize_rgb((RGB *)(image + offset))
+ */
+typedef struct {
+    Normal r;
+    Normal g; 
+    Normal b; 
+} RGBF;
+
+/**
+ * @brief pointer to a single 24bpp RGB pixel normalized as floats (0-1)
+ * RGBF *pixel_norm = normalize_rgb((RGB *)(image + offset))
+ */
+typedef struct {
+    Normal h;
+    Normal s; 
+    Normal l; 
+} HSLF;
+
+/**
+ * @brief a gradient function defines the direction of the gradient
+ * you can implement your own gradient function and pass it to the gradient struct
+ */
+typedef float (*Gradient_func)(uint16_t p1, uint16_t p2, uint16_t p3, uint16_t p4, float r1, float r2);
+
+/**
+ * @brief define a gradient between two colors, the blending will be defined
+ * in the direction of type
+ * 
+ */
+typedef struct {
+    RGB colorA1;
+    RGB colorA2;
+    RGB colorB1;
+    RGB colorB2;
+    Gradient_func type;
+} Gradient;
+
 /**
  * @brief network packet structure
  * 
@@ -249,7 +324,246 @@ struct udp_packet {
     uint8_t data[PACKET_SIZE - 10];
 };
 
+/** @brief enumeration of supported pixel order on panel */
+enum pixel_order_e {
+    PIXEL_ORDER_RGB,
+    PIXEL_ORDER_RBG,
+    PIXEL_ORDER_BGR
+};
 
+// panel order describes which logical color drives panel wires R,G,B respectively
+typedef enum {
+    PANEL_RGB = 0, PANEL_RBG, PANEL_GRB, PANEL_GBR, PANEL_BRG, PANEL_BGR
+} panel_order_t;
+
+
+typedef struct {
+    spsc_frame_ring ring;
+    // 4 frames of width*height*bitdepth bytes 
+    uint8_t *storage;
+} frame_ctx;
+
+// self referencing function pointers need this defined first
+typedef struct scene_info scene_info;
+
+
+
+// --------- jobs handed from render -> mapper ---------
+typedef enum { JOB_CPU_PIXELS = 1, JOB_PBO, JOB_QUIT = 255 } job_kind_t;
+
+typedef struct {
+    job_kind_t kind;
+    scene_info *scene;
+    size_t size_bytes;
+    union {
+        struct { uint8_t *pixels; } cpu;
+#ifdef RENDER_USE_PBO
+        struct { GLuint pbo; GLsync fence; } pbo;
+#endif
+    } u;
+} map_job_t;
+
+// mapper thread state
+typedef struct {
+    spsc_ring_t *q_in;
+    spsc_ring_t *q_filled;
+    spsc_ring_t *q_free;
+    scene_info *scene;
+    volatile int run;
+} mapper_ctx_t;
+
+
+
+
+
+// void map_byte_image_to_pwm(uint8_t *image, const scene_info *scene, uint8_t fps_sync) {
+// typedef void (*func_bcm_mapper_t)(struct scene_info *scene, uint8_t *image);
+typedef void (*func_tone_mapper_t)(const RGBF *in, RGBF *out, const float level);
+typedef uint8_t *(*func_image_mapper_t)( uint8_t *image_in, uint8_t *image_out, const struct scene_info *scene);
+typedef uint8_t *(image_mapper_t)(uint8_t *image_in, uint8_t *image_out, const struct scene_info *scene);
+
+
+typedef struct panel_rgb_scale {
+    uint8_t red_q8;
+    uint8_t green_q8;
+    uint8_t blue_q8;
+} panel_rgb_scale;
+
+typedef struct panel_rgb_offset {
+    int8_t red_q8;
+    int8_t green_q8;
+    int8_t blue_q8;
+} panel_rgb_offset;
+
+
+
+/**
+ * @brief everything to define the scene and panel configuration 
+ * This is a kind of global configuration for the entire system 
+ */
+typedef struct scene_info {
+    /** @brief the total width of the image in pixels */
+    uint16_t width;
+    /** @brief the total height of the image in pixels */
+    uint16_t height;
+    /** @brief the number of bytes per pixel in the drawing buffers (3 for RGB, 4 for RGBA) */
+    uint8_t  stride;
+
+    /** @brief the order of pixels on panel */
+    enum pixel_order_e pixel_order;
+
+    panel_order_t panel_order;
+    
+    /** @brief single panel width in pixels */
+    uint16_t panel_width;
+
+    /** @brief single panel height in pixels */
+    uint16_t panel_height;
+
+    /** @brief number of ports connected to the PI (1-3) */
+    uint8_t num_ports;
+
+    /** @brief number of bits per color channel (8-64) */
+    uint8_t bit_depth;
+
+    /** @brief brightness level (0-255) */
+    uint8_t brightness;
+
+    /** @brief array of red fractional brightness, panel type 0, type 1, ... */
+    panel_rgb_scale panel_scale[MAX_PANEL_TYPES];
+    panel_rgb_offset panel_offset[MAX_PANEL_TYPES];
+
+    /** @brief array panel types for each output */
+    uint8_t panel_types[MAX_PANELS];
+    uint8_t num_panel_types;
+
+
+    /** @brief dithering strength. (0-10) 0 is off, improves simulated color in dark areas but reduces image sharpness */
+    float dither;
+    bool quant_dither;
+
+    /** 
+     * @brief number of panels connected to each chain on the port (1-8)
+     * 4 64 pixel panels at 32bit pwm yields 75 FPS. 8 panels at 32bit pwm yields 37 FPS.
+     */
+    uint8_t num_chains;
+
+    /**
+     * @brief points to active buffer
+     * in update code use this to select the pwm buffer to render to: 
+     * (scene->buffer_ptr == 1)? scene->bcm_signalA : scene->bcm_signalB; 
+     */
+    //uint8_t buffer_ptr;
+
+    /** * @brief see buffer_ptr for usage */
+    /*
+    uint32_t *restrict bcm_signalA __attribute__((aligned(16)));
+    uint32_t *restrict bcm_signalB __attribute__((aligned(16)));
+    */
+
+    // storage for our spsc ring buffers
+    uint32_t *restrict bcm_buffers __attribute__((aligned(16)));
+
+    // size of a single bcm frame buffer
+    size_t bcm_frame_size;
+
+    //atomic_bool bcm_ptr;
+    //atomic_uint bcm_frame;
+
+    //atomic_bool frame_swap;
+    //_Atomic(unsigned) frame_ready;
+
+    spsc_frame_ring dst_ctx;
+    mapper_ctx_t src_ctx;
+
+    /** * @brief see buffer_ptr for usage */
+    uint8_t *image;
+
+    /** @brief a shader file to render on the GPU */
+    char *shader_file;
+
+	/** 
+     * @brief the tone mapping function to use, if null no tone mapping applied
+     * @see aces_tone_map
+     */
+    func_tone_mapper_t tone_mapper;
+
+	/** 
+     * @brief the tone mapping function to use, if null no tone mapping applied
+     * @see aces_tone_map
+     */
+    func_image_mapper_t image_mapper;
+
+    /**
+     * @brief  the target frame rate:
+     * maximum frame rate is: 9600 / bpp / (panel_width / 16)
+     */
+    uint16_t fps;
+    bool auto_fps;
+
+	/**
+     * @brief gamma correction value to use for pwm scaling. if 0 - no gamma is applied
+     */
+	float gamma;
+
+    /**
+     * @brief optional parameter passed to the tone mapper to determine strength
+     */
+    float tone_level;
+
+    bool jitter_brightness;
+
+    uint8_t motion_blur_frames;
+
+    float red_gamma;
+    float green_gamma;
+    float blue_gamma;
+    Normal red_linear;
+    Normal green_linear;
+    Normal blue_linear;
+
+    /**
+     * @brief boolean flag to indicate that render_forever should exit.
+     */
+    _Atomic bool do_render;
+
+    /**
+     * set to true to show the FPS on the screen
+     */
+    bool show_fps;
+
+    /**
+     * @brief current frame index, increments every frame rendered
+     */
+    uint32_t frame_index;
+    
+} scene_info;
+
+
+
+
+/**
+ * @brief map an image of RGB or RGBA pixels to a pwm signal
+ * handles double buffering and tone mapping for you
+ * 
+ * @param image pointer to the image data
+ * @param scene scene configuration
+ * @param do_fps_sync set to true to sync to scene->fps based on current time
+ */
+// void map_byte_image_to_pwm(uint8_t *restrict image, const scene_info *scene, const uint8_t do_fps_sync);
+
+/**
+ * @brief map an image of RGB or RGBA pixels to a pwm signal with dithering
+ * dithering is based on color error diffusion from full 32bpp down to our 
+ * target bit depth (usually 15bpp for 32 pwm bits).
+ * 
+ * dithering 
+ * 
+ * @param image pointer to the image data
+ * @param scene scene configuration
+ * @param do_fps_sync set to true to sync to scene->fps based on current time
+ */
+// void map_byte_image_to_pwm_dithered(uint8_t *image, const scene_info *scene, const uint8_t do_fps_sync);
 void aces_inplace(RGB *in);
 Normal normalize_8(const uint8_t in);
 
@@ -266,7 +580,13 @@ void reinhard_tone_mapperF(const RGBF *in, RGBF *out);
 Normal hable_tone_map(const Normal color);
 void hable_inplace(RGB *in);
 void adjust_contrast_saturation(RGBF *__restrict__ in, const float contrast, const float saturation);
+uint8_t* u_mapper(uint8_t *image, uint8_t *output_image, const scene_info *scene);
+uint8_t *flip_mapper(uint8_t *image, uint8_t *image_out, const struct scene_info *scene);
+uint8_t *mirror_mapper(uint8_t *image, uint8_t *image_out, const struct scene_info *scene);
+uint8_t *mirror_flip_mapper(uint8_t *image, uint8_t *image_out, const struct scene_info *scene);
 
+
+void *mapper_thread_main(void *arg);
 
 void *render_shader(void *arg);
 void dither_image(uint8_t *image, int width, int height);
@@ -277,19 +597,19 @@ void apply_noise_dithering(uint8_t *image, int width, int height);
  * will die() if invalid configuration is found
  * @param scene 
  */
-void check_scene(const hub75_display_t *scene);
+void start_scene(scene_info *scene);
 
+
+uint8_t *u_mapper_impl(uint8_t *image_in, uint8_t *image_out, const struct scene_info *scene);
+uint8_t *flip_mapper_impl(const uint8_t *image_in, uint8_t *image_out, const struct scene_info *scene);
+
+void cpu_set_affinity(int cpu_id);
 
 /**
  * @brief render the PWM signal to the GPIO pins forever...
  * 
  * @param scene 
  */
-void *hub75_display_run(const hub75_display_t *scene);
-
-/**
- * @brief initialize the hub75gpu library
- */
-void hub75gpu_init();
+void* render_forever(void *arg);
 
 #endif

@@ -491,6 +491,7 @@ void* hub75_display_run(const hub75_display_t *scene) {
                 last_time_s = current_time_s;
             }
         }
+        */
     }
 
     debug(" [-] render loop exiting. [%ld] total frames rendered\n", (frame_total + frame_count));

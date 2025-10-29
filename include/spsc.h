@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 #include <stdint.h>
 #include <semaphore.h>
 #include <unistd.h>
