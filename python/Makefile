@@ -7,8 +7,8 @@ EXT_SUFFIX := $(shell $(PYTHON) -c 'import sysconfig; print(sysconfig.get_config
 PY_CFLAGS  := $(shell $(PYTHON)-config --cflags 2>/dev/null || $(PYTHON) -c 'import sysconfig; print(sysconfig.get_config_var("CFLAGS"))')
 PY_LDFLAGS := $(shell $(PYTHON)-config --ldflags 2>/dev/null || echo "")
 
-CFLAGS := -fPIC -I../include $(PY_CFLAGS)
-LDFLAGS := -shared -L.. -lrpihub75 -Wl,-rpath,'$$ORIGIN/..' $(PY_LDFLAGS)
+CFLAGS := -fPIC -pthread -I../include $(PY_CFLAGS)
+LDFLAGS := -shared -pthread -L.. -lrpihub75_gpu -lrpihub75 -Wl,-rpath,'$$ORIGIN/..' $(PY_LDFLAGS)
 
 TARGET := hub75gpu$(EXT_SUFFIX)
 OBJS := hub75gpu_py.o
