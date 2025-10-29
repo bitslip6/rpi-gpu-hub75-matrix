@@ -37,7 +37,7 @@ void *mapper_thread_main(void *arg)
 {
     debug(" ~~ BCM mapper thread started\n");
 
-    scene_info *scene = (scene_info *)arg;
+    hub75_display_t *scene = (hub75_display_t *)arg;
 
     while (scene->do_render)
     {
@@ -47,7 +47,7 @@ void *mapper_thread_main(void *arg)
         }
 
         // map the linear rgba image to bcm mapping
-        map_byte_image_to_bcm(scene, src);
+    hub75_display_map_image_to_bcm(scene, src);
 
         spsc_pop_ptr_commit(scene->ring_buf_mapper);
     }
@@ -684,7 +684,7 @@ void dither_spatial_hash_low(uint8_t *img, int width, int height,
  */
 __attribute__((hot))
 void update_bcm_signal_64_rgb(
-    const scene_info *scene,
+    const hub75_display_t *scene,
     const void *__restrict__ void_bits,
     uint32_t *__restrict__ bcm_signal,
     const uint8_t *image,
@@ -892,7 +892,7 @@ static inline void *aligned_alloc64(size_t size) {
  * @param quant_errors pointer to an array of 3*256 floats to store the quantization errors for dithering.
  * @return void* pointer to the bcm signal map. 0-255 red, 256-511 green, 512-767 blue. caller must free() 
  */
-void *tone_map_rgb_bits(const scene_info *scene, const uint8_t bit_depth, uint16_t *quant_errors) {
+void *tone_map_rgb_bits(const hub75_display_t *scene, const uint8_t bit_depth, uint16_t *quant_errors) {
     if (bit_depth > 64 || bit_depth < 8) {
         die("bit depth must be between 8 and 64\n");
     }
@@ -1125,7 +1125,7 @@ static inline void copy_rect_rgb(const uint8_t *pixels, uint8_t *mapped_pixels,
  * @param mapped_pixels the destination image pixels
  * @param scene the scene information
  */
-static inline void apply_panel_brightness_q8(uint8_t * pixels, uint8_t *mapped_pixels, const scene_info *scene) {
+static inline void apply_panel_brightness_q8(uint8_t * pixels, uint8_t *mapped_pixels, const hub75_display_t *scene) {
     for (int py = 0; py < scene->num_ports; ++py) {
         for (int px = 0; px < scene->num_chains; ++px) {
             const int idx = py * scene->num_chains + px;
@@ -1175,7 +1175,7 @@ static inline void apply_panel_brightness_q8(uint8_t * pixels, uint8_t *mapped_p
  * @param image the image to map to the scene bcm data. if NULL scene->image will be used
  */
 __attribute__((hot))
-void map_byte_image_to_bcm(const scene_info *scene, uint8_t *image) {
+void hub75_display_map_image_to_bcm(const hub75_display_t *scene, uint8_t *image) {
 
     // tone map the bits for the current scene, update if the lookup table if scene tone mapping changes....
     // TODO: create per panel tone mapping tables if panels have different characteristics
@@ -1286,7 +1286,7 @@ float gradient_quad(uint16_t p1, uint16_t p2, uint16_t p3, uint16_t p4 __attribu
 }
 */
 
-void hub_clear(scene_info *scene) {
+void hub_clear(hub75_display_t *scene) {
     if (scene->image) {
         size_t img_size = (size_t)(scene->width * scene->height * scene->stride);
         memset(scene->image, 0, img_size); // always clear in case image is RGBA
@@ -1301,7 +1301,7 @@ void hub_clear(scene_info *scene) {
  * @param y vertical position (starting at 0) clamped to scene->height
  * @param pixel RGB value to set at pixel x,y
  */
-inline void hub_pixel(scene_info *scene, const int x, const int y, const RGB pixel) {
+inline void hub_pixel(hub75_display_t *scene, const int x, const int y, const RGB pixel) {
     const uint16_t fx = (uint16_t)MIN(x, scene->width-1);
     const uint16_t fy = (uint16_t)MIN(y, scene->height-1);
     const int offset = (fy * scene->width + fx) * scene->stride;
@@ -1322,7 +1322,7 @@ inline void hub_pixel(scene_info *scene, const int x, const int y, const RGB pix
  * @param y vertical position (starting at 0)
  * @param pixel RGB value to set at pixel x,y
  */
-inline void hub_pixel_factor(scene_info *scene, const int x, const int y, const RGB pixel, const float factor) {
+inline void hub_pixel_factor(hub75_display_t *scene, const int x, const int y, const RGB pixel, const float factor) {
     const uint16_t fx = (uint8_t)MIN(x, scene->width-1);
     const uint16_t fy = (uint8_t)MIN(y, scene->height-1);
     const int offset = (fy * scene->width + fx) * scene->stride;
@@ -1344,7 +1344,7 @@ inline void hub_pixel_factor(scene_info *scene, const int x, const int y, const 
  * @param y vertical position (starting at 0)
  * @param pixel RGB value to set at pixel x,y
  */
-inline void hub_pixel_alpha(scene_info *scene, const int x, const int y, const RGBA pixel) {
+inline void hub_pixel_alpha(hub75_display_t *scene, const int x, const int y, const RGBA pixel) {
     const uint16_t fx = (uint16_t)MIN(x, scene->width-1);
     const uint16_t fy = (uint16_t)MIN(y, scene->height-1);
     const int offset = (fy * scene->width + fx) * scene->stride;
@@ -1370,7 +1370,7 @@ inline void hub_pixel_alpha(scene_info *scene, const int x, const int y, const R
  * @param y2 inclusive
  * @param color 
  */
-void hub_fill(scene_info *scene, const uint16_t x1, const uint16_t y1, const uint16_t x2, const uint16_t y2, const RGB color) {
+void hub_fill(hub75_display_t *scene, const uint16_t x1, const uint16_t y1, const uint16_t x2, const uint16_t y2, const RGB color) {
     uint16_t fx1 = x1 % scene->width;
     uint16_t fx2 = x2 % scene->width;
     uint16_t fy1 = y1 % scene->height;
@@ -1396,7 +1396,7 @@ void hub_fill(scene_info *scene, const uint16_t x1, const uint16_t y1, const uin
 
 
 // Draw an unfilled circle using Bresenham's algorithm
-void hub_circle(scene_info *scene, const uint16_t centerX, const uint16_t centerY, const uint16_t radius, const RGB color) {
+void hub_circle(hub75_display_t *scene, const uint16_t centerX, const uint16_t centerY, const uint16_t radius, const RGB color) {
     int x = radius;
     int y = 0;
     int decisionOver2 = 1 - x; // Decision variable
@@ -1436,7 +1436,7 @@ void hub_circle(scene_info *scene, const uint16_t centerX, const uint16_t center
  * @param y1 end pixel y
  * @param color color to draw the line
  */
-void hub_line(scene_info *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, RGB color) {
+void hub_line(hub75_display_t *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, RGB color) {
     int dx = abs(x1 - x0);
     int dy = abs(y1 - y0);
     int sx = (x0 < x1) ? 1 : -1; // Step in the x direction
@@ -1474,7 +1474,7 @@ void hub_line(scene_info *scene, const uint16_t x0, const uint16_t y0, const uin
  * @param y1 end pixel y
  * @param color color to draw the line
  */
-void hub_line_aa(scene_info *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, const RGB color) {
+void hub_line_aa(hub75_display_t *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, const RGB color) {
 
 
     float fx0 = clampf((float)x0, 0, scene->width-1);

@@ -9,17 +9,17 @@
  */
 uint8_t *flip_mapper(const uint8_t *image,
                              uint8_t *image_out,
-                             const scene_info *scene);
+                             const hub75_display_t *scene);
 
 /**
  * @brief mirror and flip an image
  */
 uint8_t *mirror_flip_mapper(const uint8_t *image,
                             uint8_t * image_out,
-                            const struct scene_info *scene);
+                            const struct hub75_display *scene);
                             
-uint8_t* u_mapper_impl(const uint8_t *image, uint8_t *output_image, const scene_info *scene);
-uint8_t *mirror_mapper(const uint8_t *image, uint8_t *image_out, const struct scene_info *scene);
+uint8_t* u_mapper_impl(const uint8_t *image, uint8_t *output_image, const hub75_display_t *scene);
+uint8_t *mirror_mapper(const uint8_t *image, uint8_t *image_out, const struct hub75_display *scene);
 
 
 #endif

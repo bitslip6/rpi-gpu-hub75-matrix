@@ -149,12 +149,12 @@ typedef enum {
 
 
 // self referencing function pointers need this defined first
-struct scene_info;
+struct hub75_display;
 
 // void map_byte_image_to_pwm(uint8_t *image, const scene_info *scene, uint8_t fps_sync) {
 typedef void (*func_tone_mapper_t)(const RGBF *in, RGBF *out, const float level);
-typedef uint8_t *(*func_image_mapper_t)(const uint8_t *image_in, uint8_t *image_out, const struct scene_info *scene);
-typedef uint8_t *(image_mapper_t)(const uint8_t *image_in, uint8_t *image_out, const struct scene_info *scene);
+typedef uint8_t *(*func_image_mapper_t)(const uint8_t *image_in, uint8_t *image_out, const struct hub75_display *scene);
+typedef uint8_t *(image_mapper_t)(const uint8_t *image_in, uint8_t *image_out, const struct hub75_display *scene);
 
 /* --------------------------------------------------------------
  * Lighting types and scene lighting configuration
@@ -187,14 +187,14 @@ typedef struct light_t {
     float  outer_cos;      /* spot outer cone (cosine of angle); must be <= inner_cos */
 } light_t;
 
-typedef struct scene_lighting_t {
+typedef struct scene3d_lighting_t {
     RGBF     ambient;      // ambient light color (0..1 per channel)
     uint16_t num_lights;   // number of active lights
     light_t *lights;       // dynamic array of lights (NULL when num_lights == 0)
 
     void (*set_directional)(uint16_t index, light_vec3 direction,
                                 RGBF color, float intensity, bool casts_shadows);
-} scene_lighting_t;
+} scene3d_lighting_t;
 
 
 
@@ -203,7 +203,7 @@ typedef struct scene_lighting_t {
  * @brief everything to define the scene and panel configuration 
  * This is a kind of global configuration for the entire system 
  */
-typedef struct scene_info {
+typedef struct hub75_display {
     /** @brief the total width of the image in pixels */
     uint16_t width;
     /** @brief the total height of the image in pixels */
@@ -334,7 +334,7 @@ typedef struct scene_info {
 
     bool frame_ready;
     
-} scene_info;
+} hub75_display_t;
 
 
 /**
@@ -345,14 +345,14 @@ typedef struct scene_info {
  * @param scene the scene information
  * @param image the image to map to the scene bcm data. if NULL scene->image will be used
  */
-void map_byte_image_to_bcm(const scene_info *scene, uint8_t *image);
+void hub75_display_map_image_to_bcm(const hub75_display_t *scene, uint8_t *image);
 
 void *mapper_thread_main(void *arg);
 
 /**
  * must be called on the main thread to start the renderer. it never returns
  */
-void *render_forever(const scene_info *scene);
+void *hub75_display_run(const hub75_display_t *scene);
 
 /**
  * @brief render the shader arg->shader_file shader on the GPU
@@ -379,7 +379,7 @@ void* render_video_fn(void *arg);
  * @param arg 
  * @return void* 
  */
-bool hub_render_video(scene_info *scene, const char *filename);
+bool hub_render_video(hub75_display_t *scene, const char *filename);
 
 /**
  * @brief count number of times this function is called, 1 every second output
@@ -393,18 +393,18 @@ unsigned long calculate_fps(const uint16_t target_fps, const bool show_fps);
 
 
 // graceful shutdown helpers
-void hub75_request_shutdown(struct scene_info *scene);
-void hub75_wait_shutdown(struct scene_info *scene);
+void hub75_display_request_shutdown(struct hub75_display *scene);
+void hub75_display_wait(struct hub75_display *scene);
 
-void draw_polygon_fill(scene_info *scene, Polygonf_t *poly, RGB color);
-void gradient_polygon(scene_info *scene, Polygonf_t *poly, SimpleGradient gradient);
+void draw_polygon_fill(hub75_display_t *scene, Polygonf_t *poly, RGB color);
+void gradient_polygon(hub75_display_t *scene, Polygonf_t *poly, SimpleGradient gradient);
 
 /* Easing function implementations */
 float apply_easing(float t, easing_function_t easing);
 
 
-void hub_line_aa(scene_info *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, const RGB color);
-void hub_line(scene_info *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, RGB color);
+void hub_line_aa(hub75_display_t *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, const RGB color);
+void hub_line(hub75_display_t *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, RGB color);
 
 /**
  * @brief parse command line arguments and create a valid scene
@@ -413,19 +413,19 @@ void hub_line(scene_info *scene, const uint16_t x0, const uint16_t y0, const uin
  * @param argv command line arguments
  * @return scene_info* the created scene information
  */
-scene_info *scene_parse(int argc, char **argv);
+hub75_display_t *hub75_display_parse_args(int argc, char **argv);
 
 /**
  * @brief create a default scene
  * 
  * @return scene_info* the created scene information
  */
-scene_info *scene_new();
+hub75_display_t *hub75_display_new();
 
 /**
  * check the scene and start the rendering threads if everying is ok
  */
-void scene_start(scene_info *scene);
+void hub75_display_start(hub75_display_t *scene);
 
 /**
  * @brief install signal handlers for graceful shutdown on SIGINT/SIGTERM
@@ -569,27 +569,27 @@ typedef struct {
     transform_t *xform;           /* object transform (external owner) */
 } object_instance_t;
 
-typedef struct object_scene_t {
+typedef struct scene3d_t {
     uint16_t count;               /* number of active instances */
     uint16_t capacity;            /* allocated capacity for instances */
     object_instance_t *instances; /* array of count instances (owned by scene) */
 
     /* Embedded lighting owned by the scene (no separate lighting object needed) */
-    scene_lighting_t lighting;     /* ambient + dynamic array of lights */
+    scene3d_lighting_t lighting;     /* ambient + dynamic array of lights */
 
     /* OO-style helpers (method-like function pointers for ease of use / FFI) */
-    void (*set_ambient)(struct object_scene_t *os, RGBF ambient);
-    uint16_t (*add_directional)(struct object_scene_t *os,
+    void (*set_ambient)(struct scene3d_t *os, RGBF ambient);
+    uint16_t (*add_directional)(struct scene3d_t *os,
                                 light_vec3 direction,
                                 RGBF color,
                                 float intensity,
                                 bool casts_shadows);
 
     /* Object management helpers */
-    uint16_t (*add_object)(struct object_scene_t *os, object_t *obj, transform_t *xform);
-    object_t *(*get_object)(struct object_scene_t *os, uint16_t id);
-    transform_t *(*get_transform)(struct object_scene_t *os, uint16_t id);
-} object_scene_t;
+    uint16_t (*add_object)(struct scene3d_t *os, object_t *obj, transform_t *xform);
+    object_t *(*get_object)(struct scene3d_t *os, uint16_t id);
+    transform_t *(*get_transform)(struct scene3d_t *os, uint16_t id);
+} scene3d_t;
 
 
 typedef struct {
@@ -608,9 +608,9 @@ typedef struct {
     void (*frame_end)();
 
     mat4 (*geo_project)(camera_t *cam, transform_t *obj_xform);
-    void (*render_wire)(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene_lighting_t *lighting);
-    void (*render_filled)(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene_lighting_t *lighting);
-    void (*render_scene)(const camera_t *cam, const object_scene_t *scene, const scene_lighting_t *lighting);
+    void (*render_wire)(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene3d_lighting_t *lighting);
+    void (*render_filled)(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene3d_lighting_t *lighting);
+    void (*render_scene3d)(const camera_t *cam, const scene3d_t *scene, const scene3d_lighting_t *lighting);
 
     // camera and scene lighting functions
     camera_t* (*geo_camera)();
@@ -628,47 +628,47 @@ typedef struct {
     object_t* (*geo_torus)(uint16_t major_segments, uint16_t minor_segments);
     object_t* (*geo_plane)(uint16_t width_segments, uint16_t height_segments);
 
-    /* Convenience scene wrappers (avoid passing object_scene repeatedly) */
-    object_scene_t* (*scene_new)(uint16_t count);
-    void (*scene_set_current)(object_scene_t *os);
-    void (*scene_clear_current)(void);
-    void (*scene_set_ambient)(RGBF ambient);
-    uint16_t (*scene_add_directional)(light_vec3 direction, RGBF color, float intensity, bool casts_shadows);
-    uint16_t (*scene_add_object)(object_t *obj, transform_t *xform);
-    object_t* (*scene_get_object)(uint16_t id);
-    transform_t* (*scene_get_transform)(uint16_t id);
+    /* Convenience scene3d wrappers (avoid passing scene3d repeatedly) */
+    scene3d_t* (*scene3d_new)(uint16_t count);
+    void (*scene3d_set_current)(scene3d_t *os);
+    void (*scene3d_clear_current)(void);
+    void (*scene3d_set_ambient)(RGBF ambient);
+    uint16_t (*scene3d_add_directional)(light_vec3 direction, RGBF color, float intensity, bool casts_shadows);
+    uint16_t (*scene3d_add_object)(object_t *obj, transform_t *xform);
+    object_t* (*scene3d_get_object)(uint16_t id);
+    transform_t* (*scene3d_get_transform)(uint16_t id);
 
 } hub75gpu_t;
 
 /* set the current thread's scene and get an API whose functions do not take a scene */
-hub75gpu_t hub75gpu(scene_info *s);
+hub75gpu_t hub75_api(hub75_display_t *s);
 
 /* -------- Python/FFI-friendly helper API -------- */
 camera_t *api_new_camera(void);
 transform_t *api_new_transform(void);
 
-scene_lighting_t *api_lighting_new(uint16_t num_lights, RGBF ambient);
-void api_lighting_free(scene_lighting_t *l);
-void api_lighting_set_ambient(scene_lighting_t *l, RGBF color);
-void api_lighting_set_directional(scene_lighting_t *l, uint16_t index,
+scene3d_lighting_t *api_lighting_new(uint16_t num_lights, RGBF ambient);
+void api_lighting_free(scene3d_lighting_t *l);
+void api_lighting_set_ambient(scene3d_lighting_t *l, RGBF color);
+void api_lighting_set_directional(scene3d_lighting_t *l, uint16_t index,
                                   light_vec3 direction,
                                   RGBF color,
                                   float intensity, bool casts_shadows);
 
-object_scene_t *api_object_scene_new(uint16_t count);
-void api_object_scene_set(object_scene_t *os, uint16_t index, object_t *obj, transform_t *xform);
-void api_object_scene_free(object_scene_t *os);
+scene3d_t *api_object_scene_new(uint16_t count);
+void api_object_scene_set(scene3d_t *os, uint16_t index, object_t *obj, transform_t *xform);
+void api_object_scene_free(scene3d_t *os);
 void api_object_set_draw_mode(object_t *obj, object_draw_mode_t mode);
-void api_render_geo(const camera_t *cam, const object_scene_t *os, const scene_lighting_t *lighting);
+void api_render_geo(const camera_t *cam, const scene3d_t *os, const scene3d_lighting_t *lighting);
 
-/* Convenience scene wrappers (thread-local current object_scene) */
-void api_scene_set_current(object_scene_t *os);
-void api_scene_clear_current(void);
-void api_scene_set_ambient(RGBF ambient);
-uint16_t api_scene_add_directional(light_vec3 direction, RGBF color, float intensity, bool casts_shadows);
-uint16_t api_scene_add_object(object_t *obj, transform_t *xform);
-object_t* api_scene_get_object(uint16_t id);
-transform_t* api_scene_get_transform(uint16_t id);
+/* Convenience scene3d wrappers (thread-local current scene3d) */
+void api_scene3d_set_current(scene3d_t *os);
+void api_scene3d_clear_current(void);
+void api_scene3d_set_ambient(RGBF ambient);
+uint16_t api_scene3d_add_directional(light_vec3 direction, RGBF color, float intensity, bool casts_shadows);
+uint16_t api_scene3d_add_object(object_t *obj, transform_t *xform);
+object_t* api_scene3d_get_object(uint16_t id);
+transform_t* api_scene3d_get_transform(uint16_t id);
 
 /* Common web colors (RGBF normalized 0..1) */
 #define COLOR_BLACK        (RGBF){ 0.0f, 0.0f, 0.0f }

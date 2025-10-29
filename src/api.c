@@ -17,8 +17,8 @@
 #endif
 
 /* Thread-local storage for the current scene being processed by this thread */
-static _Thread_local scene_info *tls_scene = NULL;
-static _Thread_local object_scene_t *tls_current_os = NULL;
+static _Thread_local hub75_display_t *tls_scene = NULL;
+static _Thread_local scene3d_t *tls_current_os = NULL;
 
 /* Minimal 3D helpers for normal-based culling */
 static inline vec3 v3_add(vec3 a, vec3 b){ return (vec3){a.x+b.x,a.y+b.y,a.z+b.z}; }
@@ -234,7 +234,7 @@ static void api_frame_end() {
  * Handles coordinate swapping if x0 > x1 and clamps coordinates to valid ranges.
  * Uses RGB888 format (3 bytes per pixel).
  */
-static inline void fill_span_rgb(scene_info *scene, int y, int x0, int x1, RGB c) {
+static inline void fill_span_rgb(hub75_display_t *scene, int y, int x0, int x1, RGB c) {
     if ((unsigned)y >= (unsigned)scene->height) return;
     if (x0 > x1) { int t = x0; x0 = x1; x1 = t; }
     if (x1 < 0 || x0 >= scene->width) return;
@@ -270,7 +270,7 @@ static inline void fill_span_rgb(scene_info *scene, int y, int x0, int x1, RGB c
  * 3. For each scanline, find edge intersections
  * 4. Fill between intersection pairs
  */
-void draw_polygon_fill(scene_info *scene, Polygonf_t *poly, RGB color)
+void draw_polygon_fill(hub75_display_t *scene, Polygonf_t *poly, RGB color)
 {
     if (!scene || !scene->image || !poly || poly->num_points < 3) {
         debug("draw_polygon: bad args\n");
@@ -456,7 +456,7 @@ void api_shutdown() {
         debug("no scene set\n");
         return;
     }
-    hub75_request_shutdown(tls_scene);
+    hub75_display_request_shutdown(tls_scene);
 }
 
 void api_pixel_factor (int x, int y, RGB pixel, float factor) {
@@ -588,7 +588,7 @@ void debug_object(object_t *obj) {
     }
 }
 
-void api_geo_render_wire(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene_lighting_t *lighting) {
+void api_geo_render_wire(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene3d_lighting_t *lighting) {
     (void)lighting; /* allow NULL; lighting not used in wireframe */
 
     // Debug camera and transform (gated behind enhanced_debug)
@@ -696,7 +696,7 @@ void api_geo_render_wire(const camera_t *cam, object_t *obj, const transform_t *
     if (front_face) free(front_face);
 }
 
-void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene_lighting_t *lighting) {
+void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene3d_lighting_t *lighting) {
     if (!obj || !obj->faces || !obj->verticies) return;
     mat4 mvp = camera_project(cam, obj_xform);
     
@@ -801,10 +801,10 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
 }
 
 /* Render a list of object instances with per-object draw mode */
-static void api_render_scene(const camera_t *cam, const object_scene_t *os, const scene_lighting_t *lighting) {
+static void api_render_scene3d(const camera_t *cam, const scene3d_t *os, const scene3d_lighting_t *lighting) {
     if (!os || !os->instances || os->count == 0) return;
     /* Prefer explicitly provided lighting; else fall back to scene-owned lighting */
-    const scene_lighting_t *L = lighting ? lighting : &os->lighting;
+    const scene3d_lighting_t *L = lighting ? lighting : &os->lighting;
     for (uint16_t i = 0; i < os->count; ++i) {
         const object_instance_t *inst = &os->instances[i];
         object_t *obj = inst->object;
@@ -823,13 +823,13 @@ static void api_render_scene(const camera_t *cam, const object_scene_t *os, cons
 }
 
 /* Public wrappers for scene rendering (FFI-friendly) */
-void api_render_geo(const camera_t *cam, const object_scene_t *os, const scene_lighting_t *lighting) {
-    api_render_scene(cam, os, lighting);
+void api_render_geo(const camera_t *cam, const scene3d_t *os, const scene3d_lighting_t *lighting) {
+    api_render_scene3d(cam, os, lighting);
 }
 
 /* -------- Lighting helpers (FFI-friendly) -------- */
-scene_lighting_t *api_lighting_new(uint16_t num_lights, RGBF ambient) {
-    scene_lighting_t *L = (scene_lighting_t*)calloc(1, sizeof(scene_lighting_t));
+scene3d_lighting_t *api_lighting_new(uint16_t num_lights, RGBF ambient) {
+    scene3d_lighting_t *L = (scene3d_lighting_t*)calloc(1, sizeof(scene3d_lighting_t));
     if (!L) return NULL;
     L->num_lights = num_lights;
     if (num_lights > 0) {
@@ -840,13 +840,13 @@ scene_lighting_t *api_lighting_new(uint16_t num_lights, RGBF ambient) {
     return L;
 }
 
-void api_lighting_free(scene_lighting_t *l) {
+void api_lighting_free(scene3d_lighting_t *l) {
     if (!l) return;
     if (l->lights) free(l->lights);
     free(l);
 }
 
-void api_lighting_set_directional(scene_lighting_t *l, uint16_t index,
+void api_lighting_set_directional(scene3d_lighting_t *l, uint16_t index,
                                   light_vec3 direction, RGBF color,
                                   float intensity, bool casts_shadows) {
     if (!l || !l->lights || index >= l->num_lights) return;
@@ -860,12 +860,12 @@ void api_lighting_set_directional(scene_lighting_t *l, uint16_t index,
 
 /* -------- Object scene helpers (FFI-friendly) -------- */
 /* ---- object_scene OO-style lighting helpers ---- */
-static void os_set_ambient(object_scene_t *os, RGBF ambient) {
+static void os_set_ambient(scene3d_t *os, RGBF ambient) {
     if (!os) return;
     os->lighting.ambient = ambient;
 }
 
-static uint16_t os_add_directional(object_scene_t *os,
+static uint16_t os_add_directional(scene3d_t *os,
                                    light_vec3 direction,
                                    RGBF color,
                                    float intensity,
@@ -887,7 +887,7 @@ static uint16_t os_add_directional(object_scene_t *os,
     return n;
 }
 
-static uint16_t os_add_object(object_scene_t *os, object_t *obj, transform_t *xform) {
+static uint16_t os_add_object(scene3d_t *os, object_t *obj, transform_t *xform) {
     if (!os || !obj || !xform) return UINT16_MAX;
     /* Ensure capacity */
     if (os->count >= os->capacity) {
@@ -909,18 +909,18 @@ static uint16_t os_add_object(object_scene_t *os, object_t *obj, transform_t *xf
     return id;
 }
 
-static object_t *os_get_object(object_scene_t *os, uint16_t id) {
+static object_t *os_get_object(scene3d_t *os, uint16_t id) {
     if (!os || id >= os->count) return NULL;
     return os->instances[id].object;
 }
 
-static transform_t *os_get_transform(object_scene_t *os, uint16_t id) {
+static transform_t *os_get_transform(scene3d_t *os, uint16_t id) {
     if (!os || id >= os->count) return NULL;
     return os->instances[id].xform;
 }
 
-object_scene_t *api_object_scene_new(uint16_t object_count) {
-    object_scene_t *os = (object_scene_t*)calloc(1, sizeof(object_scene_t));
+scene3d_t *api_object_scene_new(uint16_t object_count) {
+    scene3d_t *os = (scene3d_t*)calloc(1, sizeof(scene3d_t));
     if (!os) return NULL;
     os->capacity = object_count;
     os->count = object_count;
@@ -941,13 +941,13 @@ object_scene_t *api_object_scene_new(uint16_t object_count) {
     return os;
 }
 
-void api_object_scene_set(object_scene_t *os, uint16_t index, object_t *obj, transform_t *xform) {
+void api_object_scene_set(scene3d_t *os, uint16_t index, object_t *obj, transform_t *xform) {
     if (!os || !os->instances || index >= os->count) return;
     os->instances[index].object = obj;
     os->instances[index].xform = xform;
 }
 
-void api_object_scene_free(object_scene_t *os) {
+void api_object_scene_free(scene3d_t *os) {
     if (!os) return;
     if (os->instances) free(os->instances);
     if (os->lighting.lights) free(os->lighting.lights);
@@ -990,21 +990,20 @@ static const hub75gpu_t api_table = {
     .geo_project = api_geo_project,
     .render_wire = api_geo_render_wire,
     .render_filled = api_geo_render_filled,
-    .render_scene = api_render_scene,
-
-    .scene_new = api_object_scene_new,
+    .render_scene3d = api_render_scene3d,
+    .scene3d_new = api_object_scene_new,
 
     .frame_end = api_frame_end,
     .shutdown = api_shutdown,
 
     /* convenience scene wrappers */
-    .scene_set_current = api_scene_set_current,
-    .scene_clear_current = api_scene_clear_current,
-    .scene_set_ambient = api_scene_set_ambient,
-    .scene_add_directional = api_scene_add_directional,
-    .scene_add_object = api_scene_add_object,
-    .scene_get_object = api_scene_get_object,
-    .scene_get_transform = api_scene_get_transform,
+    .scene3d_set_current = api_scene3d_set_current,
+    .scene3d_clear_current = api_scene3d_clear_current,
+    .scene3d_set_ambient = api_scene3d_set_ambient,
+    .scene3d_add_directional = api_scene3d_add_directional,
+    .scene3d_add_object = api_scene3d_add_object,
+    .scene3d_get_object = api_scene3d_get_object,
+    .scene3d_get_transform = api_scene3d_get_transform,
 };
 
 
@@ -1019,30 +1018,30 @@ static const hub75gpu_t api_table = {
  * same drawing functions. The scene parameter is stored in thread-local
  * storage and used by all subsequent drawing operations in this thread.
  */
-hub75gpu_t hub75gpu(scene_info *scene) {
+hub75gpu_t hub75_api(hub75_display_t *scene) {
     tls_scene = scene;
     return api_table;
 }
 
-/* -------- Convenience scene wrappers (thread-local current object_scene) -------- */
-void api_scene_set_current(object_scene_t *os) { tls_current_os = os; }
-void api_scene_clear_current(void) { tls_current_os = NULL; }
-void api_scene_set_ambient(RGBF ambient) {
+/* -------- Convenience scene wrappers (thread-local current scene3d) -------- */
+void api_scene3d_set_current(scene3d_t *os) { tls_current_os = os; }
+void api_scene3d_clear_current(void) { tls_current_os = NULL; }
+void api_scene3d_set_ambient(RGBF ambient) {
     if (tls_current_os && tls_current_os->set_ambient) tls_current_os->set_ambient(tls_current_os, ambient);
 }
-uint16_t api_scene_add_directional(light_vec3 direction, RGBF color, float intensity, bool casts_shadows) {
+uint16_t api_scene3d_add_directional(light_vec3 direction, RGBF color, float intensity, bool casts_shadows) {
     if (!tls_current_os || !tls_current_os->add_directional) return UINT16_MAX;
     return tls_current_os->add_directional(tls_current_os, direction, color, intensity, casts_shadows);
 }
-uint16_t api_scene_add_object(object_t *obj, transform_t *xform) {
+uint16_t api_scene3d_add_object(object_t *obj, transform_t *xform) {
     if (!tls_current_os || !tls_current_os->add_object) return UINT16_MAX;
     return tls_current_os->add_object(tls_current_os, obj, xform);
 }
-object_t* api_scene_get_object(uint16_t id) {
+object_t* api_scene3d_get_object(uint16_t id) {
     if (!tls_current_os || !tls_current_os->get_object) return NULL;
     return tls_current_os->get_object(tls_current_os, id);
 }
-transform_t* api_scene_get_transform(uint16_t id) {
+transform_t* api_scene3d_get_transform(uint16_t id) {
     if (!tls_current_os || !tls_current_os->get_transform) return NULL;
     return tls_current_os->get_transform(tls_current_os, id);
 }

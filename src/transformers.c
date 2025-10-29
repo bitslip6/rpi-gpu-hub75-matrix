@@ -20,7 +20,7 @@
  * @param scene - the scene information
  * @return uint8_t* - pointer to the output buffer
  */
-uint8_t *u_mapper_impl(const uint8_t *image_in, uint8_t *image_out, const struct scene_info *scene) {
+uint8_t *u_mapper_impl(const uint8_t *image_in, uint8_t *image_out, const struct hub75_display *scene) {
     static uint8_t *output_image = NULL;
     if (output_image == NULL) {
         debug("Allocating memory for u_mapper\n"); 
@@ -66,7 +66,7 @@ uint8_t *u_mapper_impl(const uint8_t *image_in, uint8_t *image_out, const struct
 __attribute__((hot, flatten))
 uint8_t *flip_mapper(const uint8_t *image,
                              uint8_t *image_out,
-                             const scene_info *scene)
+                             const hub75_display_t *scene)
 {
     const size_t row_sz   = (size_t)scene->width * (size_t)scene->stride;
     const size_t height   = (size_t)scene->height;
@@ -117,7 +117,7 @@ static inline uint8x16_t reverse16_u8(uint8x16_t v) {
 __attribute__((hot, flatten))
 uint8_t *mirror_mapper(const uint8_t *image,
                        uint8_t *image_out,
-                       const struct scene_info *scene)
+                       const struct hub75_display *scene)
 {
     const size_t w   = (size_t)scene->width;
     const size_t h   = (size_t)scene->height;
@@ -207,7 +207,7 @@ uint8_t *mirror_mapper(const uint8_t *image,
 __attribute__((hot, flatten))
 uint8_t *mirror_flip_mapper(const uint8_t *image,
                             uint8_t *image_out,
-                            const struct scene_info *scene)
+                            const struct hub75_display *scene)
 {
     const size_t w   = (size_t)scene->width;
     const size_t h   = (size_t)scene->height;

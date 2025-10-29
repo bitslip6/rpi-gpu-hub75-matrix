@@ -26,7 +26,7 @@
  */
 
 void* render_video_fn(void *arg) {
-    scene_info *scene = (scene_info*)arg;
+    hub75_display_t *scene = (hub75_display_t*)arg;
     while (scene->do_render) {
         if (!hub_render_video(scene, scene->shader_file)) {
             break;
@@ -40,7 +40,7 @@ void* render_video_fn(void *arg) {
 
 
 
-bool hub_render_video(scene_info *scene, const char *filename) {
+bool hub_render_video(hub75_display_t *scene, const char *filename) {
     AVFormatContext *format_ctx = NULL;
     AVCodecContext  *codec_ctx  = NULL;
     const AVCodec *codec  = NULL;  // const per modern FFmpeg API (av_find_best_stream expects const AVCodec**)
@@ -116,7 +116,7 @@ bool hub_render_video(scene_info *scene, const char *filename) {
                           0, codec_ctx->height,
                           frame_rgb->data, frame_rgb->linesize);
 
-                map_byte_image_to_bcm(scene, frame_rgb->data[0]);
+                hub75_display_map_image_to_bcm(scene, frame_rgb->data[0]);
 
                 // optional: show fps
                 AVRational fr = format_ctx->streams[video_stream_index]->avg_frame_rate;

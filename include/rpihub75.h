@@ -277,7 +277,7 @@ void apply_noise_dithering(uint8_t *image, int width, int height);
  * will die() if invalid configuration is found
  * @param scene 
  */
-void check_scene(const scene_info *scene);
+void check_scene(const hub75_display_t *scene);
 
 
 /**
@@ -285,7 +285,7 @@ void check_scene(const scene_info *scene);
  * 
  * @param scene 
  */
-void *render_forever(const scene_info *scene);
+void *hub75_display_run(const hub75_display_t *scene);
 
 /**
  * @brief initialize the hub75gpu library

@@ -108,7 +108,7 @@ static float calculate_gradient_factor(int x, int y, int minx, int miny, int max
  * Fills pixels from x0 to x1 (inclusive) on row y with gradient colors.
  * Uses the simple gradient system with two colors, direction, and easing.
  */
-void gradient_fill(scene_info *scene, int y, int x0, int x1, 
+void gradient_fill(hub75_display_t *scene, int y, int x0, int x1, 
                                              const SimpleGradient *gradient, 
                                              int minx, int miny, int maxx, int maxy) {
     if ((unsigned)y >= (unsigned)scene->height) return;
@@ -157,7 +157,7 @@ void gradient_fill(scene_info *scene, int y, int x0, int x1,
  * 3. For each scanline, find edge intersections
  * 4. Fill between intersection pairs using gradient colors
  */
-void gradient_polygon(scene_info *scene, Polygonf_t *poly, SimpleGradient gradient)
+void gradient_polygon(hub75_display_t *scene, Polygonf_t *poly, SimpleGradient gradient)
 {
     if (!scene || !scene->image || !poly || poly->num_points < 3) {
         debug("gradient_polygon: bad args\n");

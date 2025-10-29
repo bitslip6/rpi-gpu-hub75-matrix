@@ -118,7 +118,7 @@ int cpu_get_pi_model(void) {
 // --------------- Graceful Shutdown Handling ---------------------
 
 static int g_sigpipe[2] = {-1, -1};
-scene_info *g_scene = NULL;
+hub75_display_t *g_scene = NULL;
 
 /**
  * @brief signal handler for graceful shutdown on SIGINT/SIGTERM
@@ -128,7 +128,7 @@ scene_info *g_scene = NULL;
 static void signal_handler(int sig) {
     debug(" [@] Signal %d received, shutting down g_scene: [%p]...\n", sig, (void *)g_scene); 
 
-    if (g_scene != nullptr) {
+    if (g_scene != NULL) {
         g_scene->do_render = false;
     }
     if (g_sigpipe[1] != -1) {
@@ -151,6 +151,6 @@ void signal_handler_install(void) {
     sa.sa_handler = signal_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART;
-    sigaction(SIGINT,  &sa, nullptr);
-    sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 }

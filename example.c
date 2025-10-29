@@ -77,8 +77,8 @@ static bool has_extension(const char *filename, const char *extension) {
 
 static void *render_3d(void *arg) {
 
-    scene_info *scene = (scene_info*)arg;
-    hub75gpu_t api = hub75gpu(scene);
+    hub75_display_t *scene = (hub75_display_t*)arg;
+    hub75gpu_t api = hub75_api(scene);
     scene->stride = 3;
 
     // camera setup 
@@ -87,7 +87,7 @@ static void *render_3d(void *arg) {
     // create a cube object
     object_t    *cube       = api.geo_cube(DRAW_FILLED, true);
     transform_t *cube_xform = api.geo_transform();
-    cube_xform->scale       = (vec3){1.5f, 1.5f, 1.5f};  // Scale up the cube 
+    //cube_xform->scale       = (vec3){1.5f, 1.5f, 1.5f};  // Scale up the cube 
 
     // set cube edge color to red
     for (int i=0; i<cube->edge_colors->length; ++i) {
@@ -95,11 +95,11 @@ static void *render_3d(void *arg) {
     }
 
     // build an object scene and use convenience wrappers (no need to pass os repeatedly)
-    object_scene_t *os = api.scene_new(1);
-    api.scene_set_current(os);
-    api.scene_set_ambient(COLOR_DARK_GREY);
-    uint16_t light1_id = api.scene_add_directional((light_vec3){-0.5f, 1.0f, 0.2f}, COLOR_WHITE, 1.0f, false);
-    uint16_t cube_id = api.scene_add_object(cube, cube_xform);
+    scene3d_t *os = api.scene3d_new(1);
+    api.scene3d_set_current(os);
+    api.scene3d_set_ambient(COLOR_DARK_GREY);
+    uint16_t light1_id = api.scene3d_add_directional((light_vec3){-0.5f, 1.0f, 0.2f}, COLOR_WHITE, 1.0f, false);
+    uint16_t cube_id = api.scene3d_add_object(cube, cube_xform);
 
     for (int frame = 0; frame < 1; ++frame) {
         float t = (float)frame * 0.016f;
@@ -114,13 +114,13 @@ static void *render_3d(void *arg) {
         cam->target     = cube_xform->position;
 
     // Render using scene-owned lighting (pass NULL)
-    api.render_scene(cam, os, NULL);
+    api.render_scene3d(cam, os, NULL);
     }
 
     stbi_write_png("out2.png", scene->width, scene->height, 3, scene->image, scene->width * scene->stride);
     
     /* cleanup */
-    api.scene_clear_current();
+    api.scene3d_clear_current();
     api_object_scene_free(os);
 
     return NULL;
@@ -128,7 +128,7 @@ static void *render_3d(void *arg) {
 
 
 static void *render_cpu(void *arg) {
-    scene_info *scene = (scene_info*)arg;
+    hub75_display_t *scene = (hub75_display_t*)arg;
     printf("[CPU] CPU Single moving triangle (Ctrl+C to exit)\n");
 
     // Random velocities (pixels/frame), small magnitudes
@@ -153,7 +153,7 @@ static void *render_cpu(void *arg) {
     RGB color1 = { 32, 255, 160 };
     // RGB color2 = { 160, 232, 32 };
 
-    hub75gpu_t api = hub75gpu(scene);
+    hub75gpu_t api = hub75_api(scene);
 
     uint32_t frame = 0;
     while (scene->do_render) {
@@ -188,7 +188,7 @@ static void *render_cpu(void *arg) {
     }
 
     //printf(" * CPU render thread calling shutdown ...\n");
-    hub75_request_shutdown(scene);
+    hub75_display_request_shutdown(scene);
     printf(" ## CPU render thread exiting...\n");
     return NULL;
 }
@@ -201,12 +201,12 @@ int main(int argc, char **argv) {
     srand((unsigned)time(NULL));
 
     // Parse command line into a new scene. Use -h to see available options.
-    scene_info *scene = scene_parse(argc, argv);
+    hub75_display_t *scene = hub75_display_parse_args(argc, argv);
 
     scene->stride = 4;
 
     // Validate configuration, allocate internal buffers, etc.
-    scene_start(scene);
+    hub75_display_start(scene);
 
     render_3d(scene);
     exit(1);
@@ -222,9 +222,9 @@ int main(int argc, char **argv) {
     pthread_create(&scene->render_thread, NULL, render_shader, scene);
 
     printf("waiting forever...\n");
-    render_forever(scene);
+    hub75_display_run(scene);
 
-    hub75_wait_shutdown(scene);
+    hub75_display_wait(scene);
     return 0;
 
 
@@ -257,6 +257,6 @@ int main(int argc, char **argv) {
     // render_forever(scene);
 
     // wait on threads...
-    hub75_wait_shutdown(scene);
+    hub75_display_wait(scene);
     return 0; // not reached
 }

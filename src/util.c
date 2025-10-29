@@ -278,10 +278,10 @@ int parse_panel_offsets(const char *arg,
 /**
  * @brief creae a new scene with default values
  */
-scene_info *scene_new() {
+hub75_display_t *hub75_display_new() {
     // setup all scene configuration info
-    scene_info *scene = (scene_info*)malloc(sizeof(scene_info));
-    memset(scene, 0, sizeof(scene_info));
+    hub75_display_t *scene = (hub75_display_t*)malloc(sizeof(hub75_display_t));
+    memset(scene, 0, sizeof(hub75_display_t));
     scene->width = IMG_WIDTH;
     scene->height = IMG_HEIGHT;
     scene->panel_height = PANEL_HEIGHT;
@@ -364,10 +364,10 @@ char *get_nth_token(const char *str, char delimiter, int position) {
  * @param argv 
  * @return scene_info* 
  */
-scene_info *scene_parse(int argc, char **argv) {
+hub75_display_t *hub75_display_parse_args(int argc, char **argv) {
 
     // initialize the new scene
-    scene_info *scene = scene_new();
+    hub75_display_t *scene = hub75_display_new();
 
     // print usage if no arguments
     if (argc < 2) { 
@@ -573,7 +573,7 @@ scene_info *scene_parse(int argc, char **argv) {
 
 
 
-extern scene_info *g_scene;
+extern hub75_display_t *g_scene;
 
 /**
  * @brief die with a message
@@ -586,7 +586,7 @@ void die(const char *format, ...) {
     vfprintf(stderr, format, args);
     va_end(args);
 
-    hub75_request_shutdown(g_scene);
+    hub75_display_request_shutdown(g_scene);
 
     exit(1);
 }
@@ -1183,7 +1183,7 @@ void usage(__attribute__((unused))int argc, char **argv) {
  * @return void* 
  */
 void *calibrate_panels(void *arg) {
-    scene_info *scene = (scene_info*)arg;
+    hub75_display_t *scene = (hub75_display_t*)arg;
     printf("Point your browser to: calibration.html the rpi_gpu_hub75_matrix directory\n");
     printf("After calibrating each set of vertical bar.  press any key on your browser window to continue\n\n");
 
@@ -1220,7 +1220,7 @@ void *calibrate_panels(void *arg) {
     RGB c5 = {0xce, 0x9e, 0x00};
     */
 
-    // const scene_info *scene = (scene_info*)arg;
+    // const hub75_display_t *scene = (hub75_display_t*)arg;
     const size_t image_size = (size_t)(scene->width * scene->height * 4);
     uint8_t *image          = (uint8_t*)malloc(image_size);
     memset(image, 0, image_size);
@@ -1243,7 +1243,7 @@ void *calibrate_panels(void *arg) {
             }
         }
 
-        map_byte_image_to_bcm(scene, image);
+    hub75_display_map_image_to_bcm(scene, image);
         char ch = getch();
         if (ch == 'a') {
             scene->gamma -= 0.01f;
@@ -1318,7 +1318,7 @@ void *calibrate_panels(void *arg) {
  * @return void* 
  */
 void* receive_udp_data(void *arg) {
-    scene_info *scene = (scene_info *)arg; // dereference the scene info
+    hub75_display_t *scene = (hub75_display_t *)arg; // dereference the scene info
     int sock;
     struct sockaddr_in server_addr;
     struct udp_packet packet;
@@ -1368,7 +1368,7 @@ void* receive_udp_data(void *arg) {
         memcpy(image_data + ((frame_num * max_frame_sz) + frame_off), packet.data, PACKET_SIZE - 10);
         if (packet_id == total_packets) {
             // map to bcm data
-            map_byte_image_to_bcm(scene, image_data + (frame_num * max_frame_sz));
+            hub75_display_map_image_to_bcm(scene, image_data + (frame_num * max_frame_sz));
         }
 
     }

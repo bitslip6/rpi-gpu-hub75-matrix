@@ -52,7 +52,7 @@
 
 
 // Graceful shutdown helpers --------------------------------------------------
-void hub75_request_shutdown(struct scene_info *scene) {
+void hub75_display_request_shutdown(struct hub75_display *scene) {
     if (!scene) {
         printf("unable to request shutdown, no scene provided\n");
         return;
@@ -61,10 +61,10 @@ void hub75_request_shutdown(struct scene_info *scene) {
     scene->do_render = false;
     //update_bcm_signal_64_rgb(scene, NULL, NULL, NULL, 0);
 
-    hub75_wait_shutdown(scene);
+    hub75_display_wait(scene);
 }
 
-void hub75_wait_shutdown(struct scene_info *scene) {
+void hub75_display_wait(struct hub75_display *scene) {
     if (!scene) {
         printf("unable to wiat shutdown, no scene provided\n");
         return;
@@ -120,13 +120,13 @@ uint32_t row_to_address(int y, uint16_t half_height) {
 }
 
 
-extern scene_info *g_scene;
+extern hub75_display_t *g_scene;
 /**
  * @brief verify that the scene configuration is valid
  * will die() if invalid configuration is found
  * @param scene 
  */
-void scene_start(scene_info *scene) {
+void hub75_display_start(hub75_display_t *scene) {
     debug("ports: %d, chains: %d, width: %d, height: %d, stride: %d, bit_depth: %d\n", 
         scene->num_ports, scene->num_chains, scene->width, scene->height, scene->stride, scene->bit_depth);
 
@@ -210,7 +210,7 @@ void scene_start(scene_info *scene) {
 /**
  * internal method for rendering on pi zero, 3 and 4
  */
-void* render_forever_pi4(const scene_info *scene, int version) {
+void* render_forever_pi4(const hub75_display_t *scene, int version) {
 
     uint32_t *PERIBase = map_gpio(version);
     if (version == 4) {
@@ -332,7 +332,7 @@ static inline void io_store_barrier(void) {
  * scene->do_render = false; // will cause render_forever to exit from another thread
  * 
  */
-void* render_forever(const scene_info *scene) {
+void* hub75_display_run(const hub75_display_t *scene) {
 
     int cpu_model = cpu_get_pi_model();
     debug(" [+] render_forever CPU model %d: pinning to CPU 3\n", cpu_model);

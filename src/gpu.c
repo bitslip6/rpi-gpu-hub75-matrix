@@ -662,14 +662,14 @@ void cleanup_gpu_context(gpu_context_t *ctx)
  *              the shader program from a shadertoy file, sets up vertex buffers and textures,
  *              and enters the main rendering loop. It handles asynchronous readback using PBOs (if enabled)
  *              or CPU readback, and adjusts frame rate dynamically. This function is executed in a separate
- *              thread and uses the provided scene_info for configuration.
+ *              thread and uses the provided hub75_display_t for configuration.
  *
- * @param arg A pointer to a scene_info structure containing rendering parameters such as shader file,
+ * @param arg A pointer to a hub75_display_t structure containing rendering parameters such as shader file,
  *          dimensions, and FPS settings.
  */
 void *render_shader(void *arg)
 {
-    scene_info *scene = (scene_info *)arg;
+    hub75_display_t *scene = (hub75_display_t *)arg;
     debug(" ~~ render shader 2: %s\n", scene->shader_file);
     cpu_pin_thread(2); // make sure we don't run
 
