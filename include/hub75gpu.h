@@ -333,6 +333,9 @@ typedef struct hub75_display {
     pthread_t mapper_thread;
 
     bool frame_ready;
+
+    uint16_t latch_blank_cycles;
+    bool rising_edge;
     
 } hub75_display_t;
 
@@ -481,6 +484,7 @@ typedef struct hub75_api {
 
 typedef struct { float x, y; } vec2;
 typedef struct { float x, y, z; } vec3;
+typedef struct { float x, y, z, w; } vec4;
 typedef struct { float m[16]; }   mat4;  // column-major, m[col*4 + row]
 
 typedef struct {
@@ -545,9 +549,9 @@ typedef struct {
 
 object_t* object_cube(const object_draw_mode_t mode, const bool cull_backface);
 object_t* object_tetrahedron(const object_draw_mode_t mode, const bool cull_backface);
-object_t* object_octahedron(void);
+object_t* object_octahedron(const object_draw_mode_t mode, const bool cull_backface);
 object_t* object_pyramid(void);
-object_t* object_cylinder(uint16_t segments);
+object_t* object_cylinder(const uint16_t segments, const object_draw_mode_t mode, const bool cull_backface);
 object_t* object_sphere(uint16_t subdivisions);
 object_t* object_torus(uint16_t major_segments, uint16_t minor_segments);
 object_t* object_plane(uint16_t width_segments, uint16_t height_segments);
@@ -585,6 +589,11 @@ typedef struct scene3d_t {
                                 float intensity,
                                 bool casts_shadows);
 
+    /* Convenience: set position and look_at for a directional light; computes direction */
+    void (*set_directional_pose)(struct scene3d_t *os, uint16_t id,
+                                 light_vec3 position, light_vec3 look_at);
+
+    light_t *(*get_directional)(struct scene3d_t *os, uint16_t id);
     /* Object management helpers */
     uint16_t (*add_object)(struct scene3d_t *os, object_t *obj, transform_t *xform);
     object_t *(*get_object)(struct scene3d_t *os, uint16_t id);
@@ -621,9 +630,9 @@ typedef struct {
     object_t* (*geo_object)(const uint16_t num_vertices, const uint16_t num_edges, const uint16_t num_faces);
     object_t* (*geo_cube)(const object_draw_mode_t mode, const bool cull_backface);
     object_t* (*geo_tetrahedron)(const object_draw_mode_t mode, const bool cull_backface);
-    object_t* (*geo_octahedron)();
+    object_t* (*geo_octahedron)(const object_draw_mode_t mode, const bool cull_backface);
     object_t* (*geo_pyramid)();
-    object_t* (*geo_cylinder)(uint16_t segments);
+    object_t* (*geo_cylinder)(const uint16_t segments, const object_draw_mode_t mode, const bool cull_backface);
     object_t* (*geo_sphere)(uint16_t subdivisions);
     object_t* (*geo_torus)(uint16_t major_segments, uint16_t minor_segments);
     object_t* (*geo_plane)(uint16_t width_segments, uint16_t height_segments);
@@ -634,6 +643,8 @@ typedef struct {
     void (*scene3d_clear_current)(void);
     void (*scene3d_set_ambient)(RGBF ambient);
     uint16_t (*scene3d_add_directional)(light_vec3 direction, RGBF color, float intensity, bool casts_shadows);
+    void (*scene3d_set_directional_pose)(uint16_t id, light_vec3 position, light_vec3 look_at);
+    light_t* (*scene3d_get_directional)(uint16_t id);
     uint16_t (*scene3d_add_object)(object_t *obj, transform_t *xform);
     object_t* (*scene3d_get_object)(uint16_t id);
     transform_t* (*scene3d_get_transform)(uint16_t id);
@@ -668,7 +679,9 @@ void api_scene3d_set_ambient(RGBF ambient);
 uint16_t api_scene3d_add_directional(light_vec3 direction, RGBF color, float intensity, bool casts_shadows);
 uint16_t api_scene3d_add_object(object_t *obj, transform_t *xform);
 object_t* api_scene3d_get_object(uint16_t id);
+light_t* api_scene3d_get_directional(uint16_t id);
 transform_t* api_scene3d_get_transform(uint16_t id);
+void api_scene3d_set_directional_pose(uint16_t id, light_vec3 position, light_vec3 look_at);
 
 /* Common web colors (RGBF normalized 0..1) */
 #define COLOR_BLACK        (RGBF){ 0.0f, 0.0f, 0.0f }

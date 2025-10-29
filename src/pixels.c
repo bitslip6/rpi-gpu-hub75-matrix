@@ -35,7 +35,7 @@
  */
 void *mapper_thread_main(void *arg)
 {
-    debug(" ~~ BCM mapper thread started\n");
+    debug(" [+] BCM mapper thread starting\n");
 
     hub75_display_t *scene = (hub75_display_t *)arg;
 
@@ -52,7 +52,7 @@ void *mapper_thread_main(void *arg)
         spsc_pop_ptr_commit(scene->ring_buf_mapper);
     }
 
-    printf(" ## BCM mapper thread exiting...\n");
+    debug(" [-] BCM mapper thread exiting.\n");
     return NULL;
 }
 

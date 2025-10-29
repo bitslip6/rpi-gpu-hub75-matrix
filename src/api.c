@@ -117,6 +117,12 @@ static inline vec3 m4_mul_point(mat4 m, vec3 p){
     if (w != 0.0f) { x /= w; y /= w; z /= w; }
     return (vec3){x,y,z};
 }
+static inline vec3 m4_mul_point_affine(mat4 m, vec3 p){
+    float x = m.m[0]*p.x + m.m[1]*p.y + m.m[2]*p.z + m.m[3];
+    float y = m.m[4]*p.x + m.m[5]*p.y + m.m[6]*p.z + m.m[7];
+    float z = m.m[8]*p.x + m.m[9]*p.y + m.m[10]*p.z + m.m[11];
+    return (vec3){x,y,z};
+}
 static inline mat4 m4_translate(vec3 t){ mat4 r = m4_identity(); r.m[3]=t.x; r.m[7]=t.y; r.m[11]=t.z; return r; }
 static inline mat4 m4_rotate_x(float a){ float c=cosf(a), s=sinf(a); mat4 r=m4_identity(); r.m[5]=c; r.m[6]=-s; r.m[9]=s; r.m[10]=c; return r; }
 static inline mat4 m4_rotate_y(float a){ float c=cosf(a), s=sinf(a); mat4 r=m4_identity(); r.m[0]=c; r.m[2]=s; r.m[8]=-s; r.m[10]=c; return r; }
@@ -131,7 +137,7 @@ static inline mat4 build_model_matrix(const transform_t *t){
     mat4 R = m4_mul(Rz, m4_mul(Ry, Rx));
     return m4_mul(Tr, m4_mul(R, S));
 }
-static inline mat4 build_view_matrix(const camera_t *c){
+static inline mat4 build_view_matrix_old(const camera_t *c){
     vec3 f = v3_norm(v3_sub(c->target, c->position));
     vec3 up = (c->up.x==0&&c->up.y==0&&c->up.z==0)? (vec3){0,1,0} : c->up;
     vec3 s = v3_norm(v3_cross(f, up));
@@ -143,6 +149,36 @@ static inline mat4 build_view_matrix(const camera_t *c){
         -v3_dot(s, c->position), -v3_dot(u, c->position), v3_dot(f, c->position), 1.0f
     }};
     return r;
+}
+
+static inline mat4 build_view_matrix(const camera_t *c){
+    vec3 f  = v3_norm(v3_sub(c->target, c->position));
+    vec3 up = (c->up.x==0&&c->up.y==0&&c->up.z==0)? (vec3){0,1,0} : c->up;
+    vec3 s  = v3_norm(v3_cross(f, up));
+    vec3 u  = v3_cross(s, f);
+
+    // row-major, last column is translation
+    mat4 r = { .m = {
+        s.x,  u.x,  -f.x, -v3_dot(s, c->position),
+        s.y,  u.y,  -f.y, -v3_dot(u, c->position),
+        s.z,  u.z,  -f.z,  v3_dot(f, c->position),
+        0.0f, 0.0f,  0.0f, 1.0f
+    }};
+    return r;
+}
+
+static inline float tri_orientation_clip_xyw(vec4 v0, vec4 v1, vec4 v2)
+{
+    float t0 = v1.y * v2.w - v2.y * v1.w;
+    float t1 = v2.y * v0.w - v0.y * v2.w;
+    float t2 = v0.y * v1.w - v1.y * v0.w;
+    return v0.x * t0 + v1.x * t1 + v2.x * t2; // >0 = CCW, <0 = CW
+}
+
+static inline bool is_backface_ccw_clip(vec4 c0, vec4 c1, vec4 c2)
+{
+    const float s = tri_orientation_clip_xyw(c0, c1, c2);
+    return s <= 1e-12f;
 }
 
 /**
@@ -335,6 +371,7 @@ void draw_polygon_fill(hub75_display_t *scene, Polygonf_t *poly, RGB color)
     }
 
     /* Debug: verify coordinates look normalized (0..1). If they don't, log once per call. */
+    /*
     {
         float minx =  1e9f, maxx = -1e9f, miny =  1e9f, maxy = -1e9f;
         for (size_t i = 0; i < poly->num_points; ++i) {
@@ -348,6 +385,7 @@ void draw_polygon_fill(hub75_display_t *scene, Polygonf_t *poly, RGB color)
                    (double)minx, (double)miny, (double)maxx, (double)maxy);
         }
     }
+    */
 
     size_t n = poly->num_points;
     if (n > MAX_POLY_POINTS) n = MAX_POLY_POINTS;   /* truncate safely */
@@ -594,16 +632,16 @@ object_t *api_new_tetrahedron(const object_draw_mode_t draw_mode, const bool cul
     return object_tetrahedron(draw_mode, cull_backface);
 }
 
-object_t *api_new_octahedron(void) {
-    return object_octahedron();
+object_t *api_new_octahedron(const object_draw_mode_t draw_mode, const bool cull_backface) {
+    return object_octahedron(draw_mode, cull_backface);
 }
 
 object_t *api_new_pyramid(void) {
     return object_pyramid();
 }
 
-object_t *api_new_cylinder(uint16_t segments) {
-    return object_cylinder(segments);
+object_t *api_new_cylinder(const uint16_t segments, const object_draw_mode_t mode, const bool cull_backface) {
+    return object_cylinder(segments, mode, cull_backface);
 }
 
 object_t *api_new_sphere(uint16_t subs) {
@@ -765,78 +803,76 @@ void api_geo_render_wire(const camera_t *cam, object_t *obj, const transform_t *
     if (front_face) free(front_face);
 }
 
+typedef struct {
+    float depth;      /* average NDC z */
+    Polygonf_t poly;  /* 3 points normalized to [0,1] */
+    RGB color;        /* shaded color */
+} _TriFill;
+
+/* qsort comparator: sort by depth descending (far to near) */
+static int _cmp_trifill_desc(const void *a, const void *b) {
+    const _TriFill *ta = (const _TriFill*)a;
+    const _TriFill *tb = (const _TriFill*)b;
+    if (ta->depth < tb->depth) return 1;   /* b before a */
+    if (ta->depth > tb->depth) return -1;  /* a before b */
+    return 0;
+}
+
 void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene3d_lighting_t *lighting) {
     if (!obj || !obj->faces || !obj->verticies) return;
     mat4 mvp = camera_project(cam, obj_xform);
-    
-    // Transform vertices to NDC space
+
+    /* Transform all vertices to NDC */
     transform_mesh_to_ndc(obj->verticies->list, obj->verticies->length, mvp, obj->rendered_vertices);
-    
-    // Precompute world normal matrix only if lighting is provided 
+
+    /* Precompute world normal matrix only if lighting is provided */
     float N3[9];
     if (lighting) {
         mat4 M_model = model_matrix(obj_xform);
         normal_matrix_from_model(M_model, N3);
     }
 
-    // Render each triangle face 
-    for (size_t i = 0; i < obj->faces->length; i++) {
+    size_t nf = obj->faces->length;
+    _TriFill *tri = (_TriFill*)malloc(sizeof(_TriFill) * nf);
+    if (!tri) return;
+    size_t tcount = 0;
+
+    for (size_t i = 0; i < nf; i++) {
         vec3 face = obj->faces->list[i];
-        
-        /* Get the three vertices of the triangle */
         vec3 v1 = obj->rendered_vertices[(size_t)face.x];
         vec3 v2 = obj->rendered_vertices[(size_t)face.y];
         vec3 v3 = obj->rendered_vertices[(size_t)face.z];
 
-        // Optional backface culling using NDC winding (CCW = front) 
+        /* Backface culling in NDC (CCW = front) */
         if (obj->cull_backface) {
-            float ax = v2.x - v1.x;
-            float ay = v2.y - v1.y;
-            float bx = v3.x - v1.x;
-            float by = v3.y - v1.y;
-            float area = ax * by - ay * bx; // signed area in NDC (y up) 
-            if (area < 0.0f) {
-                continue; // back-facing
-            }
+            float ax = v2.x - v1.x, ay = v2.y - v1.y;
+            float bx = v3.x - v1.x, by = v3.y - v1.y;
+            float area = ax * by - ay * bx;
+            if (area < 0.0f) continue;
         }
-        
-    // Convert NDC to normalized screen coordinates [0,1] 
-    float nx1 = 0.5f * (v1.x + 1.0f);
-    float ny1 = 0.5f * (v1.y + 1.0f);
-    float nx2 = 0.5f * (v2.x + 1.0f);
-    float ny2 = 0.5f * (v2.y + 1.0f);
-    float nx3 = 0.5f * (v3.x + 1.0f);
-    float ny3 = 0.5f * (v3.y + 1.0f);
 
-    // Create a triangle polygon for rendering (expects normalized 0..1) 
-    Polygonf_t triangle;
-    triangle.num_points = 3;
-    triangle.points[0] = (Pointf_t){nx1, ny1};
-    triangle.points[1] = (Pointf_t){nx2, ny2};
-    triangle.points[2] = (Pointf_t){nx3, ny3};
-        
-        // Base face/albedo color (index by face; fallback white)
+        float nx1 = 0.5f * (v1.x + 1.0f);
+        float ny1 = 0.5f * (v1.y + 1.0f);
+        float nx2 = 0.5f * (v2.x + 1.0f);
+        float ny2 = 0.5f * (v2.y + 1.0f);
+        float nx3 = 0.5f * (v3.x + 1.0f);
+        float ny3 = 0.5f * (v3.y + 1.0f);
+
+        /* Shade */
         RGB base_rgb = (i < obj->edge_colors->length) ? obj->edge_colors->list[i] : (RGB){255,255,255};
-
-        // Flat Lambert shading (world space): N from model normal matrix, lights from `lighting` 
         RGB shaded_rgb = base_rgb;
         if (lighting) {
-
             vec3 n_obj = (obj->normals && i < obj->normals->length) ? obj->normals->list[i] : (vec3){0,0,1};
-            // transform and normalize 
             vec3 n_world = mat3_mul_vec3(N3, n_obj);
             float n_len = sqrtf(n_world.x*n_world.x + n_world.y*n_world.y + n_world.z*n_world.z);
             if (n_len > 1e-6f) { n_world.x/=n_len; n_world.y/=n_len; n_world.z/=n_len; }
 
-            // convert base color to [0,1] 
             float br = base_rgb.r/255.0f, bg = base_rgb.g/255.0f, bb = base_rgb.b/255.0f;
-            float lr = lighting->ambient.r, lg = lighting->ambient.g, lb = lighting->ambient.b; /* start with ambient */
-
+            float lr = lighting->ambient.r, lg = lighting->ambient.g, lb = lighting->ambient.b;
             for (uint16_t li = 0; li < lighting->num_lights; ++li) {
                 const light_t *L = &lighting->lights[li];
                 if (L->intensity <= 0.0f) continue;
                 if (L->type == LIGHT_DIRECTIONAL) {
-                    // Treat direction as the direction the light shines; vector to light is -direction 
                     float Lx = -L->direction.x, Ly = -L->direction.y, Lz = -L->direction.z;
                     float Llen = sqrtf(Lx*Lx + Ly*Ly + Lz*Lz);
                     if (Llen > 1e-6f) { Lx/=Llen; Ly/=Llen; Lz/=Llen; }
@@ -847,10 +883,7 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
                         lb += L->color.b * L->intensity * ndotl;
                     }
                 }
-                // TODO: add POINT and SPOT lighting
             }
-
-            // modulate base by lighting and clamp 
             float cr = fminf(fmaxf(br * lr, 0.0f), 1.0f);
             float cg = fminf(fmaxf(bg * lg, 0.0f), 1.0f);
             float cb = fminf(fmaxf(bb * lb, 0.0f), 1.0f);
@@ -859,14 +892,153 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
             shaded_rgb.b = (uint8_t)(cb * 255.0f);
         }
 
-        if (tls_scene && tls_scene->enhanced_debug) {
-            printf("Filling triangle p1 (%.3f, %.3f), p2 (%.3f, %.3f), p3 (%.3f, %.3f)\n",
-                (double)nx1, (double)ny1, (double)nx2, (double)ny2, (double)nx3, (double)ny3);
-        }
-            
-        // Render the filled triangle
-        draw_polygon_fill(tls_scene, &triangle, shaded_rgb);
+        _TriFill t;
+        t.depth = (v1.z + v2.z + v3.z) / 3.0f; /* NDC z: -1 near, +1 far */
+        t.poly.num_points = 3;
+        t.poly.points[0] = (Pointf_t){nx1, ny1};
+        t.poly.points[1] = (Pointf_t){nx2, ny2};
+        t.poly.points[2] = (Pointf_t){nx3, ny3};
+        t.color = shaded_rgb;
+        tri[tcount++] = t;
     }
+
+    /* Painter's algorithm: draw far to near => sort by depth descending (far ~ +1) */
+    if (tcount > 1) {
+        qsort(tri, tcount, sizeof(_TriFill), _cmp_trifill_desc);
+    }
+
+    for (size_t i = 0; i < tcount; ++i) {
+        if (tls_scene && tls_scene->enhanced_debug) {
+            printf("Filling triangle p1 (%.3f, %.3f), p2 (%.3f, %.3f), p3 (%.3f, %.3f) depth=%.3f\n",
+                (double)tri[i].poly.points[0].x, (double)tri[i].poly.points[0].y,
+                (double)tri[i].poly.points[1].x, (double)tri[i].poly.points[1].y,
+                (double)tri[i].poly.points[2].x, (double)tri[i].poly.points[2].y,
+                (double)tri[i].depth);
+        }
+        draw_polygon_fill(tls_scene, &tri[i].poly, tri[i].color);
+    }
+
+    free(tri);
+}
+
+/* --- Clip-space XYW orientation helpers for robust backface culling --- */
+static inline vec4 mat4_mul_point_clip_xyw(const mat4 m, const vec3 p) {
+    /* Column-major multiply with column vector: clip = M * [p.x, p.y, p.z, 1]^T */
+    float x = m.m[0]*p.x + m.m[4]*p.y + m.m[8]*p.z + m.m[12];
+    float y = m.m[1]*p.x + m.m[5]*p.y + m.m[9]*p.z + m.m[13];
+    float z = m.m[2]*p.x + m.m[6]*p.y + m.m[10]*p.z + m.m[14];
+    float w = m.m[3]*p.x + m.m[7]*p.y + m.m[11]*p.z + m.m[15];
+    (void)z; /* z not needed for orientation, but kept for completeness */
+    return (vec4){x, y, z, w};
+}
+
+/* Wireframe renderer that culls backfaces using clip-space XYW orientation */
+void api_geo_render_wire_clip_cull(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene3d_lighting_t *lighting) {
+    (void)lighting; /* not used for wireframe */
+    if (!obj || !obj->verticies || !obj->edges) return;
+
+    /* Build MVP and compute both: clip-space XYW (for culling) and NDC (for raster) */
+    mat4 mvp = camera_project(cam, obj_xform);
+
+    /* Compute clip-space for all vertices (keep x,y,w) */
+    size_t nv = obj->verticies->length;
+    vec4 *clip_xyw = (vec4*)malloc(sizeof(vec4) * nv);
+    if (!clip_xyw) return;
+    for (size_t i = 0; i < nv; ++i) {
+        vec3 p = obj->verticies->list[i];
+        clip_xyw[i] = mat4_mul_point_clip_xyw(mvp, p);
+    }
+
+    /* Also compute NDC positions used for drawing */
+    transform_mesh_to_ndc(obj->verticies->list, obj->verticies->length, mvp, obj->rendered_vertices);
+
+    const uint16_t w = (uint16_t)(tls_scene->width * 0.5f);
+    const uint16_t h = (uint16_t)(tls_scene->height * 0.5f);
+
+    bool do_cull_edges = obj->cull_backface && obj->faces && obj->faces->length > 0;
+    bool *front_face = NULL;
+    if (do_cull_edges) {
+        size_t nf = obj->faces->length;
+        front_face = (bool*)calloc(nf, sizeof(bool));
+        if (front_face) {
+            /* Allow compile-time flip of front-face convention if needed */
+            #ifndef FRONT_FACE_CCW
+            #define FRONT_FACE_CCW 1
+            #endif
+            size_t front_count = 0;
+            for (size_t i = 0; i < nf; ++i) {
+                vec3 f = obj->faces->list[i];
+                vec4 a = clip_xyw[(size_t)f.x];
+                vec4 b = clip_xyw[(size_t)f.y];
+                vec4 c = clip_xyw[(size_t)f.z];
+                float orient = tri_orientation_clip_xyw(a, b, c);
+                /* CCW => front by default. Flip with FRONT_FACE_CCW==0 if needed. */
+                bool is_front = FRONT_FACE_CCW ? (orient > 0.0f) : (orient < 0.0f);
+                front_face[i] = is_front;
+                if (is_front) front_count++;
+            }
+            /* Safety: if nothing classified as front, disable culling to avoid blank output */
+            if (front_count == 0) {
+                if (tls_scene && tls_scene->enhanced_debug) {
+                    printf("Clip-cull: 0 front faces detected; disabling cull for this object.\n");
+                }
+                do_cull_edges = false;
+                free(front_face); front_face = NULL;
+            }
+        } else {
+            do_cull_edges = false;
+        }
+    }
+
+    for (size_t i = 0; i < obj->edges->length; i++) {
+        vec2 edge = obj->edges->list[i];
+        vec3 v1 = obj->rendered_vertices[(size_t)edge.x];
+        vec3 v2 = obj->rendered_vertices[(size_t)edge.y];
+
+        /* If culling, only draw this edge if it belongs to any front-facing face */
+        if (do_cull_edges) {
+            uint16_t a = (uint16_t)edge.x;
+            uint16_t b = (uint16_t)edge.y;
+            bool draw_edge = false;
+            for (size_t fi = 0; fi < obj->faces->length; ++fi) {
+                if (!front_face[fi]) continue;
+                vec3 f = obj->faces->list[fi];
+                uint16_t i0 = (uint16_t)f.x, i1 = (uint16_t)f.y, i2 = (uint16_t)f.z;
+                /* unordered edge match against triangle edges */
+                if ((a==i0 && b==i1) || (a==i1 && b==i0) ||
+                    (a==i1 && b==i2) || (a==i2 && b==i1) ||
+                    (a==i2 && b==i0) || (a==i0 && b==i2)) {
+                    draw_edge = true;
+                    break;
+                }
+            }
+            if (!draw_edge) continue;
+        }
+
+        /* Simple z clipping in NDC space */
+        if (v1.z < -1.0f || v1.z > 1.0f || v2.z < -1.0f || v2.z > 1.0f) {
+            if (tls_scene && tls_scene->enhanced_debug) {
+                printf("Skipping edge %zu due to z clipping: V1.z=%.3f, V2.z=%.3f\n", i, (double)v1.z, (double)v2.z);
+            }
+            continue;
+        }
+
+        int x1 = (int)(w * (v1.x + 1.0f));
+        int y1 = (int)(h * (v1.y + 1.0f));
+        int x2 = (int)(w * (v2.x + 1.0f));
+        int y2 = (int)(h * (v2.y + 1.0f));
+
+        /* Clamp to screen bounds */
+        x1 = (x1 < 0) ? 0 : (x1 >= tls_scene->width) ? tls_scene->width - 1 : x1;
+        y1 = (y1 < 0) ? 0 : (y1 >= tls_scene->height) ? tls_scene->height - 1 : y1;
+        x2 = (x2 < 0) ? 0 : (x2 >= tls_scene->width) ? tls_scene->width - 1 : x2;
+        y2 = (y2 < 0) ? 0 : (y2 >= tls_scene->height) ? tls_scene->height - 1 : y2;
+
+        hub_line_aa(tls_scene, (uint16_t)x1, (uint16_t)y1, (uint16_t)x2, (uint16_t)y2, obj->edge_colors->list[i]);
+    }
+
+    if (front_face) free(front_face);
+    free(clip_xyw);
 }
 
 /* Render a list of object instances with per-object draw mode */
@@ -885,7 +1057,8 @@ static void api_render_scene3d(const camera_t *cam, const scene3d_t *os, const s
                 break;
             case DRAW_WIRE:
             default:
-                api_geo_render_wire(cam, obj, xf, L);
+                /* Use clip-space culling variant for consistency with API table */
+                api_geo_render_wire_clip_cull(cam, obj, xf, L);
                 break;
         }
     }
@@ -956,6 +1129,23 @@ static uint16_t os_add_directional(scene3d_t *os,
     return n;
 }
 
+/* Set a directional light using a camera-like pose (position + look_at) */
+static void os_set_directional_pose(scene3d_t *os, uint16_t id,
+                                    light_vec3 position, light_vec3 look_at) {
+    if (!os || id >= os->lighting.num_lights || !os->lighting.lights) return;
+    light_t *L = &os->lighting.lights[id];
+    /* Store position for completeness */
+    L->position = position;
+    /* Compute direction = normalize(look_at - position) */
+    float dx = look_at.x - position.x;
+    float dy = look_at.y - position.y;
+    float dz = look_at.z - position.z;
+    float len = sqrtf(dx*dx + dy*dy + dz*dz);
+    if (len > 1e-6f) { dx/=len; dy/=len; dz/=len; }
+    else { dx = 0.0f; dy = -1.0f; dz = 0.0f; }
+    L->direction = (light_vec3){ dx, dy, dz };
+}
+
 static uint16_t os_add_object(scene3d_t *os, object_t *obj, transform_t *xform) {
     if (!os || !obj || !xform) return UINT16_MAX;
     /* Ensure capacity */
@@ -983,6 +1173,11 @@ static object_t *os_get_object(scene3d_t *os, uint16_t id) {
     return os->instances[id].object;
 }
 
+static light_t *os_get_directional(scene3d_t *os, uint16_t id) {
+    if (!os || id >= os->lighting.num_lights) return NULL;
+    return &os->lighting.lights[id];
+}
+
 static transform_t *os_get_transform(scene3d_t *os, uint16_t id) {
     if (!os || id >= os->count) return NULL;
     return os->instances[id].xform;
@@ -1004,6 +1199,8 @@ scene3d_t *api_object_scene_new(uint16_t object_count) {
     // Wire OO-style helpers 
     os->set_ambient = os_set_ambient;
     os->add_directional = os_add_directional;
+    os->set_directional_pose = os_set_directional_pose;
+    os->get_directional = os_get_directional;
     os->add_object = os_add_object;
     os->get_object = os_get_object;
     os->get_transform = os_get_transform;
@@ -1057,7 +1254,7 @@ static const hub75gpu_t api_table = {
     .geo_camera = api_new_camera,
     .geo_transform = api_new_transform,
     .geo_project = api_geo_project,
-    .render_wire = api_geo_render_wire,
+    .render_wire = api_geo_render_wire_clip_cull,
     .render_filled = api_geo_render_filled,
     .render_scene3d = api_render_scene3d,
     .scene3d_new = api_object_scene_new,
@@ -1070,6 +1267,8 @@ static const hub75gpu_t api_table = {
     .scene3d_clear_current = api_scene3d_clear_current,
     .scene3d_set_ambient = api_scene3d_set_ambient,
     .scene3d_add_directional = api_scene3d_add_directional,
+    .scene3d_set_directional_pose = api_scene3d_set_directional_pose,
+    .scene3d_get_directional = api_scene3d_get_directional,
     .scene3d_add_object = api_scene3d_add_object,
     .scene3d_get_object = api_scene3d_get_object,
     .scene3d_get_transform = api_scene3d_get_transform,
@@ -1110,8 +1309,19 @@ object_t* api_scene3d_get_object(uint16_t id) {
     if (!tls_current_os || !tls_current_os->get_object) return NULL;
     return tls_current_os->get_object(tls_current_os, id);
 }
+light_t* api_scene3d_get_directional(uint16_t id) {
+    if (!tls_current_os || !tls_current_os->get_directional) return NULL;
+    return tls_current_os->get_directional(tls_current_os, id);
+}
+
 transform_t* api_scene3d_get_transform(uint16_t id) {
     if (!tls_current_os || !tls_current_os->get_transform) return NULL;
     return tls_current_os->get_transform(tls_current_os, id);
+}
+
+void api_scene3d_set_directional_pose(uint16_t id, light_vec3 position, light_vec3 look_at) {
+    if (tls_current_os && tls_current_os->set_directional_pose) {
+        tls_current_os->set_directional_pose(tls_current_os, id, position, look_at);
+    }
 }
 

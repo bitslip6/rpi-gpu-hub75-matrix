@@ -28,13 +28,13 @@ bool enable_rt_and_lock_mem(void) {
 
     bool is_realtime = false;
     if (sched_setscheduler(0, SCHED_RR, &sp) != 0) {
-        debug(" * Try running as root to enable real-time scheduling\n");
+        debug(" [_] Try running as root to enable real-time scheduling\n");
     } else {
-        debug(" * Real-time scheduling enabled\n");
+        debug(" [^] Real-time scheduling enabled\n");
         is_realtime = true;
     }
     if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
-        debug(" * Try running as root to enable memory locking to reduce page faults\n");
+        // debug(" * Try running as root to enable memory locking to reduce page faults\n");
     }
 
     return is_realtime;

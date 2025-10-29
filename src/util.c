@@ -315,6 +315,8 @@ hub75_display_t *hub75_display_new() {
     scene->fps = 60;
     scene->show_fps = FALSE;
     scene->enhanced_debug = false;
+    scene->latch_blank_cycles = 2;
+    scene->rising_edge = true;
 
     return scene;
 }
@@ -377,8 +379,11 @@ hub75_display_t *hub75_display_parse_args(int argc, char **argv) {
     // Parse command-line options
     int opt = 0;
     int num_scales = 0;
-    while ((opt = getopt(argc, argv, "O:T:P:o:x:y:X:Y:s:f:p:c:g:d:m:b:t:l:i:jzvqh?")) != -1) {
+    while ((opt = getopt(argc, argv, "O:T:P:o:x:y:X:Y:s:f:p:c:g:d:m:b:a:t:l:i:jrzvqh?")) != -1) {
         switch (opt) {
+        case 'r':
+            scene->rising_edge = false;
+            break;
         case 's':
             scene->shader_file = optarg;
             break;
@@ -404,6 +409,9 @@ hub75_display_t *hub75_display_parse_args(int argc, char **argv) {
             break;
         case 'p':
             scene->num_ports = ato8(optarg);
+            break;
+        case 'a':
+            scene->latch_blank_cycles = ato16(optarg);
             break;
         case 'c':
             uint8_t t = ato8(optarg);
@@ -972,8 +980,7 @@ unsigned long calculate_fps(const uint16_t target_fps, const bool show_fps) {
                 if (percent < 0.0) percent = 0.0;
                 if (percent > 100.0) percent = 100.0;
             }
-            printf("%ld, FPS: %lu, micro second sleep per frame: %ld, CPU: %.1f%%\n",
-                   frame_time_us, frame_count, sleep_time_us, percent);
+            printf("[%.1f%%] CPU, FPS: %lu\n", percent, frame_count);
         }
         window_start_ts = now_ts;  /* start a new one second window */
         frame_count = 0;
@@ -1149,8 +1156,8 @@ void usage(__attribute__((unused))int argc, char **argv) {
         "     -i <mapper>       image mapper (mirror, flip, mirror_flip)\n"
         "     -t <tone_mapper>  (aces, reinhard, none, saturation, sigmoid, hable)\n"
         "     -j                adjust brightness in pixel BCM, only for Pi3-4\n"
-        // "     -z                run LED calibration script\n"
-        // "     -n                display data from UDP server on port %d (untested)\n"
+        "     -r                clock in data on the FALLING edge of the clock (default is rising)\n"
+        "     -a <cycles>       latch delay CPU cycles for slow panels. (0 - 1024) (default 0)\n"
         "     -v                display current FPS and Panel refresh Hz\n"
     "     -K                enable backface culling for filled geometry\n"
         "     -O <r:g:b,r:g:b>  panel color correction offset ammount, +-128 for each color, comma delimited\n"

@@ -111,12 +111,18 @@ static PyObject* py_geo_object(PyObject *self, PyObject *args) {
 
 static PyObject* py_geo_tetrahedron(PyObject *self, PyObject *args) {
     if (!require_api()) return NULL;
-    object_t *obj = g_api.geo_tetrahedron();
+    int mode_int = 0; int cull = 1;
+    if (!PyArg_ParseTuple(args, "ip", &mode_int, &cull)) return NULL;
+    object_draw_mode_t mode = (object_draw_mode_t)mode_int;
+    object_t *obj = g_api.geo_tetrahedron(mode, cull ? true : false);
     return cap_from_ptr(obj, CAPS_OBJECT, NULL);
 }
 static PyObject* py_geo_octahedron(PyObject *self, PyObject *args) {
     if (!require_api()) return NULL;
-    object_t *obj = g_api.geo_octahedron();
+    int mode_int = 0; int cull = 1;
+    if (!PyArg_ParseTuple(args, "ip", &mode_int, &cull)) return NULL;
+    object_draw_mode_t mode = (object_draw_mode_t)mode_int;
+    object_t *obj = g_api.geo_octahedron(mode, cull ? true : false);
     return cap_from_ptr(obj, CAPS_OBJECT, NULL);
 }
 static PyObject* py_geo_pyramid(PyObject *self, PyObject *args) {
@@ -309,8 +315,8 @@ static PyMethodDef Hub75Methods[] = {
     {"geo_transform", (PyCFunction)py_geo_transform, METH_NOARGS, "Create a new transform (capsule)."},
     {"geo_object", (PyCFunction)py_geo_object, METH_VARARGS, "Create a raw object with counts."},
     {"geo_cube", (PyCFunction)py_geo_cube, METH_VARARGS, "Create a cube object."},
-    {"geo_tetrahedron", (PyCFunction)py_geo_tetrahedron, METH_NOARGS, "Create a tetrahedron object."},
-    {"geo_octahedron", (PyCFunction)py_geo_octahedron, METH_NOARGS, "Create an octahedron object."},
+    {"geo_tetrahedron", (PyCFunction)py_geo_tetrahedron, METH_VARARGS, "Create a tetrahedron object."},
+    {"geo_octahedron", (PyCFunction)py_geo_octahedron, METH_VARARGS, "Create an octahedron object."},
     {"geo_pyramid", (PyCFunction)py_geo_pyramid, METH_NOARGS, "Create a pyramid object."},
     {"geo_cylinder", (PyCFunction)py_geo_cylinder, METH_VARARGS, "Create a cylinder object."},
     {"geo_sphere", (PyCFunction)py_geo_sphere, METH_VARARGS, "Create a sphere object."},

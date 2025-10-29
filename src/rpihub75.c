@@ -50,6 +50,14 @@
 #include "lowlevel.h"
 
 
+// delay execution for a number of cycles
+void asm_delay(int cycles) {
+    for (volatile int s=0;s<cycles;s++) { 
+        asm volatile ("" : : : "memory"); 
+        asm(""); 
+    }
+}
+
 
 // Graceful shutdown helpers --------------------------------------------------
 void hub75_display_request_shutdown(struct hub75_display *scene) {
@@ -69,21 +77,22 @@ void hub75_display_wait(struct hub75_display *scene) {
         printf("unable to wiat shutdown, no scene provided\n");
         return;
     } 
-    debug("* waiting for mapper to stop...\n");
+    debug(" [.] waiting for mapper thread to stop...\n");
     // mapper
     if (scene->mapper_thread) {
         pthread_t t = scene->mapper_thread;
         scene->mapper_thread = 0;
         pthread_join(t, NULL);
     }
-    debug(" * waiting for render to stop...\n");
+    debug(" [$] mapper thread exited and joined\n");
+    debug(" [.] waiting for render thread to stop...\n");
     // render
     if (scene->render_thread) {
         pthread_t t = scene->render_thread;
         scene->render_thread = 0;
         pthread_join(t, NULL);
     }
-    debug("all threads completed\n");
+    debug(" [$] render thread exited and joined\n");
 }
 
 
@@ -213,6 +222,12 @@ void hub75_display_start(hub75_display_t *scene) {
     // allocate memory for LUT for input 8 bit RGB to 16 bit quant error value, forgot what 256 entries for R, G, B.
     // we could probably use a single LUT for all 3 channels since they are all the same...
     scene->quant_errors_lut = (uint16_t*)calloc(768*4, sizeof(uint16_t));
+
+    // create RGB -> BCM mapper thread
+    if (pthread_create(&scene->mapper_thread, NULL, mapper_thread_main, scene) != 0) {
+        debug("failed to create mapper thread! (this is a show stopper)\n");
+        scene->do_render = false;
+    }
 
     // assign the global scene pointer for shutdown access
     g_scene = scene;
@@ -355,7 +370,7 @@ static inline void io_store_barrier(void) {
 void* hub75_display_run(const hub75_display_t *scene) {
 
     int cpu_model = cpu_get_pi_model();
-    debug(" [+] render_forever CPU model %d: pinning to CPU 3\n", cpu_model);
+    debug(" [+] display_run CPU model %d: pinning to CPU 3\n", cpu_model);
     cpu_affinity(3);
 
     if (cpu_model < 2) {
@@ -404,9 +419,11 @@ void* hub75_display_run(const hub75_display_t *scene) {
     gettimeofday(&start_time, NULL);
 
 
-    /* cache local aliases to MMIO regs, keep them volatile */
+    // reg_out allows you to turn on bits, but will not turn bits off
     volatile uint32_t *const reg_out   = &rio->Out;
+    // reg_set allows you to set the full state of the bits, on or off
     volatile uint32_t *const reg_set   = &rioSET->Out;
+    // reg_clr allows you to only clear bits
     volatile uint32_t *const reg_clr   = &rioCLR->Out;
 
 
@@ -415,6 +432,7 @@ void* hub75_display_run(const hub75_display_t *scene) {
     const uint32_t *bcm_signal; // pointer to the current bcm data to be displayed
 
     debug(" [.] waiting for first frame acquisition...\n");
+
     while (scene->do_render) {
         bcm_signal = spsc_pop_ptr_begin(scene->ring_buf_renderer, 1000);
         if (bcm_signal != NULL) {
@@ -427,7 +445,6 @@ void* hub75_display_run(const hub75_display_t *scene) {
         return NULL;
     }
     debug(" [$] first frame acquired\n");
-
 
     // lock the memory we just touched (bcm_signal)...
     bool is_realtime = enable_rt_and_lock_mem();
@@ -488,6 +505,8 @@ void* hub75_display_run(const hub75_display_t *scene) {
                 __asm__ __volatile__("" ::: "memory");
 
                 // latch the complete row into the display
+                *reg_set = PIN_OE;                 // turn OE high to disable display during latch
+                SLOW2                              // TODO: make latch time variable
                 *reg_set = PIN_LATCH | PIN_OE;     // turn the latch and OE high
                 *reg_clr = PIN_LATCH;              // latch low <- falling edge latches data
             }
@@ -511,7 +530,8 @@ void* hub75_display_run(const hub75_display_t *scene) {
                 if (scene->show_fps) {
                     gettimeofday(&end_time, NULL);
                     double elapsed = (double)(end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_usec - start_time.tv_usec) * 1e-6;
-                    debug(" [%%] Panel Refresh Rate (%f): %.4fHz\n", elapsed, (frame_count / elapsed));
+                    float percent = (float)(frame_count) / 3215.0f;
+                    debug(" [%2.2f%%] Panel Refresh Rate: %.1fHz\n", percent, (frame_count / elapsed));
                     gettimeofday(&start_time, NULL);
                 }
                 frame_total += frame_count;
@@ -521,7 +541,7 @@ void* hub75_display_run(const hub75_display_t *scene) {
         }
     }
 
-    debug(" [-] render loop exiting. [%ld] total frames rendered\n", (frame_total + frame_count));
+    debug(" [-] display run render loop exiting. [%ld] total frames rendered\n", (frame_total + frame_count));
 
     return NULL;
 }

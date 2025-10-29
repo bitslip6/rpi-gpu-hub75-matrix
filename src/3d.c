@@ -339,12 +339,34 @@ object_t* object_tetrahedron(const object_draw_mode_t mode, const bool cull_back
     f[2] = (vec3){0,2,1};  /* top face */
     f[3] = (vec3){1,2,3};  /* bottom face */
 
-    /* calculate face normals */
-    vec3 *n = obj->normals->list;
-    for (int i = 0; i < 4; i++) {
-        vec3 v1 = vec3_sub(v[(int)f[i].y], v[(int)f[i].x]);
-        vec3 v2 = vec3_sub(v[(int)f[i].z], v[(int)f[i].x]);
-        n[i] = vec3_norm(vec3_cross(v1, v2));
+    /* Ensure outward CCW winding and compute face normals */
+    {
+        /* Helper to enforce outward-facing normals (centroid test) */
+        if (obj->faces && obj->normals && obj->verticies) {
+            vec3 *V = obj->verticies->list;
+            for (uint16_t i = 0; i < obj->faces->length; ++i) {
+                uint16_t i0 = (uint16_t)f[i].x;
+                uint16_t i1 = (uint16_t)f[i].y;
+                uint16_t i2 = (uint16_t)f[i].z;
+                vec3 v0 = V[i0], v1 = V[i1], v2 = V[i2];
+                vec3 e1 = vec3_sub(v1, v0);
+                vec3 e2 = vec3_sub(v2, v0);
+                vec3 nn = vec3_cross(e1, e2);
+                vec3 c  = (vec3){ (v0.x+v1.x+v2.x)/3.0f, (v0.y+v1.y+v2.y)/3.0f, (v0.z+v1.z+v2.z)/3.0f };
+                float d = vec3_dot(nn, c);
+                if (d < 0.0f) {
+                    /* Flip winding to make normal outward */
+                    float tmp = f[i].y; f[i].y = f[i].z; f[i].z = tmp;
+                    /* Recompute normal */
+                    i1 = (uint16_t)f[i].y; i2 = (uint16_t)f[i].z;
+                    v1 = V[i1]; v2 = V[i2];
+                    e1 = vec3_sub(v1, v0);
+                    e2 = vec3_sub(v2, v0);
+                    nn = vec3_cross(e1, e2);
+                }
+                obj->normals->list[i] = vec3_norm(nn);
+            }
+        }
     }
 
     /* fill edge colors - make all edges white */
@@ -362,7 +384,7 @@ object_t* object_tetrahedron(const object_draw_mode_t mode, const bool cull_back
 /** 
  * @brief Create an octahedron object centered at origin
  */
-object_t* object_octahedron(void) {
+object_t* object_octahedron(object_draw_mode_t mode, bool cull_backface) {
     object_t *obj = object_new(6, 12, 8);  /* 6 vertices, 12 edges, 8 triangular faces */
     if (!obj) return NULL;
 
@@ -387,6 +409,47 @@ object_t* object_octahedron(void) {
     e[8] = (vec2){0,4};  e[9] = (vec2){4,1};
     e[10]= (vec2){1,5};  e[11]= (vec2){5,0};
 
+    /* edge colors white */
+    for (int i = 0; i < 12; ++i) obj->edge_colors->list[i] = (RGB){255,255,255};
+
+    /* faces (8 triangles) */
+    vec3 *f = obj->faces->list;
+    f[0] = (vec3){2,0,4};
+    f[1] = (vec3){2,4,1};
+    f[2] = (vec3){2,1,5};
+    f[3] = (vec3){2,5,0};
+    f[4] = (vec3){3,0,5};
+    f[5] = (vec3){3,5,1};
+    f[6] = (vec3){3,1,4};
+    f[7] = (vec3){3,4,0};
+
+    /* enforce outward CCW and compute normals */
+    if (obj->faces && obj->normals && obj->verticies) {
+        vec3 *V = obj->verticies->list;
+        for (uint16_t i = 0; i < obj->faces->length; ++i) {
+            uint16_t i0 = (uint16_t)f[i].x;
+            uint16_t i1 = (uint16_t)f[i].y;
+            uint16_t i2 = (uint16_t)f[i].z;
+            vec3 v0 = V[i0], v1 = V[i1], v2 = V[i2];
+            vec3 e1v = vec3_sub(v1, v0);
+            vec3 e2v = vec3_sub(v2, v0);
+            vec3 nn = vec3_cross(e1v, e2v);
+            vec3 c  = (vec3){ (v0.x+v1.x+v2.x)/3.0f, (v0.y+v1.y+v2.y)/3.0f, (v0.z+v1.z+v2.z)/3.0f };
+            float d = vec3_dot(nn, c);
+            if (d < 0.0f) {
+                float tmp = f[i].y; f[i].y = f[i].z; f[i].z = tmp;
+                i1 = (uint16_t)f[i].y; i2 = (uint16_t)f[i].z;
+                v1 = V[i1]; v2 = V[i2];
+                e1v = vec3_sub(v1, v0);
+                e2v = vec3_sub(v2, v0);
+                nn = vec3_cross(e1v, e2v);
+            }
+            obj->normals->list[i] = vec3_norm(nn);
+        }
+    }
+
+    obj->draw_mode = mode;
+    obj->cull_backface = cull_backface;
     return obj;
 }
 
@@ -423,26 +486,27 @@ object_t* object_pyramid(void) {
  * @brief Create a cylinder object centered at origin (wireframe approximation)
  * @param segments Number of segments around the circumference (minimum 3)
  */
-object_t* object_cylinder(uint16_t segments) {
-    if (segments < 3) segments = 3;
-    if (segments > 32) segments = 32;  // practical limit for wireframe 
+object_t* object_cylinder(const uint16_t segments, const object_draw_mode_t mode, const bool cull_backface) {
+    uint16_t seg = segments;
+    if (seg < 3) seg = 3;
+    if (seg > 32) seg = 32;  // practical limit for wireframe 
 
-    uint16_t num_vertices = segments * 2;  // top and bottom circles 
-    uint16_t num_edges = segments * 3;     // top circle + bottom circle + vertical lines 
-    uint16_t num_faces = segments * 4;     // top/bottom caps + side triangles
+    uint16_t num_vertices = seg * 2;  // top and bottom circles 
+    uint16_t num_edges = seg * 3;     // top circle + bottom circle + vertical lines 
+    uint16_t num_faces = seg * 4;     // top/bottom caps + side triangles
     
     object_t *obj = object_new(num_vertices, num_edges, num_faces);
     if (!obj) return NULL;
 
     // fill vertices 
     vec3 *v = obj->verticies->list;
-    for (uint16_t i = 0; i < segments; ++i) {
-        float angle = 2.0f * (float)M_PI * (float)i / (float)segments;
+    for (uint16_t i = 0; i < seg; ++i) {
+        float angle = 2.0f * (float)M_PI * (float)i / (float)seg;
         float x = cosf(angle);
         float z = sinf(angle);
         
         v[i] = (vec3){x, 1.0f, z};              // top circle
-        v[i + segments] = (vec3){x, -1.0f, z};  // bottom circle 
+        v[i + seg] = (vec3){x, -1.0f, z};  // bottom circle 
     }
 
     // fill edges
@@ -450,21 +514,70 @@ object_t* object_cylinder(uint16_t segments) {
     uint16_t edge_idx = 0;
     
     // top circle edges 
-    for (uint16_t i = 0; i < segments; ++i) {
-        e[edge_idx++] = (vec2){(float)i, (float)((i + 1) % segments)};
+    for (uint16_t i = 0; i < seg; ++i) {
+        e[edge_idx++] = (vec2){(float)i, (float)((i + 1) % seg)};
     }
     
     // bottom circle edges 
-    for (uint16_t i = 0; i < segments; ++i) {
-        uint16_t bottom_i = i + segments;
-        uint16_t bottom_next = (uint16_t)((i + 1) % segments) + segments;
+    for (uint16_t i = 0; i < seg; ++i) {
+        uint16_t bottom_i = i + seg;
+        uint16_t bottom_next = (uint16_t)((i + 1) % seg) + seg;
         e[edge_idx++] = (vec2){bottom_i, bottom_next};
     }
     
     // vertical edges connecting top to bottom 
-    for (uint16_t i = 0; i < segments; ++i) {
-        e[edge_idx++] = (vec2){i, i + segments};
+    for (uint16_t i = 0; i < seg; ++i) {
+        e[edge_idx++] = (vec2){i, i + seg};
     }
+    /* edge colors white */
+    for (uint16_t i = 0; i < num_edges; ++i) obj->edge_colors->list[i] = (RGB){255,255,255};
+
+    /* faces: sides (2*seg) and caps (2*(seg-2)) */
+    vec3 *F = obj->faces->list;
+    uint16_t fcount = 0;
+    for (uint16_t i = 0; i < seg; ++i) {
+        uint16_t inext = (uint16_t)((i + 1) % seg);
+        uint16_t t0 = i, t1 = inext;
+        uint16_t b0 = (uint16_t)(i + seg);
+        uint16_t b1 = (uint16_t)(inext + seg);
+        F[fcount++] = (vec3){ (float)t0, (float)b0, (float)t1 };
+        F[fcount++] = (vec3){ (float)t1, (float)b0, (float)b1 };
+    }
+    for (uint16_t i = 1; i + 1 < seg; ++i) {
+        F[fcount++] = (vec3){ 0.0f, (float)i, (float)(i+1) };
+    }
+    uint16_t b_anchor = seg;
+    for (uint16_t i = 1; i + 1 < seg; ++i) {
+        F[fcount++] = (vec3){ (float)b_anchor, (float)(seg + i + 1), (float)(seg + i) };
+    }
+
+    if (obj->normals && obj->verticies) {
+        vec3 *V = obj->verticies->list;
+        for (uint16_t i = 0; i < fcount; ++i) {
+            uint16_t i0 = (uint16_t)F[i].x;
+            uint16_t i1 = (uint16_t)F[i].y;
+            uint16_t i2 = (uint16_t)F[i].z;
+            vec3 v0 = V[i0], v1 = V[i1], v2 = V[i2];
+            vec3 e1v = vec3_sub(v1, v0);
+            vec3 e2v = vec3_sub(v2, v0);
+            vec3 nn = vec3_cross(e1v, e2v);
+            vec3 c  = (vec3){ (v0.x+v1.x+v2.x)/3.0f, (v0.y+v1.y+v2.y)/3.0f, (v0.z+v1.z+v2.z)/3.0f };
+            float d = vec3_dot(nn, c);
+            if (d < 0.0f) {
+                float tmp = F[i].y; F[i].y = F[i].z; F[i].z = tmp;
+                i1 = (uint16_t)F[i].y; i2 = (uint16_t)F[i].z;
+                v1 = V[i1]; v2 = V[i2];
+                e1v = vec3_sub(v1, v0);
+                e2v = vec3_sub(v2, v0);
+                nn = vec3_cross(e1v, e2v);
+            }
+            obj->normals->list[i] = vec3_norm(nn);
+        }
+    }
+
+    obj->faces->length = fcount;
+    obj->draw_mode = mode;
+    obj->cull_backface = cull_backface;
 
     return obj;
 }
@@ -679,6 +792,16 @@ object_t* object_sphere(uint16_t subdivisions) {
  * @param major_segments Number of segments around the major radius (minimum 3)
  * @param minor_segments Number of segments around the minor radius (minimum 3)
  */
+/* Helper: centerline point on the major circle corresponding to vertex p */
+static inline vec3 torus_centerline(vec3 p, float R) {
+    float rxy = sqrtf(p.x*p.x + p.z*p.z);
+    if (rxy < 1e-6f) {
+        return (vec3){ R, 0.0f, 0.0f };
+    }
+    float ux = p.x / rxy, uz = p.z / rxy;
+    return (vec3){ R * ux, 0.0f, R * uz };
+}
+
 object_t* object_torus(uint16_t major_segments, uint16_t minor_segments) {
     if (major_segments < 3) major_segments = 3;
     if (minor_segments < 3) minor_segments = 3;
@@ -733,6 +856,65 @@ object_t* object_torus(uint16_t major_segments, uint16_t minor_segments) {
         }
     }
 
+    /* set edge colors to white */
+    for (uint16_t i = 0; i < obj->edges->length; ++i) obj->edge_colors->list[i] = (RGB){255,255,255};
+
+    /* fill faces: two triangles per quad on (major,minor) grid */
+    vec3 *F = obj->faces->list;
+    uint16_t fcount = 0;
+    for (uint16_t i = 0; i < major_segments; ++i) {
+        uint16_t inext = (uint16_t)((i + 1) % major_segments);
+        for (uint16_t j = 0; j < minor_segments; ++j) {
+            uint16_t jnext = (uint16_t)((j + 1) % minor_segments);
+            uint16_t i0 = (uint16_t)(i * minor_segments + j);
+            uint16_t i1 = (uint16_t)(inext * minor_segments + j);
+            uint16_t i2 = (uint16_t)(i * minor_segments + jnext);
+            uint16_t i3 = (uint16_t)(inext * minor_segments + jnext);
+            /* initial guess for winding; will enforce outward below */
+            F[fcount++] = (vec3){ (float)i0, (float)i1, (float)i2 };
+            F[fcount++] = (vec3){ (float)i1, (float)i3, (float)i2 };
+        }
+    }
+
+    /* enforce outward CCW using torus tube outward direction and compute face normals */
+    if (obj->normals && obj->verticies) {
+        vec3 *V = obj->verticies->list;
+        for (uint16_t i = 0; i < fcount && i < obj->normals->length; ++i) {
+            uint16_t ia = (uint16_t)F[i].x;
+            uint16_t ib = (uint16_t)F[i].y;
+            uint16_t ic = (uint16_t)F[i].z;
+            vec3 a = V[ia], b = V[ib], c = V[ic];
+            vec3 e1v = vec3_sub(b, a);
+            vec3 e2v = vec3_sub(c, a);
+            vec3 nn = vec3_cross(e1v, e2v);
+            /* Approximate outward direction for torus: average (p - C(u)) where
+               C(u) is the centerline point on the major circle at the same angle u. */
+            vec3 ca = torus_centerline(a, major_radius);
+            vec3 cb = torus_centerline(b, major_radius);
+            vec3 cc = torus_centerline(c, major_radius);
+            vec3 oa = vec3_sub(a, ca);
+            vec3 ob = vec3_sub(b, cb);
+            vec3 oc = vec3_sub(c, cc);
+            vec3 oavg = (vec3){ (oa.x+ob.x+oc.x)/3.0f, (oa.y+ob.y+oc.y)/3.0f, (oa.z+ob.z+oc.z)/3.0f };
+            float d = vec3_dot(nn, oavg);
+            if (d < 0.0f) {
+                /* flip winding */
+                float tmp = F[i].y; F[i].y = F[i].z; F[i].z = tmp;
+                ib = (uint16_t)F[i].y; ic = (uint16_t)F[i].z;
+                b = V[ib]; c = V[ic];
+                e1v = vec3_sub(b, a);
+                e2v = vec3_sub(c, a);
+                nn = vec3_cross(e1v, e2v);
+            }
+            /* normalize */
+            float len = sqrtf(nn.x*nn.x + nn.y*nn.y + nn.z*nn.z);
+            if (len > 1e-6f) { nn.x/=len; nn.y/=len; nn.z/=len; }
+            obj->normals->list[i] = nn;
+        }
+    }
+
+    obj->faces->length = fcount;
+
     return obj;
 }
 
@@ -781,11 +963,58 @@ object_t* object_plane(uint16_t width_segments, uint16_t height_segments) {
     /* vertical edges */
     for (uint16_t z = 0; z < height_segments; ++z) {
         for (uint16_t x = 0; x <= width_segments; ++x) {
-            uint16_t current = z * (uint16_t)((width_segments + 1) + x);
+            uint16_t current = (uint16_t)(z * (width_segments + 1) + x);
             uint16_t below = (uint16_t)((z + 1) * (width_segments + 1) + x);
             e[edge_idx++] = (vec2){current, below};
         }
     }
+
+    /* fill faces (two triangles per quad), ensure CCW when viewed from +Y */
+    vec3 *F = obj->faces->list;
+    uint16_t fcount = 0;
+    for (uint16_t z = 0; z < height_segments; ++z) {
+        for (uint16_t x = 0; x < width_segments; ++x) {
+            uint16_t i00 = (uint16_t)(z * (width_segments + 1) + x);
+            uint16_t i10 = (uint16_t)(z * (width_segments + 1) + (x + 1));
+            uint16_t i01 = (uint16_t)((z + 1) * (width_segments + 1) + x);
+            uint16_t i11 = (uint16_t)((z + 1) * (width_segments + 1) + (x + 1));
+            /* Winding for +Y normals: (i00,i11,i10) and (i00,i01,i11) */
+            F[fcount++] = (vec3){ (float)i00, (float)i11, (float)i10 };
+            F[fcount++] = (vec3){ (float)i00, (float)i01, (float)i11 };
+        }
+    }
+
+    /* edge colors white */
+    for (uint16_t i = 0; i < obj->edges->length; ++i) obj->edge_colors->list[i] = (RGB){255,255,255};
+
+    /* compute face normals; if normal.y < 0, flip triangle to face +Y */
+    if (obj->normals && obj->verticies) {
+        vec3 *V = obj->verticies->list;
+        for (uint16_t i = 0; i < fcount && i < obj->normals->length; ++i) {
+            uint16_t i0 = (uint16_t)F[i].x;
+            uint16_t i1 = (uint16_t)F[i].y;
+            uint16_t i2 = (uint16_t)F[i].z;
+            vec3 v0 = V[i0], v1 = V[i1], v2 = V[i2];
+            vec3 e1v = vec3_sub(v1, v0);
+            vec3 e2v = vec3_sub(v2, v0);
+            vec3 nn = vec3_cross(e1v, e2v);
+            if (nn.y < 0.0f) {
+                /* flip to make normal point upward */
+                float tmp = F[i].y; F[i].y = F[i].z; F[i].z = tmp;
+                i1 = (uint16_t)F[i].y; i2 = (uint16_t)F[i].z;
+                v1 = V[i1]; v2 = V[i2];
+                e1v = vec3_sub(v1, v0);
+                e2v = vec3_sub(v2, v0);
+                nn = vec3_cross(e1v, e2v);
+            }
+            /* normalize */
+            float len = sqrtf(nn.x*nn.x + nn.y*nn.y + nn.z*nn.z);
+            if (len > 1e-6f) { nn.x/=len; nn.y/=len; nn.z/=len; }
+            obj->normals->list[i] = nn;
+        }
+    }
+
+    obj->faces->length = fcount;
 
     return obj;
 }
