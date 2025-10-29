@@ -85,21 +85,40 @@ static void *render_3d(void *arg) {
     camera_t *cam = api.geo_camera();
 
     // create a cube object
-    object_t    *cube       = api.geo_octahedron();
+    object_t    *cube       = api.geo_torus(24, 10);  // Using sphere for better appearance on small displays
     transform_t *cube_xform = api.geo_transform();
     cube_xform->scale       = (vec3){1.25f, 1.25f, 1.25f};  // Scale up the cube 
+    cube->draw_mode = DRAW_FILLED;
+    cube->cull_backface = true;
 
-    // set cube edge color to red
+    object_t    *plane       = api.geo_plane(4, 4);
+    plane->draw_mode = DRAW_FILLED;
+    plane->cull_backface = false;
+    transform_t *plane_xform = api.geo_transform();
+    plane_xform->position.y  = 2.0f;  // Move the plane down
+    plane_xform->scale       = (vec3){5.0f, 1.0f, 5.0f};  // Scale up the plane
+
+    // set cube edge color to cyan
     for (int i=0; i<cube->edge_colors->length; ++i) {
         cube->edge_colors->list[i] = (RGB){0, 254, 254};
     }
+    // set plane edge color to indigo
+    for (int i=0; i<cube->edge_colors->length; ++i) {
+        cube->edge_colors->list[i] = (RGB){75, 0, 130};
+    }
+
+
 
     // build an object scene and use convenience wrappers (no need to pass os repeatedly)
     scene3d_t *os = api.scene3d_new(1);
     api.scene3d_set_current(os);
     api.scene3d_set_ambient(COLOR_DARK_GREY);
-    uint16_t light1_id = api.scene3d_add_directional((light_vec3){-0.5f, 1.0f, 0.2f}, COLOR_WHITE, 1.0f, false);
+    uint16_t light1_id = api.scene3d_add_directional((light_vec3){-0.5f, 1.0f, 3.2f}, COLOR_WHITE, 1.0f, true);
+    uint16_t plane_id = api.scene3d_add_object(plane, plane_xform);
     uint16_t cube_id = api.scene3d_add_object(cube, cube_xform);
+
+    light_t *light1 = api.scene3d_get_directional(light1_id);
+
 
     uint16_t frame = 0;
     while(scene->do_render) {
@@ -110,13 +129,18 @@ static void *render_3d(void *arg) {
         float t = (float)frame * 0.008f;
 
         // rotate cube and move it a bit 
-        cube_xform->rotation.x = t * 0.7f;
-        cube_xform->rotation.y = 1.14f;
+        //cube_xform->rotation.x = t * 0.7f;
+        //cube_xform->rotation.y = 1.14f;
 
         // orbit camera around origin while looking at cube - closer distance with wider FOV
-        cam->position.x = 5.0f * cosf(t * 0.3f);  // Reduced distance with wider FOV for better fit 
-        cam->position.z = 5.0f * sinf(t * 0.3f);  // Reduced distance with wider FOV for better fit 
-        cam->target     = cube_xform->position;
+        //cam->position.x = 5.0f * cosf(t * 0.3f);  // Reduced distance with wider FOV for better fit 
+        //cam->position.z = 5.0f * sinf(t * 0.3f);  // Reduced distance with wider FOV for better fit 
+        //cam->target     = cube_xform->position;
+
+        // Animate a directional light by orbiting its position and pointing at the object
+        light_vec3 pos = { 10.0f * cosf(t * 0.5f), 3.0f, 10.0f * sinf(t * 0.5f) };
+        light_vec3 look = { cube_xform->position.x, cube_xform->position.y, cube_xform->position.z };
+        api.scene3d_set_directional_pose(light1_id, pos, look);
 
         // Render using scene-owned lighting (pass NULL)
         api.render_scene3d(cam, os, NULL);
@@ -213,18 +237,10 @@ int main(int argc, char **argv) {
     // Parse command line into a new scene. Use -h to see available options.
     hub75_display_t *scene = hub75_display_parse_args(argc, argv);
 
-    scene->stride = 4;
-
     // Validate configuration, allocate internal buffers, etc.
     hub75_display_start(scene);
 
     signal_handler_install();
-
-    // create RGB -> BCM mapper thread
-    if (pthread_create(&scene->mapper_thread, NULL, mapper_thread_main, scene) != 0) {
-        scene->do_render = false;
-    }
-
 
     pthread_create(&scene->render_thread, NULL, render_3d, scene);
 
