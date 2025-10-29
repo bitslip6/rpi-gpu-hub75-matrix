@@ -544,7 +544,7 @@ typedef struct {
 
 
 object_t* object_cube(const object_draw_mode_t mode, const bool cull_backface);
-object_t* object_tetrahedron(void);
+object_t* object_tetrahedron(const object_draw_mode_t mode, const bool cull_backface);
 object_t* object_octahedron(void);
 object_t* object_pyramid(void);
 object_t* object_cylinder(uint16_t segments);
@@ -620,7 +620,7 @@ typedef struct {
     // geometry creation functions
     object_t* (*geo_object)(const uint16_t num_vertices, const uint16_t num_edges, const uint16_t num_faces);
     object_t* (*geo_cube)(const object_draw_mode_t mode, const bool cull_backface);
-    object_t* (*geo_tetrahedron)();
+    object_t* (*geo_tetrahedron)(const object_draw_mode_t mode, const bool cull_backface);
     object_t* (*geo_octahedron)();
     object_t* (*geo_pyramid)();
     object_t* (*geo_cylinder)(uint16_t segments);

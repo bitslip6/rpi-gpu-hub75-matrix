@@ -543,13 +543,11 @@ hub75_display_t *hub75_display_parse_args(int argc, char **argv) {
 
     if (scene->num_chains == 0) {
         int calcualted_chains = (int)ceil(scene->width / scene->panel_width);
-        printf("calculated: %d chains\n", calcualted_chains);
         scene->num_chains = (uint8_t)MAX(scene->num_chains, calcualted_chains);
     }
 
     if (scene->num_ports == 0) {
         int calcualted_ports = (int)MIN(3, ceil(scene->width / scene->panel_width));
-        printf("calculated: %d ports\n", calcualted_ports);
         scene->num_ports = (uint8_t)MAX(scene->num_ports, calcualted_ports);
     }
 
@@ -999,20 +997,18 @@ uint32_t* map_gpio(int version) {
     int mem_fd = 0; 
     if (version == 4) {
 	    peri = PERI4_BASE;
-     	    mem_fd = open("/dev/gpiomem", O_RDWR | O_SYNC);
+        mem_fd = open("/dev/gpiomem", O_RDWR | O_SYNC);
     } else if (version == 3) {
 	    peri = PERI3_BASE;
-     	    mem_fd = open("/dev/gpiomem", O_RDWR | O_SYNC);
+        mem_fd = open("/dev/gpiomem", O_RDWR | O_SYNC);
     } else if (version == 5) {
 	    peri = PERI5_BASE;
-     	    mem_fd = open("/dev/gpiomem0", O_RDWR | O_SYNC);
+        mem_fd = open("/dev/gpiomem0", O_RDWR | O_SYNC);
     } else {
 	    die("unknown pi version\n");
     }
 
-    if (CONSOLE_DEBUG) {
-        printf("peripheral address: %lx\n", peri);
-    }
+    debug(" [*] peripheral address: %lx, /dev/gpiomem\n", peri);
     asm volatile ("" : : : "memory");  // Prevents optimization
     uint32_t *map = (uint32_t *)mmap(
         NULL,
@@ -1028,9 +1024,6 @@ uint32_t* map_gpio(int version) {
     }
     if (mem_fd != 0) {
     	close(mem_fd);
-    }
-    if (CONSOLE_DEBUG) {
-        printf("gpio mapped\n");
     }
     return map;
 }

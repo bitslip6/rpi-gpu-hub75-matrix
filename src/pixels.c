@@ -47,7 +47,7 @@ void *mapper_thread_main(void *arg)
         }
 
         // map the linear rgba image to bcm mapping
-    hub75_display_map_image_to_bcm(scene, src);
+        hub75_display_map_image_to_bcm(scene, src);
 
         spsc_pop_ptr_commit(scene->ring_buf_mapper);
     }
@@ -705,7 +705,7 @@ void update_bcm_signal_64_rgb(
 
     // 2) derive pixel-stride geometry
     const unsigned int stride_bytes = scene->stride;                         // 3 or 4
-    const unsigned int panel_stride_px = scene->width * (scene->panel_height / 2); // number of pixels per panel half
+    const unsigned int panel_stride_px = (scene->width * (scene->panel_height / 2)); // number of pixels per panel half
 
     // 3) helper macros for pointer/index math
     #define PIX_PTR(px_index)   (image + (size_t)(px_index) * stride_bytes)
@@ -1185,7 +1185,7 @@ void hub75_display_map_image_to_bcm(const hub75_display_t *scene, uint8_t *image
     static uint8_t  phase = 1;
     phase = phase + 1;
 
-    if (phase >= 64) { phase = 0; } // 255 is a magic number to update_bcm_singal_64 to free it's memory
+    if (phase >= 64) { phase = 0; }
     phase = 0;
 
     if (UNLIKELY(bits == NULL)) {
@@ -1201,7 +1201,7 @@ void hub75_display_map_image_to_bcm(const hub75_display_t *scene, uint8_t *image
         }   
         bits = (uint64_t*)tone_map_rgb_bits(scene, scene->bit_depth, scene->quant_errors_lut);
         build_port_luts(); // once
-        debug("new tone mapped bits created\n");
+        debug(" [*] tone mapped bits created\n");
     }
 
     // select our image source

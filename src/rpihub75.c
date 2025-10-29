@@ -93,29 +93,47 @@ void hub75_display_wait(struct hub75_display *scene) {
  * @param y the panel row number to calculate the mask for
  * @return uint32_t the bitmask for the address lines at row y
  */
+/*
+ * Map logical row index y to address line bitmask.
+ * Notes:
+ * - We assume y is in [0, half_height). Apply modulo just in case.
+ * - Some HATs wire A..E in reversed significance. Allow optional bit order flip.
+ * - Optionally apply a small row offset for hardware that latches one row late/early.
+ */
 uint32_t row_to_address(int y, uint16_t half_height) {
-    // normalize y into [0, half_height) safely (accept negative defensively)
-    // POSSIBLE BLACK LINES IS THIS CODE
-    //int norm = y - 1;
-    //if (norm < 0) norm = 0;
-    // THIS IS THE ORIGINAL CODE
-    uint16_t norm = (uint16_t)((y-1) % half_height);
-    // SINCE REMOVING STRIDE-1, WE ATTEMPT TO USE y NATURALLY
-    //int norm = y;
+    if (half_height == 0) return 0;
 
-    // use modulo on int then cast (avoid implicit narrowing warning)
-    int mod = (half_height > 0) ? (norm % (int)half_height) : 0;
-    uint16_t row = (uint16_t)mod;
-    uint32_t bitmask = 0;
+    // normalize to [0, half_height)
+    uint16_t norm = (uint16_t)(y % half_height);
+    // defend against negative y although callers only pass non-negative
+    if (y < 0) {
+        int yy = y % (int)half_height;
+        if (yy < 0) yy += half_height;
+        norm = (uint16_t)yy;
+    }
 
-    // Map each bit from the input to the corresponding bit position in the bitmask
-    if (row & (1 << 0)) bitmask |= (1 << ADDRESS_A);  // Map bit 0
-    if (row & (1 << 1)) bitmask |= (1 << ADDRESS_B);  // Map bit 1
-    if (row & (1 << 2)) bitmask |= (1 << ADDRESS_C);  // Map bit 2
-    if (row & (1 << 3)) bitmask |= (1 << ADDRESS_D);  // Map bit 3
-    if (row & (1 << 4)) bitmask |= (1 << ADDRESS_E);  // Map bit 4
+    // Optional compile-time row offset to quickly test off-by-one issues
+    #ifndef ROW_ADDRESS_Y_OFFSET
+    #define ROW_ADDRESS_Y_OFFSET -1
+    #endif
+    norm = (uint16_t)((norm + ROW_ADDRESS_Y_OFFSET) % half_height);
 
+    // Allow compile-time reversal of address bit significance if wiring differs
+    #ifndef ADDRESS_LSB_IS_A
+    #define ADDRESS_LSB_IS_A 1
+    #endif
 
+    const uint8_t order[5] =
+    #if ADDRESS_LSB_IS_A
+        { ADDRESS_A, ADDRESS_B, ADDRESS_C, ADDRESS_D, ADDRESS_E };
+    #else
+        { ADDRESS_E, ADDRESS_D, ADDRESS_C, ADDRESS_B, ADDRESS_A };
+    #endif
+
+    uint32_t bitmask = 0u;
+    for (uint8_t i = 0; i < 5; ++i) {
+        if (norm & (1u << i)) bitmask |= (1u << order[i]);
+    }
     return bitmask;
 }
 
@@ -210,6 +228,7 @@ void hub75_display_start(hub75_display_t *scene) {
 /**
  * internal method for rendering on pi zero, 3 and 4
  */
+/*
 void* render_forever_pi4(const hub75_display_t *scene, int version) {
 
     uint32_t *PERIBase = map_gpio(version);
@@ -235,8 +254,8 @@ void* render_forever_pi4(const hub75_display_t *scene, int version) {
     uint32_t *jitter_mask = jitter_create(JITTER_SIZE, scene->brightness, scene->jitter_brightness);
 
     // store the row to address mapping in an array for faster access
-    uint32_t addr_map[half_height];
-    for (int i=0; i<half_height; i++) {
+    uint32_t addr_map[half_height*2];
+    for (int i=0; i<half_height+1; i++) {
         addr_map[i] = row_to_address(i, half_height);
     }
 
@@ -309,6 +328,7 @@ void* render_forever_pi4(const hub75_display_t *scene, int version) {
 
     return NULL;
 }
+    */
 
 
 static inline void io_write_barrier(void) {
@@ -342,9 +362,11 @@ void* hub75_display_run(const hub75_display_t *scene) {
         die(" [!] Unsupported CPU model detected %d\n", cpu_model);
     }
 
+    /*
     if (cpu_model < 5 ) {
         return render_forever_pi4(scene, cpu_model);
     }
+    */
 
     // map the gpio address to we can control the GPIO pins
     uint32_t *PERIBase = map_gpio(5); // for root on pi5 (/dev/mem, offset is 0xD0000)
@@ -370,7 +392,7 @@ void* hub75_display_run(const hub75_display_t *scene) {
     uint32_t *jitter_mask = jitter_create(JITTER_SIZE, scene->brightness, scene->jitter_brightness);
 
     // store the row to address mapping in an array for faster access
-    uint32_t addr_map[half_height] __attribute__((aligned(16)));
+    uint32_t addr_map[half_height];
     for (int i=0; i<half_height; i++) {
         addr_map[i] = row_to_address(i, half_height);
     }
@@ -404,7 +426,7 @@ void* hub75_display_run(const hub75_display_t *scene) {
         debug(" [!] unable to locate first rendered frame\n");
         return NULL;
     }
-    printf(" [*] first frame acquired\n");
+    debug(" [$] first frame acquired\n");
 
 
     // lock the memory we just touched (bcm_signal)...
@@ -440,6 +462,12 @@ void* hub75_display_run(const hub75_display_t *scene) {
 
                 const uint32_t addr_bits = addr_map[y];
 
+                // Precharge: ensure address lines are stable while OE is high before shifting next row
+                // This reduces row-boundary ghosting on some panels.
+                uint32_t oe_addr = PIN_OE | addr_bits;
+                *reg_out = oe_addr;
+                io_store_barrier();
+
                 // jitter_idx must be at least width pixels before end of jitter_mask
                 // jitter_idx = ((y * 1315423911u) + phase) % JITTER_SIZE; // decorrelate rows
                 // jitter_idx = phase; // phase can offset jitter patterns
@@ -447,7 +475,7 @@ void* hub75_display_run(const hub75_display_t *scene) {
 
                 for (uint16_t x = 0; x < width; x++) {
 
-                    const uint32_t v = bcm_signal[offset] | addr_bits | jitter_mask[jitter_idx];
+                    uint32_t v = bcm_signal[offset] | addr_bits | jitter_mask[jitter_idx];
                     *reg_out = v;                 // set data + addr + oe, clk low
                     *reg_out = v | PIN_CLK;       // clk high 
 
@@ -460,7 +488,7 @@ void* hub75_display_run(const hub75_display_t *scene) {
                 __asm__ __volatile__("" ::: "memory");
 
                 // latch the complete row into the display
-                *reg_set = PIN_LATCH | PIN_OE;     // turn th elatch and OE high
+                *reg_set = PIN_LATCH | PIN_OE;     // turn the latch and OE high
                 *reg_clr = PIN_LATCH;              // latch low <- falling edge latches data
             }
 

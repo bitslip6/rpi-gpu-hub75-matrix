@@ -88,6 +88,63 @@ static inline vec3 mat3_mul_v3(const float M[9], vec3 v){
                    M[2]*v.x + M[5]*v.y + M[8]*v.z };
 }
 
+/* Minimal 4x4 helpers (row-major) to compute view-space vertices for culling */
+static inline mat4 m4_identity(void){
+    mat4 r = { .m = {
+        1,0,0,0,
+        0,1,0,0,
+        0,0,1,0,
+        0,0,0,1
+    }}; return r;
+}
+static inline mat4 m4_mul(mat4 a, mat4 b){
+    mat4 r = {0};
+    for(int row=0; row<4; ++row){
+        for(int col=0; col<4; ++col){
+            r.m[row*4+col] = a.m[row*4+0]*b.m[0*4+col]
+                           + a.m[row*4+1]*b.m[1*4+col]
+                           + a.m[row*4+2]*b.m[2*4+col]
+                           + a.m[row*4+3]*b.m[3*4+col];
+        }
+    }
+    return r;
+}
+static inline vec3 m4_mul_point(mat4 m, vec3 p){
+    float x = m.m[0]*p.x + m.m[1]*p.y + m.m[2]*p.z + m.m[3];
+    float y = m.m[4]*p.x + m.m[5]*p.y + m.m[6]*p.z + m.m[7];
+    float z = m.m[8]*p.x + m.m[9]*p.y + m.m[10]*p.z + m.m[11];
+    float w = m.m[12]*p.x + m.m[13]*p.y + m.m[14]*p.z + m.m[15];
+    if (w != 0.0f) { x /= w; y /= w; z /= w; }
+    return (vec3){x,y,z};
+}
+static inline mat4 m4_translate(vec3 t){ mat4 r = m4_identity(); r.m[3]=t.x; r.m[7]=t.y; r.m[11]=t.z; return r; }
+static inline mat4 m4_rotate_x(float a){ float c=cosf(a), s=sinf(a); mat4 r=m4_identity(); r.m[5]=c; r.m[6]=-s; r.m[9]=s; r.m[10]=c; return r; }
+static inline mat4 m4_rotate_y(float a){ float c=cosf(a), s=sinf(a); mat4 r=m4_identity(); r.m[0]=c; r.m[2]=s; r.m[8]=-s; r.m[10]=c; return r; }
+static inline mat4 m4_rotate_z(float a){ float c=cosf(a), s=sinf(a); mat4 r=m4_identity(); r.m[0]=c; r.m[1]=-s; r.m[4]=s; r.m[5]=c; return r; }
+static inline mat4 m4_scale(vec3 s){ mat4 r=m4_identity(); r.m[0]=s.x? s.x:1.0f; r.m[5]=s.y? s.y:1.0f; r.m[10]=s.z? s.z:1.0f; return r; }
+static inline mat4 build_model_matrix(const transform_t *t){
+    mat4 S = m4_scale(t->scale.x==0&&t->scale.y==0&&t->scale.z==0?(vec3){1,1,1}:t->scale);
+    mat4 Rx = m4_rotate_x(t->rotation.x);
+    mat4 Ry = m4_rotate_y(t->rotation.y);
+    mat4 Rz = m4_rotate_z(t->rotation.z);
+    mat4 Tr = m4_translate(t->position);
+    mat4 R = m4_mul(Rz, m4_mul(Ry, Rx));
+    return m4_mul(Tr, m4_mul(R, S));
+}
+static inline mat4 build_view_matrix(const camera_t *c){
+    vec3 f = v3_norm(v3_sub(c->target, c->position));
+    vec3 up = (c->up.x==0&&c->up.y==0&&c->up.z==0)? (vec3){0,1,0} : c->up;
+    vec3 s = v3_norm(v3_cross(f, up));
+    vec3 u = v3_cross(s, f);
+    mat4 r = { .m = {
+        s.x, u.x, -f.x, 0.0f,
+        s.y, u.y, -f.y, 0.0f,
+        s.z, u.z, -f.z, 0.0f,
+        -v3_dot(s, c->position), -v3_dot(u, c->position), v3_dot(f, c->position), 1.0f
+    }};
+    return r;
+}
+
 /**
  * @brief Clear the current scene's image buffer by setting all pixels to black
  * 
@@ -533,8 +590,8 @@ object_t *api_new_cube(const object_draw_mode_t draw_mode, const bool cull_backf
     return object_cube(draw_mode, cull_backface);
 }
 
-object_t *api_new_tetrahedron(void) {
-    return object_tetrahedron();
+object_t *api_new_tetrahedron(const object_draw_mode_t draw_mode, const bool cull_backface) {
+    return object_tetrahedron(draw_mode, cull_backface);
 }
 
 object_t *api_new_octahedron(void) {
@@ -613,22 +670,34 @@ void api_geo_render_wire(const camera_t *cam, object_t *obj, const transform_t *
     const uint16_t w = (uint16_t)(tls_scene->width * 0.5f);
     const uint16_t h = (uint16_t)(tls_scene->height * 0.5f);
 
-    /* If enabled, compute front-facing faces using normals in view space.
+    /* If enabled, compute front-facing faces in VIEW space using geometry (more robust).
        We'll still render as edges, filtering edges that do not belong to any front-facing face. */
     bool do_cull_edges = false;
     bool *front_face = NULL;
-    if (obj->cull_backface && obj->faces && obj->normals && obj->faces->length == obj->normals->length) {
-        float Rm[9], Rv[9];
-        mat3_model_rotation(obj_xform->rotation, Rm);
-        mat3_view_rotation(cam, Rv);
+    if (obj->cull_backface && obj->faces && obj->verticies && obj->faces->length > 0) {
+        /* Build view * model (row-major) to transform object vertices into view space */
+        mat4 V = build_view_matrix(cam);
+        mat4 M = build_model_matrix(obj_xform);
+        mat4 MV = m4_mul(V, M);
+
         size_t nf = obj->faces->length;
         front_face = (bool*)calloc(nf, sizeof(bool));
         if (front_face) {
             for (size_t i = 0; i < nf; ++i) {
-                vec3 n_obj = obj->normals->list[i];
-                vec3 n_world = mat3_mul_v3(Rm, n_obj);
-                vec3 n_view  = mat3_mul_v3(Rv, n_world);
-                front_face[i] = (n_view.z > 0.0f);
+                vec3 f = obj->faces->list[i];
+                vec3 p0 = obj->verticies->list[(size_t)f.x];
+                vec3 p1 = obj->verticies->list[(size_t)f.y];
+                vec3 p2 = obj->verticies->list[(size_t)f.z];
+                /* transform to view space */
+                vec3 v0 = m4_mul_point(MV, p0);
+                vec3 v1 = m4_mul_point(MV, p1);
+                vec3 v2 = m4_mul_point(MV, p2);
+                /* compute face normal in view space */
+                vec3 e1 = v3_sub(v1, v0);
+                vec3 e2 = v3_sub(v2, v0);
+                vec3 n  = v3_cross(e1, e2);
+                /* In our view space, camera looks down -Z; front faces have n.z > 0 */
+                front_face[i] = (n.z > 1e-6f);
             }
             do_cull_edges = true;
         }
@@ -726,7 +795,7 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
             float bx = v3.x - v1.x;
             float by = v3.y - v1.y;
             float area = ax * by - ay * bx; // signed area in NDC (y up) 
-            if (area > 0.0f) {
+            if (area < 0.0f) {
                 continue; // back-facing
             }
         }

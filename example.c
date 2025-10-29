@@ -85,13 +85,13 @@ static void *render_3d(void *arg) {
     camera_t *cam = api.geo_camera();
 
     // create a cube object
-    object_t    *cube       = api.geo_cube(DRAW_FILLED, true);
+    object_t    *cube       = api.geo_octahedron();
     transform_t *cube_xform = api.geo_transform();
-    //cube_xform->scale       = (vec3){1.5f, 1.5f, 1.5f};  // Scale up the cube 
+    cube_xform->scale       = (vec3){1.25f, 1.25f, 1.25f};  // Scale up the cube 
 
     // set cube edge color to red
     for (int i=0; i<cube->edge_colors->length; ++i) {
-        cube->edge_colors->list[i] = (RGB){ 250, 64, 64 };
+        cube->edge_colors->list[i] = (RGB){0, 254, 254};
     }
 
     // build an object scene and use convenience wrappers (no need to pass os repeatedly)
@@ -101,8 +101,13 @@ static void *render_3d(void *arg) {
     uint16_t light1_id = api.scene3d_add_directional((light_vec3){-0.5f, 1.0f, 0.2f}, COLOR_WHITE, 1.0f, false);
     uint16_t cube_id = api.scene3d_add_object(cube, cube_xform);
 
-    for (int frame = 0; frame < 1; ++frame) {
-        float t = (float)frame * 0.016f;
+    uint16_t frame = 0;
+    while(scene->do_render) {
+
+        frame++;
+        api.frame_begin(); 
+        api.clear();
+        float t = (float)frame * 0.008f;
 
         // rotate cube and move it a bit 
         cube_xform->rotation.x = t * 0.7f;
@@ -113,11 +118,16 @@ static void *render_3d(void *arg) {
         cam->position.z = 5.0f * sinf(t * 0.3f);  // Reduced distance with wider FOV for better fit 
         cam->target     = cube_xform->position;
 
-    // Render using scene-owned lighting (pass NULL)
-    api.render_scene3d(cam, os, NULL);
+        // Render using scene-owned lighting (pass NULL)
+        api.render_scene3d(cam, os, NULL);
+
+        api.frame_end();
+
+        // FPS calculation
+        calculate_fps(scene->fps, scene->show_fps);
     }
 
-    stbi_write_png("out2.png", scene->width, scene->height, 3, scene->image, scene->width * scene->stride);
+    //stbi_write_png("out2.png", scene->width, scene->height, 3, scene->image, scene->width * scene->stride);
     
     /* cleanup */
     api.scene3d_clear_current();
@@ -208,9 +218,6 @@ int main(int argc, char **argv) {
     // Validate configuration, allocate internal buffers, etc.
     hub75_display_start(scene);
 
-    render_3d(scene);
-    exit(1);
-
     signal_handler_install();
 
     // create RGB -> BCM mapper thread
@@ -219,9 +226,8 @@ int main(int argc, char **argv) {
     }
 
 
-    pthread_create(&scene->render_thread, NULL, render_shader, scene);
+    pthread_create(&scene->render_thread, NULL, render_3d, scene);
 
-    printf("waiting forever...\n");
     hub75_display_run(scene);
 
     hub75_display_wait(scene);

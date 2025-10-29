@@ -278,12 +278,18 @@ object_t* object_cube(const object_draw_mode_t mode, const bool cull_backface) {
 
     /* fill faces (triangles) - 2 triangles per cube face */
     vec3 *f = obj->faces->list;
-    /* front face (z=-1) */  f[0] = (vec3){0,1,2};  f[1] = (vec3){0,2,3};
-    /* back face (z=+1) */   f[2] = (vec3){5,4,7};  f[3] = (vec3){5,7,6};
-    /* left face (x=-1) */   f[4] = (vec3){4,0,3};  f[5] = (vec3){4,3,7};
-    /* right face (x=+1) */  f[6] = (vec3){1,5,6};  f[7] = (vec3){1,6,2};
-    /* bottom face (y=-1) */ f[8] = (vec3){4,5,1};  f[9] = (vec3){4,1,0};
-    /* top face (y=+1) */    f[10]= (vec3){3,2,6};  f[11]= (vec3){3,6,7};
+    /*
+     * Ensure all triangle windings are consistent with outward normals.
+     * Using right-handed coordinates and row-major math, a front-facing
+     * triangle (as seen from outside the cube) should have its vertices
+     * wound such that the computed normal points outward.
+     */
+    /* front face (z=-1) */  f[0] = (vec3){0,2,1};  f[1] = (vec3){0,3,2};
+    /* back face (z=+1) */   f[2] = (vec3){5,7,4};  f[3] = (vec3){5,6,7};
+    /* left face (x=-1) */   f[4] = (vec3){4,3,0};  f[5] = (vec3){4,7,3};
+    /* right face (x=+1) */  f[6] = (vec3){1,6,5};  f[7] = (vec3){1,2,6};
+    /* bottom face (y=-1) */ f[8] = (vec3){4,1,5};  f[9] = (vec3){4,0,1};
+    /* top face (y=+1) */    f[10]= (vec3){3,6,2};  f[11]= (vec3){3,7,6};
 
     /* fill face normals */
     vec3 *n = obj->normals->list;
@@ -308,7 +314,7 @@ object_t* object_cube(const object_draw_mode_t mode, const bool cull_backface) {
 /** 
  * @brief Create a tetrahedron (triangular pyramid) object centered at origin
  */
-object_t* object_tetrahedron(void) {
+object_t* object_tetrahedron(const object_draw_mode_t mode, const bool cull_backface) {
     object_t *obj = object_new(4, 6, 4);  /* 4 vertices, 6 edges, 4 triangular faces */
     if (!obj) return NULL;
 
@@ -346,6 +352,9 @@ object_t* object_tetrahedron(void) {
     for (int i = 0; i < 6; i++) {
         c[i] = (RGB){255, 255, 255};  /* white edges */
     }
+
+    obj->draw_mode = mode;
+    obj->cull_backface = cull_backface;
 
     return obj;
 }
@@ -490,128 +499,178 @@ static vec3 sphere_get_midpoint(vec3 a, vec3 b) {
     return vec3_norm(mid);  /* Project to unit sphere */
 }
 
+/* ---- Local helpers for icosphere subdivision ---- */
+typedef struct { uint32_t key; uint16_t idx; } MidEntry;
+typedef struct { MidEntry *tab; uint32_t cap; } MidCache;
+
+static inline uint16_t mid_lookup(MidCache *mc,
+                                  vec3 **V, uint16_t *vcount, uint16_t *vcap,
+                                  uint16_t a, uint16_t b) {
+    /* Without cache, always add */
+    if (!mc || !mc->tab || mc->cap == 0) {
+        vec3 m = sphere_get_midpoint((*V)[a], (*V)[b]);
+        return sphere_add_vertex(V, vcount, vcap, m);
+    }
+    uint16_t lo = (a < b) ? a : b;
+    uint16_t hi = (a < b) ? b : a;
+    uint32_t key = ((uint32_t)lo << 16) | (uint32_t)hi;
+
+    /* open addressing */
+    const uint32_t cap = mc->cap;
+    uint32_t h = key * 2654435761u;
+    for (uint32_t p = 0; p < cap; ++p) {
+        uint32_t i = (h + p) % cap;
+        if (mc->tab[i].key == key) return mc->tab[i].idx;
+        if (mc->tab[i].key == 0) {
+            vec3 m = sphere_get_midpoint((*V)[a], (*V)[b]);
+            uint16_t idx = sphere_add_vertex(V, vcount, vcap, m);
+            mc->tab[i].key = key; mc->tab[i].idx = idx; return idx;
+        }
+    }
+    /* table full -> fall back */
+    vec3 m = sphere_get_midpoint((*V)[a], (*V)[b]);
+    return sphere_add_vertex(V, vcount, vcap, m);
+}
+
+typedef struct { uint32_t key; uint8_t used; } EdgeEntry;
+typedef struct { EdgeEntry *tab; uint32_t cap; } EdgeSet;
+
+static inline void add_edge_unique(EdgeSet *es, vec2 *E, uint16_t *ecount,
+                                   uint16_t a, uint16_t b) {
+    uint16_t lo = (a < b) ? a : b;
+    uint16_t hi = (a < b) ? b : a;
+    if (!es || !es->tab || es->cap == 0) {
+        E[(*ecount)++] = (vec2){ (float)lo, (float)hi };
+        return;
+    }
+    uint32_t key = ((uint32_t)lo << 16) | (uint32_t)hi;
+    uint32_t h = key * 2654435761u;
+    const uint32_t cap = es->cap;
+    for (uint32_t p = 0; p < cap; ++p) {
+        uint32_t i = (h + p) % cap;
+        if (es->tab[i].used && es->tab[i].key == key) return; /* already added */
+        if (!es->tab[i].used) {
+            es->tab[i].used = 1; es->tab[i].key = key;
+            E[(*ecount)++] = (vec2){ (float)lo, (float)hi };
+            return;
+        }
+    }
+    /* set full: still add (may duplicate) */
+    E[(*ecount)++] = (vec2){ (float)lo, (float)hi };
+}
+
 /** 
  * @brief Create a sphere object (geodesic approximation with icosphere)
  * @param subdivisions Number of subdivision levels (0-4 recommended)
  */
 object_t* object_sphere(uint16_t subdivisions) {
-    /* Limit subdivisions for memory and performance reasons */
+    /* Clamp subdivisions for memory/perf */
     if (subdivisions > 4) subdivisions = 4;
-    
-    /* Calculate number of vertices and edges after subdivision */
-    uint16_t base_vertices = 12;
-    uint16_t base_edges = 30;
-    
-    /* Each subdivision level roughly quadruples the triangle count */
-    /* For icosphere: vertices ≈ 10 * 4^level + 2, edges ≈ 30 * 4^level */
-    uint16_t num_vertices = base_vertices;
-    uint16_t num_edges = base_edges;
-    
-    for (uint16_t i = 0; i < subdivisions; i++) {
-        /* Each edge split adds one new vertex, each triangle split adds 3 new edges per original edge */
-        num_vertices += num_edges;  /* One new vertex per edge split */
-        num_edges *= 4;             /* Each edge becomes 4 edges after subdivision */
+
+    /* Capacity estimates for icosphere */
+    uint16_t num_vertices = 12;           /* 10*4^0 + 2 */
+    uint16_t num_faces    = 20;           /* base icosahedron */
+    uint16_t num_edges    = 30;           /* base */
+    for (uint16_t i = 0; i < subdivisions; ++i) {
+        num_vertices += num_edges;        /* one new vertex per split edge */
+        num_faces    *= 4;                /* each face -> 4 */
+        num_edges    *= 4;                /* each edge -> 4 */
     }
-    
-    uint16_t num_faces = 20; /* icosahedron has 20 triangular faces */
-    for (uint16_t i = 0; i < subdivisions; i++) {
-        num_faces *= 4;  /* Each subdivision quadruples triangle count */
-    }
-    
-    /* Create object with calculated capacity */
+
     object_t *obj = object_new(num_vertices, num_edges, num_faces);
     if (!obj) return NULL;
 
-    /* Golden ratio for icosahedron construction */
-    float phi = (1.0f + sqrtf(5.0f)) / 2.0f;  /* golden ratio */
-    float inv_len = 1.0f / sqrtf(1.0f + phi * phi);
-    
-    /* Start with icosahedron vertices */
-    vec3 icosahedron_vertices[12] = {
-        { inv_len,  phi * inv_len,  0},
-        {-inv_len,  phi * inv_len,  0},
-        { inv_len, -phi * inv_len,  0},
-        {-inv_len, -phi * inv_len,  0},
-        { 0,  inv_len,  phi * inv_len},
-        { 0, -inv_len,  phi * inv_len},
-        { 0,  inv_len, -phi * inv_len},
-        { 0, -inv_len, -phi * inv_len},
-        { phi * inv_len,  0,  inv_len},
-        {-phi * inv_len,  0,  inv_len},
-        { phi * inv_len,  0, -inv_len},
-        {-phi * inv_len,  0, -inv_len}
+    /* Build normalized icosahedron */
+    const float phi = (1.0f + sqrtf(5.0f)) * 0.5f;
+    const float inv_len = 1.0f / sqrtf(1.0f + phi*phi);
+    vec3 base_v[12] = {
+        { inv_len,  phi*inv_len, 0}, { -inv_len,  phi*inv_len, 0},
+        { inv_len, -phi*inv_len, 0}, { -inv_len, -phi*inv_len, 0},
+        { 0,  inv_len,  phi*inv_len}, { 0, -inv_len,  phi*inv_len},
+        { 0,  inv_len, -phi*inv_len}, { 0, -inv_len, -phi*inv_len},
+        {  phi*inv_len, 0,  inv_len}, { -phi*inv_len, 0,  inv_len},
+        {  phi*inv_len, 0, -inv_len}, { -phi*inv_len, 0, -inv_len}
     };
-    
-    /* Icosahedron edges (as vertex index pairs) */
-    uint16_t icosahedron_edges[30][2] = {
-        {0,1},   {0,4},   {0,6},   {0,8},   {0,10},
-        {1,4},   {1,6},   {1,9},   {1,11},  {2,3},
-        {2,5},   {2,7},   {2,8},   {2,10},  {3,5},
-        {3,7},   {3,9},   {3,11},  {4,5},   {4,8},
-        {4,9},   {5,8},   {5,9},   {6,7},   {6,10},
-        {6,11},  {7,10},  {7,11},  {8,10},  {9,11}
+
+    /* Faces of icosahedron mapped to our vertex order (see comment above) */
+    uint16_t faces_idx[20][3] = {
+        {1,9,4}, {1,4,0}, {1,0,6}, {1,6,11}, {1,11,9},
+        {0,4,8}, {4,9,5}, {9,11,3}, {11,6,7}, {6,0,10},
+        {2,8,5}, {2,5,3}, {2,3,7}, {2,7,10}, {2,10,8},
+        {5,8,4}, {3,5,9}, {7,3,11}, {10,7,6}, {8,10,0}
     };
-    
-    /* Initialize with base icosahedron */
-    vec3 *vertices = obj->verticies->list;
-    vec2 *edges = obj->edges->list;
-    
-    uint16_t vertex_count = 0;
-    uint16_t edge_count = 0;
-    uint16_t vertex_capacity = num_vertices;
-    
-    /* Add initial vertices */
-    for (int i = 0; i < 12; i++) {
-        sphere_add_vertex(&vertices, &vertex_count, &vertex_capacity, icosahedron_vertices[i]);
+
+    vec3 *V = obj->verticies->list;
+    vec3 *N = obj->normals->list;
+    vec3 *F = obj->faces->list; /* actually vec3 of indices (x,y,z) */
+
+    uint16_t vcount = 0; uint16_t vcap = num_vertices;
+    for (int i = 0; i < 12; ++i) {
+        sphere_add_vertex(&V, &vcount, &vcap, base_v[i]);
     }
-    
-    /* Add initial edges */
-    for (int i = 0; i < 30; i++) {
-        edges[edge_count++] = (vec2){icosahedron_edges[i][0], icosahedron_edges[i][1]};
+
+    /* Initialize faces */
+    uint16_t fcount = 20;
+    for (int i = 0; i < 20; ++i) {
+        F[i] = (vec3){ (float)faces_idx[i][0], (float)faces_idx[i][1], (float)faces_idx[i][2] };
     }
-    
-    /* Perform subdivisions */
-    for (uint16_t level = 0; level < subdivisions; level++) {
-        uint16_t old_edge_count = edge_count;
-        vec2 *old_edges = malloc(old_edge_count * sizeof(vec2));
-        if (!old_edges) break;  /* Out of memory, return what we have */
-        
-        /* Copy current edges */
-        for (uint16_t i = 0; i < old_edge_count; i++) {
-            old_edges[i] = edges[i];
+
+    /* Midpoint cache to avoid duplicate vertices on shared edges */
+    MidCache mc = {0};
+    mc.cap = (uint32_t)(num_edges * 2u + 64u);
+    mc.tab = (mc.cap ? calloc(mc.cap, sizeof(MidEntry)) : NULL);
+
+    /* Subdivide faces */
+    for (uint16_t s = 0; s < subdivisions; ++s) {
+        uint16_t old_fcount = fcount;
+        vec3 *oldF = malloc(old_fcount * sizeof(vec3));
+        if (!oldF) break;
+        for (uint16_t i = 0; i < old_fcount; ++i) oldF[i] = F[i];
+        fcount = 0;
+        for (uint16_t i = 0; i < old_fcount; ++i) {
+            uint16_t v0 = (uint16_t)oldF[i].x;
+            uint16_t v1 = (uint16_t)oldF[i].y;
+            uint16_t v2 = (uint16_t)oldF[i].z;
+            uint16_t a = mid_lookup(&mc, &V, &vcount, &vcap, v0, v1);
+            uint16_t b = mid_lookup(&mc, &V, &vcount, &vcap, v1, v2);
+            uint16_t c = mid_lookup(&mc, &V, &vcount, &vcap, v2, v0);
+            /* Four new faces */
+            F[fcount++] = (vec3){ (float)v0, (float)a, (float)c };
+            F[fcount++] = (vec3){ (float)v1, (float)b, (float)a };
+            F[fcount++] = (vec3){ (float)v2, (float)c, (float)b };
+            F[fcount++] = (vec3){ (float)a,  (float)b, (float)c };
         }
-        
-        /* Reset edge count for new subdivision */
-        edge_count = 0;
-        
-        /* Subdivide each edge */
-        for (uint16_t i = 0; i < old_edge_count; i++) {
-            uint16_t v1 = (uint16_t)old_edges[i].x;
-            uint16_t v2 = (uint16_t)old_edges[i].y;
-            
-            /* Get midpoint vertex */
-            vec3 midpoint = sphere_get_midpoint(vertices[v1], vertices[v2]);
-            uint16_t v_mid = sphere_add_vertex(&vertices, &vertex_count, &vertex_capacity, midpoint);
-            
-            /* Create two new edges from the split */
-            if (edge_count < num_edges) {
-                edges[edge_count++] = (vec2){v1, v_mid};
-            }
-            if (edge_count < num_edges) {
-                edges[edge_count++] = (vec2){v_mid, v2};
-            }
-        }
-        
-        /* For a proper geodesic sphere, we should also add edges between midpoints of triangle edges
-         * This is a simplified version that creates a more spherical shape by subdivision */
-        
-        free(old_edges);
+        free(oldF);
     }
-    
-    /* Update actual counts in the object */
-    obj->verticies->length = vertex_count;
-    obj->edges->length = edge_count;
-    
+
+    /* Build unique edges from faces */
+    vec2 *E = obj->edges->list;
+    uint16_t ecount = 0;
+    EdgeSet es = {0};
+    es.cap = (uint32_t)num_edges * 2u + 64u;
+    es.tab = (es.cap ? calloc(es.cap, sizeof(EdgeEntry)) : NULL);
+
+    for (uint16_t i = 0; i < fcount; ++i) {
+        uint16_t i0 = (uint16_t)F[i].x, i1 = (uint16_t)F[i].y, i2 = (uint16_t)F[i].z;
+        add_edge_unique(&es, E, &ecount, i0, i1);
+        add_edge_unique(&es, E, &ecount, i1, i2);
+        add_edge_unique(&es, E, &ecount, i2, i0);
+    }
+
+    /* Face normals (flat) */
+    for (uint16_t i = 0; i < fcount && i < obj->normals->length; ++i) {
+        uint16_t i0 = (uint16_t)F[i].x, i1 = (uint16_t)F[i].y, i2 = (uint16_t)F[i].z;
+        vec3 e1 = vec3_sub(V[i1], V[i0]);
+        vec3 e2 = vec3_sub(V[i2], V[i0]);
+        N[i] = vec3_norm(vec3_cross(e1, e2));
+    }
+
+    if (mc.tab) free(mc.tab);
+    if (es.tab) free(es.tab);
+
+    obj->verticies->length = vcount;
+    obj->faces->length = fcount;
+    obj->edges->length = ecount;
     return obj;
 }
 
