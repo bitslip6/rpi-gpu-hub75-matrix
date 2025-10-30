@@ -36,6 +36,10 @@ static inline vec3 v3_cross(vec3 a, vec3 b){
 }
 static inline vec3 v3_norm(vec3 v){ float d = sqrtf(v3_dot(v,v)); return d>0? (vec3){v.x/d,v.y/d,v.z/d} : (vec3){0,0,0}; }
 
+/* Forward decl for clip-space helper used in filled renderer culling */
+static inline vec4 mat4_mul_point_clip_xyw(const mat4 m, const vec3 p);
+static inline float tri_orientation_clip_xyw(vec4 v0, vec4 v1, vec4 v2);
+
 /* ---------------- Shadows: column-major math helpers (match 3d.c) ---------------- */
 typedef struct { int w, h; float *depth; mat4 VP; mat4 V; float z_bias; bool valid; } ShadowMap;
 static _Thread_local ShadowMap *tls_shadow_maps = NULL;
@@ -117,6 +121,69 @@ static RGB compute_face_shaded_color(size_t face_index,
                         float x_ndc = cclip.x * invw;
                         float y_ndc = cclip.y * invw;
                         float z_lv = cm_m4_mul_point3(SM->V, cw).z;
+                        int sx = (int)((x_ndc * 0.5f + 0.5f) * (float)(SM->w - 1) + 0.5f);
+                        int sy = (int)((y_ndc * 0.5f + 0.5f) * (float)(SM->h - 1) + 0.5f);
+                        if ((unsigned)sx < (unsigned)SM->w && (unsigned)sy < (unsigned)SM->h) {
+                            size_t sidx = (size_t)sy * (size_t)SM->w + (size_t)sx;
+                            float map_z = SM->depth[sidx];
+                            if (z_lv > map_z + SM->z_bias) {
+                                vis = 0.0f;
+                            }
+                        }
+                    }
+                }
+                if (vis > 0.0f) {
+                    lr += L->color.r * L->intensity * ndotl;
+                    lg += L->color.g * L->intensity * ndotl;
+                    lb += L->color.b * L->intensity * ndotl;
+                }
+            }
+        }
+    }
+
+    float cr = fminf(fmaxf(br * lr, 0.0f), 1.0f);
+    float cg = fminf(fmaxf(bg * lg, 0.0f), 1.0f);
+    float cb = fminf(fmaxf(bb * lb, 0.0f), 1.0f);
+    RGB shaded_rgb;
+    shaded_rgb.r = (uint8_t)(cr * 255.0f);
+    shaded_rgb.g = (uint8_t)(cg * 255.0f);
+    shaded_rgb.b = (uint8_t)(cb * 255.0f);
+    return shaded_rgb;
+}
+
+/* Compute shaded color for a vertex using its world-space position and normal */
+static RGB compute_vertex_shaded_color(RGB base_rgb,
+                                       vec3 v_world,
+                                       vec3 n_world,
+                                       const object_t *obj,
+                                       const scene3d_lighting_t *lighting){
+    if (!lighting) return base_rgb;
+
+    /* normalize normal */
+    float nlen = sqrtf(n_world.x*n_world.x + n_world.y*n_world.y + n_world.z*n_world.z);
+    if (nlen > 1e-6f) { n_world.x/=nlen; n_world.y/=nlen; n_world.z/=nlen; }
+
+    float br = base_rgb.r/255.0f, bg = base_rgb.g/255.0f, bb = base_rgb.b/255.0f;
+    float lr = lighting->ambient.r, lg = lighting->ambient.g, lb = lighting->ambient.b;
+
+    for (uint16_t li = 0; li < lighting->num_lights; ++li) {
+        const light_t *L = &lighting->lights[li];
+        if (L->intensity <= 0.0f) continue;
+        if (L->type == LIGHT_DIRECTIONAL) {
+            float Lx = -L->direction.x, Ly = -L->direction.y, Lz = -L->direction.z;
+            float Llen = sqrtf(Lx*Lx + Ly*Ly + Lz*Lz);
+            if (Llen > 1e-6f) { Lx/=Llen; Ly/=Llen; Lz/=Llen; }
+            float ndotl = n_world.x*Lx + n_world.y*Ly + n_world.z*Lz;
+            if (ndotl > 0.0f) {
+                float vis = 1.0f;
+                if (tls_shadow_maps && li < tls_shadow_count && obj->shadow_enabled && L->casts_shadows && L->shadow_enabled) {
+                    ShadowMap *SM = &tls_shadow_maps[li];
+                    if (SM && SM->valid && SM->depth) {
+                        vec4 cclip = cm_m4_mul_point4(SM->VP, v_world);
+                        float invw = (fabsf(cclip.w) > 1e-6f) ? (1.0f / cclip.w) : 1.0f;
+                        float x_ndc = cclip.x * invw;
+                        float y_ndc = cclip.y * invw;
+                        float z_lv = cm_m4_mul_point3(SM->V, v_world).z;
                         int sx = (int)((x_ndc * 0.5f + 0.5f) * (float)(SM->w - 1) + 0.5f);
                         int sy = (int)((y_ndc * 0.5f + 0.5f) * (float)(SM->h - 1) + 0.5f);
                         if ((unsigned)sx < (unsigned)SM->w && (unsigned)sy < (unsigned)SM->h) {
@@ -608,7 +675,7 @@ static inline void draw_triangle_gouraud(hub75_display_t *scene, const Polygonf_
     /* Fast path: solid color triangle -> reuse existing solid fill */
     if (vcolor[0].r == vcolor[1].r && vcolor[0].g == vcolor[1].g && vcolor[0].b == vcolor[1].b &&
         vcolor[0].r == vcolor[2].r && vcolor[0].g == vcolor[2].g && vcolor[0].b == vcolor[2].b) {
-        draw_polygon_fill(scene, poly, vcolor[0]);
+        draw_polygon_fill(scene, (Polygonf_t*)poly, vcolor[0]);
         return;
     }
 
@@ -655,6 +722,12 @@ static inline void draw_triangle_gouraud(hub75_display_t *scene, const Polygonf_
         A2 = -A2; B2 = -B2; C2 = -C2;
         area2 = -area2;
     }
+
+    /* Top-left rule classification per edge (after normalization)
+       Edge considered top-left if A>0 or (A==0 and B<0). */
+    const int tl0 = (A0 > 0) || (A0 == 0 && B0 < 0);
+    const int tl1 = (A1 > 0) || (A1 == 0 && B1 < 0);
+    const int tl2 = (A2 > 0) || (A2 == 0 && B2 < 0);
 
     /* Fixed-point scale (8 fractional bits) for sampling at pixel centers (x+0.5,y+0.5) */
     const int FP = 8;
@@ -713,7 +786,9 @@ static inline void draw_triangle_gouraud(hub75_display_t *scene, const Polygonf_
         int E0 = E0_row, E1 = E1_row, E2 = E2_row;
         int rfp = r_row, gfp = g_row, bfp = b_row;
         for (int px = minx; px <= maxx; ++px) {
-            if (E0 >= 0 && E1 >= 0 && E2 >= 0) {
+            if ( (E0 > 0 || (E0 == 0 && tl0)) &&
+                 (E1 > 0 || (E1 == 0 && tl1)) &&
+                 (E2 > 0 || (E2 == 0 && tl2)) ) {
                 int r8 = rfp >> FP; if (r8 < 0) r8 = 0; else if (r8 > 255) r8 = 255;
                 int g8 = gfp >> FP; if (g8 < 0) g8 = 0; else if (g8 > 255) g8 = 255;
                 int b8 = bfp >> FP; if (b8 < 0) b8 = 0; else if (b8 > 255) b8 = 255;
@@ -1102,6 +1177,10 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
     }
 
     size_t nf = obj->faces->length;
+    /* Ensure vertex normals exist once */
+    if (obj->vertex_normals && !obj->vertex_normals_ready) {
+        object_build_vertex_normals(obj);
+    }
     if (!obj->trifill_buffer || obj->trifill_capacity < nf) {
         void *newbuf = realloc(obj->trifill_buffer, sizeof(_TriFill) * nf);
         if (!newbuf) return;
@@ -1118,18 +1197,35 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
             obj->rendered_vertices[(size_t)face.y],
             obj->rendered_vertices[(size_t)face.z]
         };
-        /* Backface culling in NDC (CCW = front) */
-        if (obj->cull_backface && is_backface_ndc(v[0], v[1], v[2])) continue;
+        /* Robust backface culling in clip-space XYW (pre-divide) */
+        if (obj->cull_backface) {
+            vec3 p0 = obj->verticies->list[(uint16_t)face.x];
+            vec3 p1 = obj->verticies->list[(uint16_t)face.y];
+            vec3 p2 = obj->verticies->list[(uint16_t)face.z];
+            vec4 c0 = mat4_mul_point_clip_xyw(mvp, p0);
+            vec4 c1 = mat4_mul_point_clip_xyw(mvp, p1);
+            vec4 c2 = mat4_mul_point_clip_xyw(mvp, p2);
+            float orient = tri_orientation_clip_xyw(c0, c1, c2);
+            bool back = FRONT_FACE_CCW ? (orient <= 0.0f) : (orient >= 0.0f);
+            if (back) continue;
+        }
 
         float nx[3], ny[3];
         for (int vi = 0; vi < 3; ++vi) {
             nx[vi] = 0.5f * (v[vi].x + 1.0f);
             ny[vi] = 0.5f * (v[vi].y + 1.0f);
         }
-          /* Per-vertex shading (Gouraud): for now, use face-based shading result for each vertex.
-              This keeps visuals unchanged while enabling vertex-level shadows in a later step. */
-          RGB shaded_rgb = compute_face_shaded_color(i, obj, lighting, M_model, N3);
-          RGB vcolor[3] = { shaded_rgb, shaded_rgb, shaded_rgb };
+        /* Base material color per face (matches prior behavior) */
+        RGB base_rgb = (i < obj->edge_colors->length) ? obj->edge_colors->list[i] : (RGB){255,255,255};
+        RGB vcolor[3];
+        /* Compute per-vertex world positions and normals, then shade */
+        uint16_t idx[3] = { (uint16_t)face.x, (uint16_t)face.y, (uint16_t)face.z };
+        for (int vi = 0; vi < 3; ++vi) {
+            vec3 vw = cm_m4_mul_point3(M_model, obj->verticies->list[idx[vi]]);
+            vec3 n_obj = obj->vertex_normals && obj->vertex_normals->list ? obj->vertex_normals->list[idx[vi]] : (vec3){0,0,1};
+            vec3 nw = mat3_mul_vec3(N3, n_obj);
+            vcolor[vi] = compute_vertex_shaded_color(base_rgb, vw, nw, obj, lighting);
+        }
         _TriFill t;
         t.depth = (v[0].z + v[1].z + v[2].z) / 3.0f;
         t.poly.num_points = 3;
@@ -1271,7 +1367,16 @@ void api_geo_render_wire_clip_cull(const camera_t *cam, object_t *obj, const tra
         x2 = (x2 < 0) ? 0 : (x2 >= tls_scene->width) ? tls_scene->width - 1 : x2;
         y2 = (y2 < 0) ? 0 : (y2 >= tls_scene->height) ? tls_scene->height - 1 : y2;
 
-        hub_line_aa(tls_scene, (uint16_t)x1, (uint16_t)y1, (uint16_t)x2, (uint16_t)y2, obj->edge_colors->list[i]);
+        /* Guard against malformed edge/color arrays */
+        RGB edge_col = {255,255,255};
+        if (obj->edge_colors && i < obj->edge_colors->length) {
+            edge_col = obj->edge_colors->list[i];
+        }
+        /* Ensure edge indices are within vertex range; skip if out-of-bounds */
+        if ((size_t)edge.x >= obj->verticies->length || (size_t)edge.y >= obj->verticies->length) {
+            continue;
+        }
+        hub_line_aa(tls_scene, (uint16_t)x1, (uint16_t)y1, (uint16_t)x2, (uint16_t)y2, edge_col);
     }
 
     if (front_face) free(front_face);

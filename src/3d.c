@@ -234,19 +234,22 @@ object_t* object_new(const uint16_t num_vertices, const uint16_t num_edges, cons
     obj->edges = edge_list_new(num_edges);
     obj->faces = face_list_new(num_faces);
     obj->normals = normal_list_new(num_faces);
+    obj->vertex_normals = normal_list_new(num_vertices);
+    obj->vertex_normals_ready = false;
 
     obj->trifill_buffer = NULL;
     obj->trifill_capacity = 0;
 
     if (!obj->verticies || !obj->rendered_vertices || !obj->edge_colors ||
-        !obj->edges || !obj->faces || !obj->normals) {
+        !obj->edges || !obj->faces || !obj->normals || !obj->vertex_normals) {
         /* Cleanup on failure */
         if (obj->verticies) free(obj->verticies);
         if (obj->rendered_vertices) free(obj->rendered_vertices);
         if (obj->edge_colors) free(obj->edge_colors);
         if (obj->edges) free(obj->edges);
         if (obj->faces) free(obj->faces);
-        if (obj->normals) free(obj->normals);
+    if (obj->normals) free(obj->normals);
+    if (obj->vertex_normals) free(obj->vertex_normals);
         if (obj->trifill_buffer) free(obj->trifill_buffer);
         free(obj);
         return NULL;
@@ -262,6 +265,7 @@ object_t* object_new(const uint16_t num_vertices, const uint16_t num_edges, cons
             if (obj->edges) free(obj->edges);
             if (obj->faces) free(obj->faces);
             if (obj->normals) free(obj->normals);
+            if (obj->vertex_normals) free(obj->vertex_normals);
             free(obj);
             return NULL;
         }
@@ -1158,6 +1162,31 @@ void object_free(object_t *obj) {
     if (obj->edges) free(obj->edges);
     if (obj->faces) free(obj->faces);
     if (obj->normals) free(obj->normals);
+    if (obj->vertex_normals) free(obj->vertex_normals);
     if (obj->trifill_buffer) free(obj->trifill_buffer);
     free(obj);
+}
+
+/* Build smooth per-vertex normals by averaging adjacent face normals and normalizing */
+void object_build_vertex_normals(object_t *obj) {
+    if (!obj || !obj->verticies || !obj->faces || !obj->normals || !obj->vertex_normals) return;
+    uint16_t nv = obj->verticies->length;
+    uint16_t nf = obj->faces->length;
+    vec3 *VN = obj->vertex_normals->list;
+    if (!VN) return;
+    /* zero accumulators */
+    for (uint16_t i = 0; i < nv; ++i) VN[i] = (vec3){0,0,0};
+    /* accumulate face normals for each vertex */
+    for (uint16_t f = 0; f < nf; ++f) {
+        vec3 n = (f < obj->normals->length) ? obj->normals->list[f] : (vec3){0,0,1};
+        uint16_t i0 = (uint16_t)obj->faces->list[f].x;
+        uint16_t i1 = (uint16_t)obj->faces->list[f].y;
+        uint16_t i2 = (uint16_t)obj->faces->list[f].z;
+        if (i0 < nv) VN[i0] = vec3_add(VN[i0], n);
+        if (i1 < nv) VN[i1] = vec3_add(VN[i1], n);
+        if (i2 < nv) VN[i2] = vec3_add(VN[i2], n);
+    }
+    /* normalize */
+    for (uint16_t i = 0; i < nv; ++i) VN[i] = vec3_norm(VN[i]);
+    obj->vertex_normals_ready = true;
 }

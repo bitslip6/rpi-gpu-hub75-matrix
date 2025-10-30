@@ -39,15 +39,8 @@
 #include "pixels.h"
 #include "spsc.h"
 
-#define USE_STB_IMAGE
-#ifdef USE_STB_IMAGE
-#define STB_IMAGE_IMPLEMENTATION
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wconversion"
-#pragma GCC diagnostic ignored "-Wsign-conversion"
-#pragma GCC diagnostic ignored "-Wdouble-promotion"
-#include "stb_image.h"
-#pragma GCC diagnostic pop
+#ifdef HAVE_LIBPNG
+#include <png.h>
 #endif
 
 /*
@@ -102,57 +95,79 @@ const char *vertex_shader_source =
     "}\n";
 
 /**
- * Load Texture:
- * Loads a PNG texture from the specified file path using stb_image.
- * Generates an OpenGL texture, sets texture parameters, and returns the texture ID.
+ * Load Texture using libpng
  */
-#ifdef USE_STB_IMAGE
-GLuint load_texture(const char *filePath)
+#ifdef HAVE_LIBPNG
+static GLuint load_texture(const char *filePath)
 {
-    GLuint textureID;
+    FILE *fp = fopen(filePath, "rb");
+    if (!fp) {
+        die("Failed to open texture: %s\n", filePath);
+    }
+
+    png_structp png_ptr = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png_ptr) { fclose(fp); die("png_create_read_struct failed for %s\n", filePath); }
+    png_infop info_ptr = png_create_info_struct(png_ptr);
+    if (!info_ptr) { png_destroy_read_struct(&png_ptr, NULL, NULL); fclose(fp); die("png_create_info_struct failed for %s\n", filePath); }
+    if (setjmp(png_jmpbuf(png_ptr))) {
+        png_destroy_read_struct(&png_ptr, &info_ptr, NULL); fclose(fp); die("png read error for %s\n", filePath);
+    }
+    png_init_io(png_ptr, fp);
+    png_read_info(png_ptr, info_ptr);
+
+    png_uint_32 width, height;
+    int bit_depth, color_type;
+    png_get_IHDR(png_ptr, info_ptr, &width, &height, &bit_depth, &color_type, NULL, NULL, NULL);
+
+    // Normalize to 8-bit RGBA
+    if (bit_depth == 16) png_set_strip_16(png_ptr);
+    if (color_type == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png_ptr);
+    if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8) png_set_expand_gray_1_2_4_to_8(png_ptr);
+    if (png_get_valid(png_ptr, info_ptr, PNG_INFO_tRNS)) png_set_tRNS_to_alpha(png_ptr);
+    if (color_type == PNG_COLOR_TYPE_RGB || color_type == PNG_COLOR_TYPE_GRAY || color_type == PNG_COLOR_TYPE_PALETTE) {
+        png_set_filler(png_ptr, 0xFF, PNG_FILLER_AFTER);
+    }
+    else if (color_type == PNG_COLOR_TYPE_GRAY_ALPHA) {
+        // already GA -> expand gray to RGB
+        png_set_gray_to_rgb(png_ptr);
+    }
+    // Ensure RGB order
+    // png_set_bgr(png_ptr); // not needed generally
+
+    png_read_update_info(png_ptr, info_ptr);
+
+    size_t rowbytes = png_get_rowbytes(png_ptr, info_ptr);
+    png_bytep image_data = (png_bytep)malloc(rowbytes * height);
+    if (!image_data) {
+        png_destroy_read_struct(&png_ptr, &info_ptr, NULL); fclose(fp); die("Out of memory decoding %s\n", filePath);
+    }
+    png_bytep *row_pointers = (png_bytep*)malloc(sizeof(png_bytep) * height);
+    if (!row_pointers) {
+        free(image_data); png_destroy_read_struct(&png_ptr, &info_ptr, NULL); fclose(fp); die("Out of memory (rows) decoding %s\n", filePath);
+    }
+    for (png_uint_32 y = 0; y < height; ++y) {
+        row_pointers[y] = image_data + y * rowbytes;
+    }
+    png_read_image(png_ptr, row_pointers);
+    png_read_end(png_ptr, NULL);
+    png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
+    fclose(fp);
+    free(row_pointers);
+
+    // Upload to GL
+    GLuint textureID = 0;
     glGenTextures(1, &textureID);
     glBindTexture(GL_TEXTURE_2D, textureID);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)width, (GLsizei)height, 0, GL_RGBA, GL_UNSIGNED_BYTE, image_data);
+    glGenerateMipmap(GL_TEXTURE_2D);
 
-    // Load the texture data from a PNG file using stb_image
-    int width, height, nrChannels;
-    unsigned char *data = stbi_load(filePath, &width, &height, &nrChannels, 0);
-    if (data)
-    {
-        // Determine the format based on the number of channels in the PNG file
-        GLenum format;
-        if (nrChannels == 1)
-            format = GL_RED;
-        else if (nrChannels == 3)
-            format = GL_RGB;
-        else if (nrChannels == 4)
-            format = GL_RGBA;
-        else
-        {
-            printf("Unsupported number of channels in PNG: %d\n", nrChannels);
-            stbi_image_free(data);
-            return 0;
-        }
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
-        // Upload texture to GPU with mipmaps
-        // internalformat parameter (3rd) is GLint; our chosen 'format' is GLenum, cast to GLint to silence -Wsign-conversion
-        glTexImage2D(GL_TEXTURE_2D, 0, (GLint)format, width, height, 0, format, GL_UNSIGNED_BYTE, data);
-        glGenerateMipmap(GL_TEXTURE_2D); // Generate mipmaps for texture
-
-        // Set texture parameters for wrapping and filtering
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);      // Wrap horizontally
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);      // Wrap vertically
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); // fast filter
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST); // fast filter
-    }
-    else
-    {
-        die("Failed to load texture: %s\n", filePath);
-    }
-
-    debug("loaded texture %s [%dx%d]\n", filePath, width, height);
-    // Free image memory after loading into OpenGL
-    stbi_image_free(data);
-
+    debug("loaded texture %s [%ux%u]\n", filePath, (unsigned)width, (unsigned)height);
+    free(image_data);
     return textureID;
 }
 #endif
@@ -328,8 +343,8 @@ int open_dri_device()
     return fd;
 }
 
-#ifdef USE_STB_IMAGE
-void bind_tex(char *shader_file, char *texture_extension, GLuint unit)
+#ifdef HAVE_LIBPNG
+static void bind_tex(char *shader_file, char *texture_extension, GLuint unit)
 {
     char *chan0 = change_file_extension(shader_file, texture_extension);
     if (access(chan0, R_OK) == 0)
@@ -704,17 +719,14 @@ void *render_shader(void *arg)
     // IMPORTANT: ensure tight unpack before any texture uploads
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
-    // Optional textures
-#ifdef USE_STB_IMAGE
-
+    // Optional textures via libpng
+#ifdef HAVE_LIBPNG
     bind_tex(scene->shader_file, "channel0", 0);
     bind_tex(scene->shader_file, "channel1", 1);
-
     GLint c0_loc = glGetUniformLocation(program, "iChannel0");
     GLint c1_loc = glGetUniformLocation(program, "iChannel1");
     glUniform1i(c0_loc, 0);
     glUniform1i(c1_loc, 1);
-
 #endif
 
     // uniforms

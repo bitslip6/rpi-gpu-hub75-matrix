@@ -546,6 +546,8 @@ typedef struct {
     edge_list_t *edges;
     face_list_t *faces;       /* NEW: triangle definitions */
     normal_list_t *normals;   /* NEW: face normals */
+    normal_list_t *vertex_normals; /* NEW: smooth per-vertex normals */
+    bool vertex_normals_ready;     /* computed once flag */
     color_list_t *edge_colors;
 
     vec3 *rendered_vertices;
@@ -577,6 +579,8 @@ object_t* object_plane(uint16_t width_segments, uint16_t height_segments);
 mat4 camera_project(const camera_t *cam, const transform_t *obj_xform);
 void transform_mesh_to_ndc(const vec3 *in_vertices, size_t n, mat4 mvp, vec3 *out_ndc);
 object_t* object_new(uint16_t num_vertices, uint16_t num_edges, uint16_t num_faces);
+/* Build smooth per-vertex normals from faces (averaged and normalized) */
+void object_build_vertex_normals(object_t *obj);
 
 /* 3D math utilities (normals) */
 /* Build model matrix (T * Rz * Ry * Rx * S) */
