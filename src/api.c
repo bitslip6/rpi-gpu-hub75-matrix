@@ -16,6 +16,11 @@
 #  error "need thread local storage support (_Thread_local)"
 #endif
 
+/* Allow compile-time flip of front-face convention if needed */
+#ifndef FRONT_FACE_CCW
+#define FRONT_FACE_CCW 1
+#endif
+
 /* Thread-local storage for the current scene being processed by this thread */
 static _Thread_local hub75_display_t *tls_scene = NULL;
 static _Thread_local scene3d_t *tls_current_os = NULL;
@@ -60,6 +65,86 @@ static inline vec4 cm_m4_mul_point4(const mat4 m, const vec3 p){
 static inline vec3 cm_m4_mul_point3(const mat4 m, const vec3 p){
     vec4 v = cm_m4_mul_point4(m, p);
     return (vec3){v.x, v.y, v.z};
+}
+
+/* -------- Helpers for filled renderer -------- */
+static inline bool is_backface_ndc(const vec3 v0, const vec3 v1, const vec3 v2){
+    float ax = v1.x - v0.x, ay = v1.y - v0.y;
+    float bx = v2.x - v0.x, by = v2.y - v0.y;
+    float area = ax * by - ay * bx;
+    return (area < 0.0f);
+}
+
+/* Compute shaded color for a face using face normal + centroid shadow test (matches prior behavior) */
+static RGB compute_face_shaded_color(size_t face_index,
+                                     const object_t *obj,
+                                     const scene3d_lighting_t *lighting,
+                                     const mat4 M_model,
+                                     const float N3[9]){
+    RGB base_rgb = (face_index < obj->edge_colors->length) ? obj->edge_colors->list[face_index] : (RGB){255,255,255};
+    if (!lighting) return base_rgb;
+
+    vec3 n_obj = (obj->normals && face_index < obj->normals->length) ? obj->normals->list[face_index] : (vec3){0,0,1};
+    vec3 n_world = mat3_mul_vec3(N3, n_obj);
+    float n_len = sqrtf(n_world.x*n_world.x + n_world.y*n_world.y + n_world.z*n_world.z);
+    if (n_len > 1e-6f) { n_world.x/=n_len; n_world.y/=n_len; n_world.z/=n_len; }
+
+    float br = base_rgb.r/255.0f, bg = base_rgb.g/255.0f, bb = base_rgb.b/255.0f;
+    float lr = lighting->ambient.r, lg = lighting->ambient.g, lb = lighting->ambient.b;
+
+    /* World-space centroid for shadow test */
+    vec3 face = obj->faces->list[face_index];
+    vec3 v0w = cm_m4_mul_point3(M_model, obj->verticies->list[(uint16_t)face.x]);
+    vec3 v1w = cm_m4_mul_point3(M_model, obj->verticies->list[(uint16_t)face.y]);
+    vec3 v2w = cm_m4_mul_point3(M_model, obj->verticies->list[(uint16_t)face.z]);
+    vec3 cw = { (v0w.x+v1w.x+v2w.x)/3.0f, (v0w.y+v1w.y+v2w.y)/3.0f, (v0w.z+v1w.z+v2w.z)/3.0f };
+
+    for (uint16_t li = 0; li < lighting->num_lights; ++li) {
+        const light_t *L = &lighting->lights[li];
+        if (L->intensity <= 0.0f) continue;
+        if (L->type == LIGHT_DIRECTIONAL) {
+            float Lx = -L->direction.x, Ly = -L->direction.y, Lz = -L->direction.z;
+            float Llen = sqrtf(Lx*Lx + Ly*Ly + Lz*Lz);
+            if (Llen > 1e-6f) { Lx/=Llen; Ly/=Llen; Lz/=Llen; }
+            float ndotl = n_world.x*Lx + n_world.y*Ly + n_world.z*Lz;
+            if (ndotl > 0.0f) {
+                float vis = 1.0f;
+                if (tls_shadow_maps && li < tls_shadow_count && obj->shadow_enabled && L->casts_shadows && L->shadow_enabled) {
+                    ShadowMap *SM = &tls_shadow_maps[li];
+                    if (SM && SM->valid && SM->depth) {
+                        vec4 cclip = cm_m4_mul_point4(SM->VP, cw);
+                        float invw = (fabsf(cclip.w) > 1e-6f) ? (1.0f / cclip.w) : 1.0f;
+                        float x_ndc = cclip.x * invw;
+                        float y_ndc = cclip.y * invw;
+                        float z_lv = cm_m4_mul_point3(SM->V, cw).z;
+                        int sx = (int)((x_ndc * 0.5f + 0.5f) * (float)(SM->w - 1) + 0.5f);
+                        int sy = (int)((y_ndc * 0.5f + 0.5f) * (float)(SM->h - 1) + 0.5f);
+                        if ((unsigned)sx < (unsigned)SM->w && (unsigned)sy < (unsigned)SM->h) {
+                            size_t sidx = (size_t)sy * (size_t)SM->w + (size_t)sx;
+                            float map_z = SM->depth[sidx];
+                            if (z_lv > map_z + SM->z_bias) {
+                                vis = 0.0f;
+                            }
+                        }
+                    }
+                }
+                if (vis > 0.0f) {
+                    lr += L->color.r * L->intensity * ndotl;
+                    lg += L->color.g * L->intensity * ndotl;
+                    lb += L->color.b * L->intensity * ndotl;
+                }
+            }
+        }
+    }
+
+    float cr = fminf(fmaxf(br * lr, 0.0f), 1.0f);
+    float cg = fminf(fmaxf(bg * lg, 0.0f), 1.0f);
+    float cb = fminf(fmaxf(bb * lb, 0.0f), 1.0f);
+    RGB shaded_rgb;
+    shaded_rgb.r = (uint8_t)(cr * 255.0f);
+    shaded_rgb.g = (uint8_t)(cg * 255.0f);
+    shaded_rgb.b = (uint8_t)(cb * 255.0f);
+    return shaded_rgb;
 }
 static inline mat4 cm_m4_look_at(vec3 eye, vec3 target, vec3 up){
     vec3 f = v3_norm((vec3){ target.x - eye.x, target.y - eye.y, target.z - eye.z });
@@ -514,6 +599,135 @@ void draw_polygon_fill(hub75_display_t *scene, Polygonf_t *poly, RGB color)
     }
 }
 
+/* Gouraud-shaded triangle rasterization (normalized coords -> screen)
+ * Integer edge functions for inside test + fixed-point color interpolation for speed.
+ */
+static inline void draw_triangle_gouraud(hub75_display_t *scene, const Polygonf_t *poly, const RGB vcolor[3]) {
+    if (!scene || !scene->image || !poly || poly->num_points != 3) return;
+
+    /* Fast path: solid color triangle -> reuse existing solid fill */
+    if (vcolor[0].r == vcolor[1].r && vcolor[0].g == vcolor[1].g && vcolor[0].b == vcolor[1].b &&
+        vcolor[0].r == vcolor[2].r && vcolor[0].g == vcolor[2].g && vcolor[0].b == vcolor[2].b) {
+        draw_polygon_fill(scene, poly, vcolor[0]);
+        return;
+    }
+
+    /* Convert to pixel space */
+    int x[3], y[3];
+    for (int i = 0; i < 3; ++i) {
+        x[i] = norm_to_px(poly->points[i].x, scene->width);
+        y[i] = norm_to_px(poly->points[i].y, scene->height);
+    }
+
+    /* Compute triangle bounding box */
+    int minx = x[0], maxx = x[0];
+    int miny = y[0], maxy = y[0];
+    for (int i = 1; i < 3; ++i) {
+        if (x[i] < minx) { minx = x[i]; }
+        if (x[i] > maxx) { maxx = x[i]; }
+        if (y[i] < miny) { miny = y[i]; }
+        if (y[i] > maxy) { maxy = y[i]; }
+    }
+    /* Clamp to framebuffer */
+    minx = clamp_int(minx, 0, scene->width - 1);
+    maxx = clamp_int(maxx, 0, scene->width - 1);
+    miny = clamp_int(miny, 0, scene->height - 1);
+    maxy = clamp_int(maxy, 0, scene->height - 1);
+    if (minx > maxx || miny > maxy) return;
+
+    /* Integer edge functions E(x,y) = A*x + B*y + C
+       Define edges for barycentric weights w0,w1,w2 corresponding to vertices v0,v1,v2.
+       E0 is edge v1->v2 evaluated at (x,y), etc. */
+    int x0 = x[0], y0 = y[0];
+    int x1 = x[1], y1 = y[1];
+    int x2 = x[2], y2 = y[2];
+
+    int A0 = (y1 - y2), B0 = (x2 - x1), C0 = x1*y2 - x2*y1; /* w0 */
+    int A1 = (y2 - y0), B1 = (x0 - x2), C1 = x2*y0 - x0*y2; /* w1 */
+    int A2 = (y0 - y1), B2 = (x1 - x0), C2 = x0*y1 - x1*y0; /* w2 */
+
+    int area2 = A0 * x0 + B0 * y0 + C0;
+    if (area2 == 0) return; /* degenerate */
+    if (area2 < 0) {
+        /* Normalize so area is positive and inside test is >= 0 */
+        A0 = -A0; B0 = -B0; C0 = -C0;
+        A1 = -A1; B1 = -B1; C1 = -C1;
+        A2 = -A2; B2 = -B2; C2 = -C2;
+        area2 = -area2;
+    }
+
+    /* Fixed-point scale (8 fractional bits) for sampling at pixel centers (x+0.5,y+0.5) */
+    const int FP = 8;
+    const int ONE = 1 << FP;         /* 256 */
+    const int HALF = ONE >> 1;       /* 128 */
+
+    /* Precompute edge increments in fixed-point */
+    int dE0dx = A0 * ONE, dE0dy = B0 * ONE;
+    int dE1dx = A1 * ONE, dE1dy = B1 * ONE;
+    int dE2dx = A2 * ONE, dE2dy = B2 * ONE;
+
+    /* Evaluate edges at top-left sample point (minx+0.5, miny+0.5) in fixed-point */
+    int X = (minx << FP) + HALF;
+    int Y = (miny << FP) + HALF;
+    int C0fp = C0 * ONE, C1fp = C1 * ONE, C2fp = C2 * ONE;
+    int E0_row = A0 * X + B0 * Y + C0fp;
+    int E1_row = A1 * X + B1 * Y + C1fp;
+    int E2_row = A2 * X + B2 * Y + C2fp;
+
+    /* Precompute color interpolation increments (fixed-point 8 fractional bits) */
+    float inv_area2 = 1.0f / (float)area2;
+    float r0 = (float)vcolor[0].r, g0 = (float)vcolor[0].g, b0 = (float)vcolor[0].b;
+    float r1 = (float)vcolor[1].r, g1 = (float)vcolor[1].g, b1 = (float)vcolor[1].b;
+    float r2 = (float)vcolor[2].r, g2 = (float)vcolor[2].g, b2 = (float)vcolor[2].b;
+
+    float w2dx_f = -(float)A0 * inv_area2 - (float)A1 * inv_area2; /* since A2 = -A0 - A1 */
+    float w2dy_f = -(float)B0 * inv_area2 - (float)B1 * inv_area2; /* since B2 = -B0 - B1 */
+    float dw0dx_f = (float)A0 * inv_area2, dw0dy_f = (float)B0 * inv_area2;
+    float dw1dx_f = (float)A1 * inv_area2, dw1dy_f = (float)B1 * inv_area2;
+
+    float drdx_f = dw0dx_f*r0 + dw1dx_f*r1 + w2dx_f*r2;
+    float dgdx_f = dw0dx_f*g0 + dw1dx_f*g1 + w2dx_f*g2;
+    float dbdx_f = dw0dx_f*b0 + dw1dx_f*b1 + w2dx_f*b2;
+    float drdy_f = dw0dy_f*r0 + dw1dy_f*r1 + w2dy_f*r2;
+    float dgdy_f = dw0dy_f*g0 + dw1dy_f*g1 + w2dy_f*g2;
+    float dbdy_f = dw0dy_f*b0 + dw1dy_f*b1 + w2dy_f*b2;
+
+    int drdx = (int)lrintf(drdx_f * (float)ONE);
+    int dgdx = (int)lrintf(dgdx_f * (float)ONE);
+    int dbdx = (int)lrintf(dbdx_f * (float)ONE);
+    int drdy = (int)lrintf(drdy_f * (float)ONE);
+    int dgdy = (int)lrintf(dgdy_f * (float)ONE);
+    int dbdy = (int)lrintf(dbdy_f * (float)ONE);
+
+    /* Starting color at (minx+0.5, miny+0.5) using floats once, then fixed-point accumulation */
+    float w0_row_f = ((float)(A0 * minx + B0 * miny) + (float)(A0 + B0) * 0.5f + (float)C0) * inv_area2;
+    float w1_row_f = ((float)(A1 * minx + B1 * miny) + (float)(A1 + B1) * 0.5f + (float)C1) * inv_area2;
+    float w2_row_f = 1.0f - w0_row_f - w1_row_f;
+    int r_row = (int)lrintf((w0_row_f*r0 + w1_row_f*r1 + w2_row_f*r2) * (float)ONE);
+    int g_row = (int)lrintf((w0_row_f*g0 + w1_row_f*g1 + w2_row_f*g2) * (float)ONE);
+    int b_row = (int)lrintf((w0_row_f*b0 + w1_row_f*b1 + w2_row_f*b2) * (float)ONE);
+
+    size_t row_stride = (size_t)scene->width * (size_t)scene->stride;
+    for (int py = miny; py <= maxy; ++py) {
+        uint8_t *p = scene->image + (size_t)py * row_stride + (size_t)minx * (size_t)scene->stride;
+        int E0 = E0_row, E1 = E1_row, E2 = E2_row;
+        int rfp = r_row, gfp = g_row, bfp = b_row;
+        for (int px = minx; px <= maxx; ++px) {
+            if (E0 >= 0 && E1 >= 0 && E2 >= 0) {
+                int r8 = rfp >> FP; if (r8 < 0) r8 = 0; else if (r8 > 255) r8 = 255;
+                int g8 = gfp >> FP; if (g8 < 0) g8 = 0; else if (g8 > 255) g8 = 255;
+                int b8 = bfp >> FP; if (b8 < 0) b8 = 0; else if (b8 > 255) b8 = 255;
+                p[0] = (uint8_t)r8; p[1] = (uint8_t)g8; p[2] = (uint8_t)b8;
+            }
+            E0 += dE0dx; E1 += dE1dx; E2 += dE2dx;
+            rfp += drdx; gfp += dgdx; bfp += dbdx;
+            p += scene->stride;
+        }
+        E0_row += dE0dy; E1_row += dE1dy; E2_row += dE2dy;
+        r_row += drdy; g_row += dgdy; b_row += dbdy;
+    }
+}
+
 /**
  * @brief Determine the winding order of a polygon
  * 
@@ -531,18 +745,18 @@ poly_winding_t polygon_winding(const Polygonf_t *poly)
 {
     if (!poly || poly->num_points < 3) return POLY_DEGENERATE;
 
-    double a = 0.0; /* use double for robustness */
+    float a = 0.0;
     size_t n = poly->num_points;
     for (size_t i = 0, j = n - 1; i < n; j = i++) {
-        double xi = poly->points[i].x;
-        double yi = poly->points[i].y;
-        double xj = poly->points[j].x;
-        double yj = poly->points[j].y;
+        float xi = poly->points[i].x;
+        float yi = poly->points[i].y;
+        float xj = poly->points[j].x;
+        float yj = poly->points[j].y;
         a += xj * yi - xi * yj;
     }
 
     /* treat tiny areas as degenerate to avoid jitter on almost-collinear input */
-    const double eps = 1e-12;
+    const float eps = 1e-10;
     if (a > eps)  return POLY_CCW;
     if (a < -eps) return POLY_CW;
     return POLY_DEGENERATE;
@@ -905,79 +1119,17 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
             obj->rendered_vertices[(size_t)face.z]
         };
         /* Backface culling in NDC (CCW = front) */
-        if (obj->cull_backface) {
-            float ax = v[1].x - v[0].x, ay = v[1].y - v[0].y;
-            float bx = v[2].x - v[0].x, by = v[2].y - v[0].y;
-            float area = ax * by - ay * bx;
-            if (area < 0.0f) continue;
-        }
+        if (obj->cull_backface && is_backface_ndc(v[0], v[1], v[2])) continue;
+
         float nx[3], ny[3];
         for (int vi = 0; vi < 3; ++vi) {
             nx[vi] = 0.5f * (v[vi].x + 1.0f);
             ny[vi] = 0.5f * (v[vi].y + 1.0f);
         }
-        RGB vcolor[3];
-        for (int vi = 0; vi < 3; ++vi) {
-            RGB base_rgb = (i < obj->edge_colors->length) ? obj->edge_colors->list[i] : (RGB){255,255,255};
-            RGB shaded_rgb = base_rgb;
-            if (lighting) {
-                vec3 n_obj = (obj->normals && i < obj->normals->length) ? obj->normals->list[i] : (vec3){0,0,1};
-                vec3 n_world = mat3_mul_vec3(N3, n_obj);
-                float n_len = sqrtf(n_world.x*n_world.x + n_world.y*n_world.y + n_world.z*n_world.z);
-                if (n_len > 1e-6f) { n_world.x/=n_len; n_world.y/=n_len; n_world.z/=n_len; }
-                float br = base_rgb.r/255.0f, bg = base_rgb.g/255.0f, bb = base_rgb.b/255.0f;
-                float lr = lighting->ambient.r, lg = lighting->ambient.g, lb = lighting->ambient.b;
-                /* For now, use centroid for shadow test and face normal for shading (matches old behavior) */
-                vec3 v0w = cm_m4_mul_point3(M_model, obj->verticies->list[(uint16_t)face.x]);
-                vec3 v1w = cm_m4_mul_point3(M_model, obj->verticies->list[(uint16_t)face.y]);
-                vec3 v2w = cm_m4_mul_point3(M_model, obj->verticies->list[(uint16_t)face.z]);
-                vec3 cw = { (v0w.x+v1w.x+v2w.x)/3.0f, (v0w.y+v1w.y+v2w.y)/3.0f, (v0w.z+v1w.z+v2w.z)/3.0f };
-                for (uint16_t li = 0; li < lighting->num_lights; ++li) {
-                    const light_t *L = &lighting->lights[li];
-                    if (L->intensity <= 0.0f) continue;
-                    if (L->type == LIGHT_DIRECTIONAL) {
-                        float Lx = -L->direction.x, Ly = -L->direction.y, Lz = -L->direction.z;
-                        float Llen = sqrtf(Lx*Lx + Ly*Ly + Lz*Lz);
-                        if (Llen > 1e-6f) { Lx/=Llen; Ly/=Llen; Lz/=Llen; }
-                        float ndotl = n_world.x*Lx + n_world.y*Ly + n_world.z*Lz;
-                        if (ndotl > 0.0f) {
-                            float vis = 1.0f;
-                            if (tls_shadow_maps && li < tls_shadow_count && obj->shadow_enabled && L->casts_shadows && L->shadow_enabled) {
-                                ShadowMap *SM = &tls_shadow_maps[li];
-                                if (SM && SM->valid && SM->depth) {
-                                    vec4 cclip = cm_m4_mul_point4(SM->VP, cw);
-                                    float invw = (fabsf(cclip.w) > 1e-6f) ? (1.0f / cclip.w) : 1.0f;
-                                    float x_ndc = cclip.x * invw;
-                                    float y_ndc = cclip.y * invw;
-                                    float z_lv = cm_m4_mul_point3(SM->V, cw).z;
-                                    int sx = (int)((x_ndc * 0.5f + 0.5f) * (float)(SM->w - 1) + 0.5f);
-                                    int sy = (int)((y_ndc * 0.5f + 0.5f) * (float)(SM->h - 1) + 0.5f);
-                                    if ((unsigned)sx < (unsigned)SM->w && (unsigned)sy < (unsigned)SM->h) {
-                                        size_t sidx = (size_t)sy * (size_t)SM->w + (size_t)sx;
-                                        float map_z = SM->depth[sidx];
-                                        if (z_lv > map_z + SM->z_bias) {
-                                            vis = 0.0f;
-                                        }
-                                    }
-                                }
-                            }
-                            if (vis > 0.0f) {
-                                lr += L->color.r * L->intensity * ndotl;
-                                lg += L->color.g * L->intensity * ndotl;
-                                lb += L->color.b * L->intensity * ndotl;
-                            }
-                        }
-                    }
-                }
-                float cr = fminf(fmaxf(br * lr, 0.0f), 1.0f);
-                float cg = fminf(fmaxf(bg * lg, 0.0f), 1.0f);
-                float cb = fminf(fmaxf(bb * lb, 0.0f), 1.0f);
-                shaded_rgb.r = (uint8_t)(cr * 255.0f);
-                shaded_rgb.g = (uint8_t)(cg * 255.0f);
-                shaded_rgb.b = (uint8_t)(cb * 255.0f);
-            }
-            vcolor[vi] = shaded_rgb;
-        }
+          /* Per-vertex shading (Gouraud): for now, use face-based shading result for each vertex.
+              This keeps visuals unchanged while enabling vertex-level shadows in a later step. */
+          RGB shaded_rgb = compute_face_shaded_color(i, obj, lighting, M_model, N3);
+          RGB vcolor[3] = { shaded_rgb, shaded_rgb, shaded_rgb };
         _TriFill t;
         t.depth = (v[0].z + v[1].z + v[2].z) / 3.0f;
         t.poly.num_points = 3;
@@ -1003,8 +1155,8 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
                 (double)tri[i].poly.points[2].x, (double)tri[i].poly.points[2].y,
                 (double)tri[i].depth);
         }
-        /* For now, use the color of the first vertex (matches old behavior) */
-        draw_polygon_fill(tls_scene, &tri[i].poly, tri[i].vcolor[0]);
+        /* Gouraud fill using per-vertex colors */
+        draw_triangle_gouraud(tls_scene, &tri[i].poly, tri[i].vcolor);
     }
 
     /* trifill_buffer is persistent, do not free here */
@@ -1050,10 +1202,6 @@ void api_geo_render_wire_clip_cull(const camera_t *cam, object_t *obj, const tra
         size_t nf = obj->faces->length;
         front_face = (bool*)calloc(nf, sizeof(bool));
         if (front_face) {
-            /* Allow compile-time flip of front-face convention if needed */
-            #ifndef FRONT_FACE_CCW
-            #define FRONT_FACE_CCW 1
-            #endif
             size_t front_count = 0;
             for (size_t i = 0; i < nf; ++i) {
                 vec3 f = obj->faces->list[i];
@@ -1151,9 +1299,12 @@ static void api_render_scene3d(const camera_t *cam, const scene3d_t *os, const s
             uint16_t nV = inst->object->verticies->length;
             for (uint16_t vi = 0; vi < nV; ++vi) {
                 vec3 wp = cm_m4_mul_point3(M, V[vi]);
-                if (wp.x < bb_min.x) bb_min.x = wp.x; if (wp.x > bb_max.x) bb_max.x = wp.x;
-                if (wp.y < bb_min.y) bb_min.y = wp.y; if (wp.y > bb_max.y) bb_max.y = wp.y;
-                if (wp.z < bb_min.z) bb_min.z = wp.z; if (wp.z > bb_max.z) bb_max.z = wp.z;
+                if (wp.x < bb_min.x) { bb_min.x = wp.x; }
+                if (wp.x > bb_max.x) { bb_max.x = wp.x; }
+                if (wp.y < bb_min.y) { bb_min.y = wp.y; }
+                if (wp.y > bb_max.y) { bb_max.y = wp.y; }
+                if (wp.z < bb_min.z) { bb_min.z = wp.z; }
+                if (wp.z > bb_max.z) { bb_max.z = wp.z; }
             }
         }
         vec3 bb_center = { (bb_min.x+bb_max.x)*0.5f, (bb_min.y+bb_max.y)*0.5f, (bb_min.z+bb_max.z)*0.5f };
@@ -1196,9 +1347,12 @@ static void api_render_scene3d(const camera_t *cam, const scene3d_t *os, const s
                 float lxmin=1e9f, lxmax=-1e9f, lymin=1e9f, lymax=-1e9f, lzmin=1e9f, lzmax=-1e9f;
                 for (int ci=0; ci<8; ++ci) {
                     vec3 lv = cm_m4_mul_point3(V, corners[ci]);
-                    if (lv.x < lxmin) lxmin = lv.x; if (lv.x > lxmax) lxmax = lv.x;
-                    if (lv.y < lymin) lymin = lv.y; if (lv.y > lymax) lymax = lv.y;
-                    if (lv.z < lzmin) lzmin = lv.z; if (lv.z > lzmax) lzmax = lv.z;
+                    if (lv.x < lxmin) { lxmin = lv.x; }
+                    if (lv.x > lxmax) { lxmax = lv.x; }
+                    if (lv.y < lymin) { lymin = lv.y; }
+                    if (lv.y > lymax) { lymax = lv.y; }
+                    if (lv.z < lzmin) { lzmin = lv.z; }
+                    if (lv.z > lzmax) { lzmax = lv.z; }
                 }
                 float pad = 0.10f * fmaxf(fmaxf(lxmax-lxmin, lymax-lymin), lzmax-lzmin);
                 mat4 P = cm_m4_ortho(lxmin-pad, lxmax+pad, lymin-pad, lymax+pad, lzmin-pad, lzmax+pad);
