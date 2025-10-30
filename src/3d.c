@@ -1,4 +1,3 @@
-
 // scene_transform.c
 // Build: gcc -std=c17 -O2 scene_transform.c -lm -o scene_transform
 
@@ -228,15 +227,18 @@ object_t* object_new(const uint16_t num_vertices, const uint16_t num_edges, cons
 
     object_t *obj = calloc(1, total);
     if (!obj) return NULL;
-    
+
     obj->verticies = vert_list_new(num_vertices);
     obj->rendered_vertices = calloc(num_vertices, sizeof(vec3));
     obj->edge_colors = color_list_new(num_edges);  /* Should be num_edges, not num_vertices */
     obj->edges = edge_list_new(num_edges);
     obj->faces = face_list_new(num_faces);
     obj->normals = normal_list_new(num_faces);
-    
-    if (!obj->verticies || !obj->rendered_vertices || !obj->edge_colors || 
+
+    obj->trifill_buffer = NULL;
+    obj->trifill_capacity = 0;
+
+    if (!obj->verticies || !obj->rendered_vertices || !obj->edge_colors ||
         !obj->edges || !obj->faces || !obj->normals) {
         /* Cleanup on failure */
         if (obj->verticies) free(obj->verticies);
@@ -245,10 +247,30 @@ object_t* object_new(const uint16_t num_vertices, const uint16_t num_edges, cons
         if (obj->edges) free(obj->edges);
         if (obj->faces) free(obj->faces);
         if (obj->normals) free(obj->normals);
+        if (obj->trifill_buffer) free(obj->trifill_buffer);
         free(obj);
         return NULL;
     }
-
+    /* Allocate trifill buffer for filled rendering */
+    if (num_faces > 0) {
+        obj->trifill_buffer = malloc(sizeof(_TriFill) * num_faces);
+        if (!obj->trifill_buffer) {
+            /* Cleanup on failure */
+            if (obj->verticies) free(obj->verticies);
+            if (obj->rendered_vertices) free(obj->rendered_vertices);
+            if (obj->edge_colors) free(obj->edge_colors);
+            if (obj->edges) free(obj->edges);
+            if (obj->faces) free(obj->faces);
+            if (obj->normals) free(obj->normals);
+            free(obj);
+            return NULL;
+        }
+        obj->trifill_capacity = num_faces;
+    }
+    /* Defaults */
+    obj->cull_backface = true;
+    obj->draw_mode = DRAW_WIRE;
+    obj->shadow_enabled = true; /* default: objects cast/receive shadows */
     return obj;
 }
 
@@ -431,18 +453,18 @@ object_t* object_octahedron(object_draw_mode_t mode, bool cull_backface) {
             uint16_t i1 = (uint16_t)f[i].y;
             uint16_t i2 = (uint16_t)f[i].z;
             vec3 v0 = V[i0], v1 = V[i1], v2 = V[i2];
-            vec3 e1v = vec3_sub(v1, v0);
-            vec3 e2v = vec3_sub(v2, v0);
-            vec3 nn = vec3_cross(e1v, e2v);
+            vec3 e1 = vec3_sub(v1, v0);
+            vec3 e2 = vec3_sub(v2, v0);
+            vec3 nn = vec3_cross(e1, e2);
             vec3 c  = (vec3){ (v0.x+v1.x+v2.x)/3.0f, (v0.y+v1.y+v2.y)/3.0f, (v0.z+v1.z+v2.z)/3.0f };
             float d = vec3_dot(nn, c);
             if (d < 0.0f) {
                 float tmp = f[i].y; f[i].y = f[i].z; f[i].z = tmp;
                 i1 = (uint16_t)f[i].y; i2 = (uint16_t)f[i].z;
                 v1 = V[i1]; v2 = V[i2];
-                e1v = vec3_sub(v1, v0);
-                e2v = vec3_sub(v2, v0);
-                nn = vec3_cross(e1v, e2v);
+                e1 = vec3_sub(v1, v0);
+                e2 = vec3_sub(v2, v0);
+                nn = vec3_cross(e1, e2);
             }
             obj->normals->list[i] = vec3_norm(nn);
         }
@@ -582,94 +604,110 @@ object_t* object_cylinder(const uint16_t segments, const object_draw_mode_t mode
     return obj;
 }
 
-/* Helper function to add vertex if not exists, return index */
-static uint16_t sphere_add_vertex(vec3 **vertices, uint16_t *vertex_count, uint16_t *capacity, vec3 vertex) {
-    /* Normalize vertex to unit sphere */
-    vertex = vec3_norm(vertex);
-    
-    /* Check if vertex already exists (within tolerance) */
-    const float tolerance = 1e-6f;
-    for (uint16_t i = 0; i < *vertex_count; i++) {
-        vec3 diff = vec3_sub((*vertices)[i], vertex);
-        if (vec3_dot(diff, diff) < tolerance * tolerance) {
-            return i;  /* Found existing vertex */
+/* ---- Helpers for icosphere generation (sphere) ---- */
+typedef struct {
+    uint16_t a;
+    uint16_t b;
+    uint16_t mid;
+    uint8_t  used;
+} MidEntry;
+
+typedef struct {
+    uint32_t cap;
+    MidEntry *tab;
+} MidCache;
+
+static inline uint32_t pair_key_u32(uint16_t a, uint16_t b){ return ((uint32_t)a << 16) | (uint32_t)b; }
+static inline uint32_t hash_u32(uint32_t k){
+    /* Simple integer hash (xorshift mix) */
+    k ^= k >> 16; k *= 0x7feb352dU; k ^= k >> 15; k *= 0x846ca68bU; k ^= k >> 16;
+    return k;
+}
+
+/* Add a normalized vertex to the array (no realloc expected due to pre-sizing) */
+static void sphere_add_vertex(vec3 **Vptr, uint16_t *vcount, uint16_t *vcap, vec3 p){
+    (void)vcap; /* capacity preallocated by caller */
+    float d = sqrtf(p.x*p.x + p.y*p.y + p.z*p.z);
+    if (d > 1e-9f){ p.x/=d; p.y/=d; p.z/=d; }
+    (*Vptr)[*vcount] = p;
+    (*vcount)++;
+}
+
+/* Look up or create midpoint vertex between indices v0 and v1 */
+static uint16_t mid_lookup(MidCache *mc, vec3 **Vptr, uint16_t *vcount, uint16_t *vcap, uint16_t v0, uint16_t v1){
+    (void)vcap; /* pre-sized */
+    uint16_t a = (v0 < v1) ? v0 : v1;
+    uint16_t b = (v0 < v1) ? v1 : v0;
+    if (!mc->tab || mc->cap == 0){
+        /* Fallback: just create */
+        vec3 vm = { ((*Vptr)[a].x + (*Vptr)[b].x)*0.5f,
+                    ((*Vptr)[a].y + (*Vptr)[b].y)*0.5f,
+                    ((*Vptr)[a].z + (*Vptr)[b].z)*0.5f };
+        sphere_add_vertex(Vptr, vcount, vcap, vm);
+        return (uint16_t)(*vcount - 1);
+    }
+    uint32_t key = pair_key_u32(a, b);
+    uint32_t mask = mc->cap - 1u;
+    uint32_t h = hash_u32(key);
+    for (uint32_t probe = 0; probe < mc->cap; ++probe){
+        uint32_t idx = (h + probe) & mask;
+        MidEntry *e = &mc->tab[idx];
+        if (!e->used){
+            /* Insert */
+            vec3 vm = { ((*Vptr)[a].x + (*Vptr)[b].x)*0.5f,
+                        ((*Vptr)[a].y + (*Vptr)[b].y)*0.5f,
+                        ((*Vptr)[a].z + (*Vptr)[b].z)*0.5f };
+            sphere_add_vertex(Vptr, vcount, vcap, vm);
+            e->a = a; e->b = b; e->mid = (uint16_t)(*vcount - 1); e->used = 1;
+            return e->mid;
+        }
+        if (e->a == a && e->b == b){
+            return e->mid;
         }
     }
-    
-    /* Add new vertex */
-    if (*vertex_count >= *capacity) {
-        /* Should not happen with pre-calculated capacity */
-        return *vertex_count;
-    }
-    
-    (*vertices)[*vertex_count] = vertex;
-    return (*vertex_count)++;
+    /* Table full: fallback create */
+    vec3 vm = { ((*Vptr)[a].x + (*Vptr)[b].x)*0.5f,
+                ((*Vptr)[a].y + (*Vptr)[b].y)*0.5f,
+                ((*Vptr)[a].z + (*Vptr)[b].z)*0.5f };
+    sphere_add_vertex(Vptr, vcount, vcap, vm);
+    return (uint16_t)(*vcount - 1);
 }
 
-/* Helper function to get midpoint between two vertices */
-static vec3 sphere_get_midpoint(vec3 a, vec3 b) {
-    vec3 mid = vec3_add(a, vec3_scale(vec3_sub(b, a), 0.5f));
-    return vec3_norm(mid);  /* Project to unit sphere */
-}
+typedef struct {
+    uint16_t a;
+    uint16_t b;
+    uint8_t  used;
+} EdgeEntry;
 
-/* ---- Local helpers for icosphere subdivision ---- */
-typedef struct { uint32_t key; uint16_t idx; } MidEntry;
-typedef struct { MidEntry *tab; uint32_t cap; } MidCache;
+typedef struct {
+    uint32_t cap;
+    EdgeEntry *tab;
+} EdgeSet;
 
-static inline uint16_t mid_lookup(MidCache *mc,
-                                  vec3 **V, uint16_t *vcount, uint16_t *vcap,
-                                  uint16_t a, uint16_t b) {
-    /* Without cache, always add */
-    if (!mc || !mc->tab || mc->cap == 0) {
-        vec3 m = sphere_get_midpoint((*V)[a], (*V)[b]);
-        return sphere_add_vertex(V, vcount, vcap, m);
-    }
-    uint16_t lo = (a < b) ? a : b;
-    uint16_t hi = (a < b) ? b : a;
-    uint32_t key = ((uint32_t)lo << 16) | (uint32_t)hi;
-
-    /* open addressing */
-    const uint32_t cap = mc->cap;
-    uint32_t h = key * 2654435761u;
-    for (uint32_t p = 0; p < cap; ++p) {
-        uint32_t i = (h + p) % cap;
-        if (mc->tab[i].key == key) return mc->tab[i].idx;
-        if (mc->tab[i].key == 0) {
-            vec3 m = sphere_get_midpoint((*V)[a], (*V)[b]);
-            uint16_t idx = sphere_add_vertex(V, vcount, vcap, m);
-            mc->tab[i].key = key; mc->tab[i].idx = idx; return idx;
-        }
-    }
-    /* table full -> fall back */
-    vec3 m = sphere_get_midpoint((*V)[a], (*V)[b]);
-    return sphere_add_vertex(V, vcount, vcap, m);
-}
-
-typedef struct { uint32_t key; uint8_t used; } EdgeEntry;
-typedef struct { EdgeEntry *tab; uint32_t cap; } EdgeSet;
-
-static inline void add_edge_unique(EdgeSet *es, vec2 *E, uint16_t *ecount,
-                                   uint16_t a, uint16_t b) {
-    uint16_t lo = (a < b) ? a : b;
-    uint16_t hi = (a < b) ? b : a;
-    if (!es || !es->tab || es->cap == 0) {
-        E[(*ecount)++] = (vec2){ (float)lo, (float)hi };
+static void add_edge_unique(EdgeSet *es, vec2 *E, uint16_t *ecount, uint16_t i0, uint16_t i1){
+    uint16_t a = (i0 < i1) ? i0 : i1;
+    uint16_t b = (i0 < i1) ? i1 : i0;
+    if (!es->tab || es->cap == 0){
+        E[(*ecount)++] = (vec2){i0, i1};
         return;
     }
-    uint32_t key = ((uint32_t)lo << 16) | (uint32_t)hi;
-    uint32_t h = key * 2654435761u;
-    const uint32_t cap = es->cap;
-    for (uint32_t p = 0; p < cap; ++p) {
-        uint32_t i = (h + p) % cap;
-        if (es->tab[i].used && es->tab[i].key == key) return; /* already added */
-        if (!es->tab[i].used) {
-            es->tab[i].used = 1; es->tab[i].key = key;
-            E[(*ecount)++] = (vec2){ (float)lo, (float)hi };
+    uint32_t key = pair_key_u32(a, b);
+    uint32_t mask = es->cap - 1u;
+    uint32_t h = hash_u32(key);
+    for (uint32_t probe = 0; probe < es->cap; ++probe){
+        uint32_t idx = (h + probe) & mask;
+        EdgeEntry *ee = &es->tab[idx];
+        if (!ee->used){
+            ee->a = a; ee->b = b; ee->used = 1;
+            E[(*ecount)++] = (vec2){i0, i1};
             return;
         }
+        if (ee->a == a && ee->b == b){
+            return; /* already added */
+        }
     }
-    /* set full: still add (may duplicate) */
-    E[(*ecount)++] = (vec2){ (float)lo, (float)hi };
+    /* Table full: append anyway */
+    E[(*ecount)++] = (vec2){i0, i1};
 }
 
 /** 
@@ -1110,4 +1148,16 @@ vec3 mat3_mul_vec3(const float M[9], vec3 v) {
         M[1]*v.x + M[4]*v.y + M[7]*v.z,
         M[2]*v.x + M[5]*v.y + M[8]*v.z
     };
+}
+
+void object_free(object_t *obj) {
+    if (!obj) return;
+    if (obj->verticies) free(obj->verticies);
+    if (obj->rendered_vertices) free(obj->rendered_vertices);
+    if (obj->edge_colors) free(obj->edge_colors);
+    if (obj->edges) free(obj->edges);
+    if (obj->faces) free(obj->faces);
+    if (obj->normals) free(obj->normals);
+    if (obj->trifill_buffer) free(obj->trifill_buffer);
+    free(obj);
 }

@@ -31,6 +31,65 @@ static inline vec3 v3_cross(vec3 a, vec3 b){
 }
 static inline vec3 v3_norm(vec3 v){ float d = sqrtf(v3_dot(v,v)); return d>0? (vec3){v.x/d,v.y/d,v.z/d} : (vec3){0,0,0}; }
 
+/* ---------------- Shadows: column-major math helpers (match 3d.c) ---------------- */
+typedef struct { int w, h; float *depth; mat4 VP; mat4 V; float z_bias; bool valid; } ShadowMap;
+static _Thread_local ShadowMap *tls_shadow_maps = NULL;
+static _Thread_local uint16_t tls_shadow_count = 0;
+
+static inline mat4 cm_m4_identity(void){ mat4 r = { .m={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1} }; return r; }
+static inline mat4 cm_m4_mul(mat4 a, mat4 b){
+    mat4 r = (mat4){0};
+    for (int row = 0; row < 4; ++row) {
+        for (int col = 0; col < 4; ++col) {
+            r.m[col*4 + row] =
+                a.m[0*4 + row] * b.m[col*4 + 0] +
+                a.m[1*4 + row] * b.m[col*4 + 1] +
+                a.m[2*4 + row] * b.m[col*4 + 2] +
+                a.m[3*4 + row] * b.m[col*4 + 3];
+        }
+    }
+    return r;
+}
+static inline vec4 cm_m4_mul_point4(const mat4 m, const vec3 p){
+    float x = m.m[0]*p.x + m.m[4]*p.y + m.m[8]*p.z + m.m[12];
+    float y = m.m[1]*p.x + m.m[5]*p.y + m.m[9]*p.z + m.m[13];
+    float z = m.m[2]*p.x + m.m[6]*p.y + m.m[10]*p.z + m.m[14];
+    float w = m.m[3]*p.x + m.m[7]*p.y + m.m[11]*p.z + m.m[15];
+    return (vec4){x,y,z,w};
+}
+static inline vec3 cm_m4_mul_point3(const mat4 m, const vec3 p){
+    vec4 v = cm_m4_mul_point4(m, p);
+    return (vec3){v.x, v.y, v.z};
+}
+static inline mat4 cm_m4_look_at(vec3 eye, vec3 target, vec3 up){
+    vec3 f = v3_norm((vec3){ target.x - eye.x, target.y - eye.y, target.z - eye.z });
+    vec3 s = v3_norm(v3_cross(f, up));
+    vec3 u = v3_cross(s, f);
+    mat4 r = cm_m4_identity();
+    r.m[0] = s.x;   r.m[4] = s.y;   r.m[8]  = s.z;   r.m[12] = -(s.x*eye.x + s.y*eye.y + s.z*eye.z);
+    r.m[1] = u.x;   r.m[5] = u.y;   r.m[9]  = u.z;   r.m[13] = -(u.x*eye.x + u.y*eye.y + u.z*eye.z);
+    r.m[2] = -f.x;  r.m[6] = -f.y;  r.m[10] = -f.z;  r.m[14] =  (f.x*eye.x + f.y*eye.y + f.z*eye.z);
+    r.m[3] = 0.0f;  r.m[7] = 0.0f;  r.m[11] = 0.0f;  r.m[15] = 1.0f;
+    return r;
+}
+static inline mat4 cm_m4_ortho(float l, float r, float b, float t, float n, float f){
+    mat4 m = (mat4){0};
+    m.m[0] = 2.0f/(r-l);
+    m.m[5] = 2.0f/(t-b);
+    m.m[10] = -2.0f/(f-n);
+    m.m[12] = -(r+l)/(r-l);
+    m.m[13] = -(t+b)/(t-b);
+    m.m[14] = -(f+n)/(f-n);
+    m.m[15] = 1.0f;
+    return m;
+}
+static inline vec3 pick_up_from_dir(vec3 dir){
+    vec3 a = {0,1,0};
+    float d = fabsf(v3_dot(dir, a));
+    if (d > 0.9f) a = (vec3){1,0,0};
+    return v3_norm(v3_cross(v3_cross(a, dir), dir));
+}
+
 /* Build model rotation 3x3 (column-major) from Euler angles, order Rz*Ry*Rx */
 static inline void mat3_model_rotation(const vec3 euler, float Rm[9]){
     float cx = cosf(euler.x), sx = sinf(euler.x);
@@ -803,11 +862,6 @@ void api_geo_render_wire(const camera_t *cam, object_t *obj, const transform_t *
     if (front_face) free(front_face);
 }
 
-typedef struct {
-    float depth;      /* average NDC z */
-    Polygonf_t poly;  /* 3 points normalized to [0,1] */
-    RGB color;        /* shaded color */
-} _TriFill;
 
 /* qsort comparator: sort by depth descending (far to near) */
 static int _cmp_trifill_desc(const void *a, const void *b) {
@@ -827,78 +881,112 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
 
     /* Precompute world normal matrix only if lighting is provided */
     float N3[9];
+    mat4 M_model = cm_m4_identity();
     if (lighting) {
-        mat4 M_model = model_matrix(obj_xform);
+        M_model = model_matrix(obj_xform);
         normal_matrix_from_model(M_model, N3);
     }
 
     size_t nf = obj->faces->length;
-    _TriFill *tri = (_TriFill*)malloc(sizeof(_TriFill) * nf);
-    if (!tri) return;
+    if (!obj->trifill_buffer || obj->trifill_capacity < nf) {
+        void *newbuf = realloc(obj->trifill_buffer, sizeof(_TriFill) * nf);
+        if (!newbuf) return;
+        obj->trifill_buffer = newbuf;
+        obj->trifill_capacity = nf;
+    }
+    _TriFill *tri = (_TriFill*)obj->trifill_buffer;
     size_t tcount = 0;
 
     for (size_t i = 0; i < nf; i++) {
         vec3 face = obj->faces->list[i];
-        vec3 v1 = obj->rendered_vertices[(size_t)face.x];
-        vec3 v2 = obj->rendered_vertices[(size_t)face.y];
-        vec3 v3 = obj->rendered_vertices[(size_t)face.z];
-
+        vec3 v[3] = {
+            obj->rendered_vertices[(size_t)face.x],
+            obj->rendered_vertices[(size_t)face.y],
+            obj->rendered_vertices[(size_t)face.z]
+        };
         /* Backface culling in NDC (CCW = front) */
         if (obj->cull_backface) {
-            float ax = v2.x - v1.x, ay = v2.y - v1.y;
-            float bx = v3.x - v1.x, by = v3.y - v1.y;
+            float ax = v[1].x - v[0].x, ay = v[1].y - v[0].y;
+            float bx = v[2].x - v[0].x, by = v[2].y - v[0].y;
             float area = ax * by - ay * bx;
             if (area < 0.0f) continue;
         }
-
-        float nx1 = 0.5f * (v1.x + 1.0f);
-        float ny1 = 0.5f * (v1.y + 1.0f);
-        float nx2 = 0.5f * (v2.x + 1.0f);
-        float ny2 = 0.5f * (v2.y + 1.0f);
-        float nx3 = 0.5f * (v3.x + 1.0f);
-        float ny3 = 0.5f * (v3.y + 1.0f);
-
-        /* Shade */
-        RGB base_rgb = (i < obj->edge_colors->length) ? obj->edge_colors->list[i] : (RGB){255,255,255};
-        RGB shaded_rgb = base_rgb;
-        if (lighting) {
-            vec3 n_obj = (obj->normals && i < obj->normals->length) ? obj->normals->list[i] : (vec3){0,0,1};
-            vec3 n_world = mat3_mul_vec3(N3, n_obj);
-            float n_len = sqrtf(n_world.x*n_world.x + n_world.y*n_world.y + n_world.z*n_world.z);
-            if (n_len > 1e-6f) { n_world.x/=n_len; n_world.y/=n_len; n_world.z/=n_len; }
-
-            float br = base_rgb.r/255.0f, bg = base_rgb.g/255.0f, bb = base_rgb.b/255.0f;
-            float lr = lighting->ambient.r, lg = lighting->ambient.g, lb = lighting->ambient.b;
-            for (uint16_t li = 0; li < lighting->num_lights; ++li) {
-                const light_t *L = &lighting->lights[li];
-                if (L->intensity <= 0.0f) continue;
-                if (L->type == LIGHT_DIRECTIONAL) {
-                    float Lx = -L->direction.x, Ly = -L->direction.y, Lz = -L->direction.z;
-                    float Llen = sqrtf(Lx*Lx + Ly*Ly + Lz*Lz);
-                    if (Llen > 1e-6f) { Lx/=Llen; Ly/=Llen; Lz/=Llen; }
-                    float ndotl = n_world.x*Lx + n_world.y*Ly + n_world.z*Lz;
-                    if (ndotl > 0.0f) {
-                        lr += L->color.r * L->intensity * ndotl;
-                        lg += L->color.g * L->intensity * ndotl;
-                        lb += L->color.b * L->intensity * ndotl;
+        float nx[3], ny[3];
+        for (int vi = 0; vi < 3; ++vi) {
+            nx[vi] = 0.5f * (v[vi].x + 1.0f);
+            ny[vi] = 0.5f * (v[vi].y + 1.0f);
+        }
+        RGB vcolor[3];
+        for (int vi = 0; vi < 3; ++vi) {
+            RGB base_rgb = (i < obj->edge_colors->length) ? obj->edge_colors->list[i] : (RGB){255,255,255};
+            RGB shaded_rgb = base_rgb;
+            if (lighting) {
+                vec3 n_obj = (obj->normals && i < obj->normals->length) ? obj->normals->list[i] : (vec3){0,0,1};
+                vec3 n_world = mat3_mul_vec3(N3, n_obj);
+                float n_len = sqrtf(n_world.x*n_world.x + n_world.y*n_world.y + n_world.z*n_world.z);
+                if (n_len > 1e-6f) { n_world.x/=n_len; n_world.y/=n_len; n_world.z/=n_len; }
+                float br = base_rgb.r/255.0f, bg = base_rgb.g/255.0f, bb = base_rgb.b/255.0f;
+                float lr = lighting->ambient.r, lg = lighting->ambient.g, lb = lighting->ambient.b;
+                /* For now, use centroid for shadow test and face normal for shading (matches old behavior) */
+                vec3 v0w = cm_m4_mul_point3(M_model, obj->verticies->list[(uint16_t)face.x]);
+                vec3 v1w = cm_m4_mul_point3(M_model, obj->verticies->list[(uint16_t)face.y]);
+                vec3 v2w = cm_m4_mul_point3(M_model, obj->verticies->list[(uint16_t)face.z]);
+                vec3 cw = { (v0w.x+v1w.x+v2w.x)/3.0f, (v0w.y+v1w.y+v2w.y)/3.0f, (v0w.z+v1w.z+v2w.z)/3.0f };
+                for (uint16_t li = 0; li < lighting->num_lights; ++li) {
+                    const light_t *L = &lighting->lights[li];
+                    if (L->intensity <= 0.0f) continue;
+                    if (L->type == LIGHT_DIRECTIONAL) {
+                        float Lx = -L->direction.x, Ly = -L->direction.y, Lz = -L->direction.z;
+                        float Llen = sqrtf(Lx*Lx + Ly*Ly + Lz*Lz);
+                        if (Llen > 1e-6f) { Lx/=Llen; Ly/=Llen; Lz/=Llen; }
+                        float ndotl = n_world.x*Lx + n_world.y*Ly + n_world.z*Lz;
+                        if (ndotl > 0.0f) {
+                            float vis = 1.0f;
+                            if (tls_shadow_maps && li < tls_shadow_count && obj->shadow_enabled && L->casts_shadows && L->shadow_enabled) {
+                                ShadowMap *SM = &tls_shadow_maps[li];
+                                if (SM && SM->valid && SM->depth) {
+                                    vec4 cclip = cm_m4_mul_point4(SM->VP, cw);
+                                    float invw = (fabsf(cclip.w) > 1e-6f) ? (1.0f / cclip.w) : 1.0f;
+                                    float x_ndc = cclip.x * invw;
+                                    float y_ndc = cclip.y * invw;
+                                    float z_lv = cm_m4_mul_point3(SM->V, cw).z;
+                                    int sx = (int)((x_ndc * 0.5f + 0.5f) * (float)(SM->w - 1) + 0.5f);
+                                    int sy = (int)((y_ndc * 0.5f + 0.5f) * (float)(SM->h - 1) + 0.5f);
+                                    if ((unsigned)sx < (unsigned)SM->w && (unsigned)sy < (unsigned)SM->h) {
+                                        size_t sidx = (size_t)sy * (size_t)SM->w + (size_t)sx;
+                                        float map_z = SM->depth[sidx];
+                                        if (z_lv > map_z + SM->z_bias) {
+                                            vis = 0.0f;
+                                        }
+                                    }
+                                }
+                            }
+                            if (vis > 0.0f) {
+                                lr += L->color.r * L->intensity * ndotl;
+                                lg += L->color.g * L->intensity * ndotl;
+                                lb += L->color.b * L->intensity * ndotl;
+                            }
+                        }
                     }
                 }
+                float cr = fminf(fmaxf(br * lr, 0.0f), 1.0f);
+                float cg = fminf(fmaxf(bg * lg, 0.0f), 1.0f);
+                float cb = fminf(fmaxf(bb * lb, 0.0f), 1.0f);
+                shaded_rgb.r = (uint8_t)(cr * 255.0f);
+                shaded_rgb.g = (uint8_t)(cg * 255.0f);
+                shaded_rgb.b = (uint8_t)(cb * 255.0f);
             }
-            float cr = fminf(fmaxf(br * lr, 0.0f), 1.0f);
-            float cg = fminf(fmaxf(bg * lg, 0.0f), 1.0f);
-            float cb = fminf(fmaxf(bb * lb, 0.0f), 1.0f);
-            shaded_rgb.r = (uint8_t)(cr * 255.0f);
-            shaded_rgb.g = (uint8_t)(cg * 255.0f);
-            shaded_rgb.b = (uint8_t)(cb * 255.0f);
+            vcolor[vi] = shaded_rgb;
         }
-
         _TriFill t;
-        t.depth = (v1.z + v2.z + v3.z) / 3.0f; /* NDC z: -1 near, +1 far */
+        t.depth = (v[0].z + v[1].z + v[2].z) / 3.0f;
         t.poly.num_points = 3;
-        t.poly.points[0] = (Pointf_t){nx1, ny1};
-        t.poly.points[1] = (Pointf_t){nx2, ny2};
-        t.poly.points[2] = (Pointf_t){nx3, ny3};
-        t.color = shaded_rgb;
+        t.poly.points[0] = (Pointf_t){nx[0], ny[0]};
+        t.poly.points[1] = (Pointf_t){nx[1], ny[1]};
+        t.poly.points[2] = (Pointf_t){nx[2], ny[2]};
+        t.vcolor[0] = vcolor[0];
+        t.vcolor[1] = vcolor[1];
+        t.vcolor[2] = vcolor[2];
         tri[tcount++] = t;
     }
 
@@ -915,10 +1003,11 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
                 (double)tri[i].poly.points[2].x, (double)tri[i].poly.points[2].y,
                 (double)tri[i].depth);
         }
-        draw_polygon_fill(tls_scene, &tri[i].poly, tri[i].color);
+        /* For now, use the color of the first vertex (matches old behavior) */
+        draw_polygon_fill(tls_scene, &tri[i].poly, tri[i].vcolor[0]);
     }
 
-    free(tri);
+    /* trifill_buffer is persistent, do not free here */
 }
 
 /* --- Clip-space XYW orientation helpers for robust backface culling --- */
@@ -1046,6 +1135,117 @@ static void api_render_scene3d(const camera_t *cam, const scene3d_t *os, const s
     if (!os || !os->instances || os->count == 0) return;
     /* Prefer explicitly provided lighting; else fall back to scene-owned lighting */
     const scene3d_lighting_t *L = lighting ? lighting : &os->lighting;
+    /* ---------------- Build per-light shadow maps (centroid-based) ---------------- */
+    tls_shadow_maps = NULL; tls_shadow_count = 0;
+    /* --- Stable shadow map: cache VP/bias in light_t, only recompute if needed --- */
+    if (L && L->num_lights > 0) {
+        /* Compute world-space AABB of shadow-enabled objects ONCE for all lights */
+        vec3 bb_min = { +1e9f, +1e9f, +1e9f };
+        vec3 bb_max = { -1e9f, -1e9f, -1e9f };
+        for (uint16_t i = 0; i < os->count; ++i) {
+            const object_instance_t *inst = &os->instances[i];
+            if (!inst || !inst->object || !inst->xform) continue;
+            if (!inst->object->shadow_enabled || !inst->object->verticies) continue;
+            mat4 M = model_matrix(inst->xform);
+            vec3 *V = inst->object->verticies->list;
+            uint16_t nV = inst->object->verticies->length;
+            for (uint16_t vi = 0; vi < nV; ++vi) {
+                vec3 wp = cm_m4_mul_point3(M, V[vi]);
+                if (wp.x < bb_min.x) bb_min.x = wp.x; if (wp.x > bb_max.x) bb_max.x = wp.x;
+                if (wp.y < bb_min.y) bb_min.y = wp.y; if (wp.y > bb_max.y) bb_max.y = wp.y;
+                if (wp.z < bb_min.z) bb_min.z = wp.z; if (wp.z > bb_max.z) bb_max.z = wp.z;
+            }
+        }
+        vec3 bb_center = { (bb_min.x+bb_max.x)*0.5f, (bb_min.y+bb_max.y)*0.5f, (bb_min.z+bb_max.z)*0.5f };
+        vec3 bb_extent = { (bb_max.x-bb_min.x)*0.5f, (bb_max.y-bb_min.y)*0.5f, (bb_max.z-bb_min.z)*0.5f };
+        float bb_radius = sqrtf(bb_extent.x*bb_extent.x + bb_extent.y*bb_extent.y + bb_extent.z*bb_extent.z);
+
+        tls_shadow_count = L->num_lights;
+        tls_shadow_maps = (ShadowMap*)calloc(tls_shadow_count, sizeof(ShadowMap));
+        if (!tls_shadow_maps) { tls_shadow_count = 0; }
+
+        const int SM_W = 128, SM_H = 128;
+        for (uint16_t li = 0; li < L->num_lights; ++li) {
+            light_t *Lt = &L->lights[li];
+            ShadowMap *SM = &tls_shadow_maps[li];
+            SM->valid = false;
+            if (!Lt) continue;
+            if (Lt->type != LIGHT_DIRECTIONAL) continue;
+            if (Lt->intensity <= 0.0f) continue;
+            if (!Lt->casts_shadows || !Lt->shadow_enabled) continue;
+
+            /* Only recompute shadow VP if not valid (first frame or after scene change) */
+            if (!Lt->shadow_vp_valid) {
+                vec3 dir = v3_norm((vec3){ Lt->direction.x, Lt->direction.y, Lt->direction.z });
+                if (fabsf(dir.x)+fabsf(dir.y)+fabsf(dir.z) < 1e-6f) dir = (vec3){0,-1,0};
+                vec3 eye = (vec3){ Lt->position.x, Lt->position.y, Lt->position.z };
+                float eye_len = sqrtf(eye.x*eye.x + eye.y*eye.y + eye.z*eye.z);
+                if (eye_len < 1e-6f) {
+                    eye = (vec3){ bb_center.x - dir.x*(bb_radius*2.5f),
+                                  bb_center.y - dir.y*(bb_radius*2.5f),
+                                  bb_center.z - dir.z*(bb_radius*2.5f) };
+                }
+                vec3 up = pick_up_from_dir(dir);
+                mat4 V = cm_m4_look_at(eye, bb_center, up);
+                vec3 corners[8] = {
+                    {bb_min.x, bb_min.y, bb_min.z}, {bb_max.x, bb_min.y, bb_min.z},
+                    {bb_min.x, bb_max.y, bb_min.z}, {bb_max.x, bb_max.y, bb_min.z},
+                    {bb_min.x, bb_min.y, bb_max.z}, {bb_max.x, bb_min.y, bb_max.z},
+                    {bb_min.x, bb_max.y, bb_max.z}, {bb_max.x, bb_max.y, bb_max.z}
+                };
+                float lxmin=1e9f, lxmax=-1e9f, lymin=1e9f, lymax=-1e9f, lzmin=1e9f, lzmax=-1e9f;
+                for (int ci=0; ci<8; ++ci) {
+                    vec3 lv = cm_m4_mul_point3(V, corners[ci]);
+                    if (lv.x < lxmin) lxmin = lv.x; if (lv.x > lxmax) lxmax = lv.x;
+                    if (lv.y < lymin) lymin = lv.y; if (lv.y > lymax) lymax = lv.y;
+                    if (lv.z < lzmin) lzmin = lv.z; if (lv.z > lzmax) lzmax = lv.z;
+                }
+                float pad = 0.10f * fmaxf(fmaxf(lxmax-lxmin, lymax-lymin), lzmax-lzmin);
+                mat4 P = cm_m4_ortho(lxmin-pad, lxmax+pad, lymin-pad, lymax+pad, lzmin-pad, lzmax+pad);
+                Lt->shadow_V = V;
+                Lt->shadow_P = P;
+                Lt->shadow_VP = cm_m4_mul(P, V);
+                Lt->shadow_z_bias = 0.002f * (lzmax - lzmin) + 1e-5f;
+                Lt->shadow_vp_valid = true;
+            }
+            SM->V  = Lt->shadow_V;
+            SM->VP = Lt->shadow_VP;
+            SM->z_bias = Lt->shadow_z_bias;
+
+            SM->w = SM_W; SM->h = SM_H;
+            SM->depth = (float*)malloc((size_t)SM_W * (size_t)SM_H * sizeof(float));
+            if (!SM->depth) { SM->valid = false; continue; }
+            for (int i = 0; i < SM_W*SM_H; ++i) SM->depth[i] = 1e9f;
+
+            for (uint16_t oi = 0; oi < os->count; ++oi) {
+                const object_instance_t *inst = &os->instances[oi];
+                if (!inst || !inst->object || !inst->xform) continue;
+                if (!inst->object->shadow_enabled || !inst->object->faces || !inst->object->verticies) continue;
+                mat4 M = model_matrix(inst->xform);
+                vec3 *Vtx = inst->object->verticies->list;
+                face_list_t *F = inst->object->faces;
+                for (uint16_t fi = 0; fi < F->length; ++fi) {
+                    vec3 f = F->list[fi];
+                    vec3 v0w = cm_m4_mul_point3(M, Vtx[(uint16_t)f.x]);
+                    vec3 v1w = cm_m4_mul_point3(M, Vtx[(uint16_t)f.y]);
+                    vec3 v2w = cm_m4_mul_point3(M, Vtx[(uint16_t)f.z]);
+                    vec3 cw = { (v0w.x+v1w.x+v2w.x)/3.0f, (v0w.y+v1w.y+v2w.y)/3.0f, (v0w.z+v1w.z+v2w.z)/3.0f };
+                    vec4 cclip = cm_m4_mul_point4(SM->VP, cw);
+                    float invw = (fabsf(cclip.w) > 1e-6f) ? (1.0f / cclip.w) : 1.0f;
+                    float x_ndc = cclip.x * invw;
+                    float y_ndc = cclip.y * invw;
+                    float z_lv = cm_m4_mul_point3(SM->V, cw).z;
+                    int sx = (int)((x_ndc * 0.5f + 0.5f) * (float)(SM->w - 1) + 0.5f);
+                    int sy = (int)((y_ndc * 0.5f + 0.5f) * (float)(SM->h - 1) + 0.5f);
+                    if ((unsigned)sx < (unsigned)SM->w && (unsigned)sy < (unsigned)SM->h) {
+                        size_t idx = (size_t)sy * (size_t)SM->w + (size_t)sx;
+                        if (z_lv < SM->depth[idx]) SM->depth[idx] = z_lv;
+                    }
+                }
+            }
+            SM->valid = true;
+        }
+    }
     for (uint16_t i = 0; i < os->count; ++i) {
         const object_instance_t *inst = &os->instances[i];
         object_t *obj = inst->object;
@@ -1061,6 +1261,15 @@ static void api_render_scene3d(const camera_t *cam, const scene3d_t *os, const s
                 api_geo_render_wire_clip_cull(cam, obj, xf, L);
                 break;
         }
+    }
+
+    /* Cleanup shadow maps */
+    if (tls_shadow_maps) {
+        for (uint16_t li = 0; li < tls_shadow_count; ++li) {
+            if (tls_shadow_maps[li].depth) free(tls_shadow_maps[li].depth);
+        }
+        free(tls_shadow_maps);
+        tls_shadow_maps = NULL; tls_shadow_count = 0;
     }
 }
 
@@ -1098,6 +1307,7 @@ void api_lighting_set_directional(scene3d_lighting_t *l, uint16_t index,
     L->color = color;
     L->intensity = intensity;
     L->casts_shadows = casts_shadows;
+    L->shadow_enabled = casts_shadows; /* default runtime toggle aligns with casts_shadows */
 }
 
 /* -------- Object scene helpers (FFI-friendly) -------- */
@@ -1123,6 +1333,7 @@ static uint16_t os_add_directional(scene3d_t *os,
     L->color = color;
     L->intensity = intensity;
     L->casts_shadows = casts_shadows;
+    L->shadow_enabled = casts_shadows; /* enable by default if configured to cast */
     L->position = (light_vec3){0,0,0};
     L->range = 0.0f; L->inner_cos = 1.0f; L->outer_cos = 1.0f;
     os->lighting.num_lights = (uint16_t)(n + 1);

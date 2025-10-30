@@ -530,7 +530,8 @@ void* hub75_display_run(const hub75_display_t *scene) {
                 if (scene->show_fps) {
                     gettimeofday(&end_time, NULL);
                     double elapsed = (double)(end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_usec - start_time.tv_usec) * 1e-6;
-                    float percent = (float)(frame_count) / 3215.0f;
+                    float hz = (float)(frame_count) / (float)(elapsed);
+                    float percent = (float)(hz) / 3215.0f;
                     debug(" [%2.2f%%] Panel Refresh Rate: %.1fHz\n", percent, (frame_count / elapsed));
                     gettimeofday(&start_time, NULL);
                 }

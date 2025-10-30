@@ -156,46 +156,6 @@ typedef void (*func_tone_mapper_t)(const RGBF *in, RGBF *out, const float level)
 typedef uint8_t *(*func_image_mapper_t)(const uint8_t *image_in, uint8_t *image_out, const struct hub75_display *scene);
 typedef uint8_t *(image_mapper_t)(const uint8_t *image_in, uint8_t *image_out, const struct hub75_display *scene);
 
-/* --------------------------------------------------------------
- * Lighting types and scene lighting configuration
- * (definitions appear before scene_info usage)
- * -------------------------------------------------------------- */
-typedef enum {
-    LIGHT_DIRECTIONAL = 0,
-    LIGHT_POINT       = 1,
-    LIGHT_SPOT        = 2
-} light_type_t;
-
-/* local 3-float vector for lighting (avoid dependency on vec3 defined later) */
-typedef struct { float x, y, z; } light_vec3;
-
-typedef struct light_t {
-    light_type_t type;     /* light category */
-
-    /* Common parameters */
-    RGBF   color;          /* light color (0..1 per channel) */
-    float  intensity;      /* scalar multiplier for brightness */
-    bool   casts_shadows;  /* whether this light should cast shadows */
-
-    /* Geometric parameters (interpreted by type) */
-    light_vec3 position;   /* for point/spot lights */
-    light_vec3 direction;  /* for directional/spot lights */
-
-    /* Optional falloff / cone controls (POINT/SPOT) */
-    float  range;          /* effective radius for point/spot; 0 => infinite */
-    float  inner_cos;      /* spot inner cone (cosine of angle); 1 => no cone */
-    float  outer_cos;      /* spot outer cone (cosine of angle); must be <= inner_cos */
-} light_t;
-
-typedef struct scene3d_lighting_t {
-    RGBF     ambient;      // ambient light color (0..1 per channel)
-    uint16_t num_lights;   // number of active lights
-    light_t *lights;       // dynamic array of lights (NULL when num_lights == 0)
-
-    void (*set_directional)(uint16_t index, light_vec3 direction,
-                                RGBF color, float intensity, bool casts_shadows);
-} scene3d_lighting_t;
-
 
 
 
@@ -493,6 +453,54 @@ typedef struct {
     vec3 scale;        // per-axis scale 
 } transform_t;
 
+
+/* --------------------------------------------------------------
+ * Lighting types and scene lighting configuration
+ * (definitions appear before scene_info usage)
+ * -------------------------------------------------------------- */
+typedef enum {
+    LIGHT_DIRECTIONAL = 0,
+    LIGHT_POINT       = 1,
+    LIGHT_SPOT        = 2
+} light_type_t;
+
+/* local 3-float vector for lighting (avoid dependency on vec3 defined later) */
+typedef struct { float x, y, z; } light_vec3;
+
+typedef struct light_t {
+    light_type_t type;     /* light category */
+
+    /* Common parameters */
+    RGBF   color;          /* light color (0..1 per channel) */
+    float  intensity;      /* scalar multiplier for brightness */
+    bool   casts_shadows;  /* whether this light should cast shadows */
+    bool   shadow_enabled; /* runtime toggle to enable/disable shadowing for this light */
+
+    /* Geometric parameters (interpreted by type) */
+    light_vec3 position;   /* for point/spot lights */
+    light_vec3 direction;  /* for directional/spot lights */
+
+    /* Optional falloff / cone controls (POINT/SPOT) */
+    float  range;          /* effective radius for point/spot; 0 => infinite */
+    float  inner_cos;      /* spot inner cone (cosine of angle); 1 => no cone */
+    float  outer_cos;      /* spot outer cone (cosine of angle); must be <= inner_cos */
+    /* Shadow map view/proj cache for stability */
+    mat4 shadow_V, shadow_P, shadow_VP;
+    float shadow_z_bias;
+    bool shadow_vp_valid;
+} light_t;
+
+typedef struct scene3d_lighting_t {
+    RGBF     ambient;      // ambient light color (0..1 per channel)
+    uint16_t num_lights;   // number of active lights
+    light_t *lights;       // dynamic array of lights (NULL when num_lights == 0)
+
+    void (*set_directional)(uint16_t index, light_vec3 direction,
+                                RGBF color, float intensity, bool casts_shadows);
+} scene3d_lighting_t;
+
+
+
 typedef struct {
     vec3 position;     // camera position 
     vec3 target;       // look-at target 
@@ -543,7 +551,18 @@ typedef struct {
     vec3 *rendered_vertices;
     bool cull_backface;    /* toggle backface culling for wireframe/fill */
     object_draw_mode_t draw_mode; /* how to render this object */
+    bool shadow_enabled;   /* runtime toggle to mark this object as casting/receiving shadows */
+
+    /* Persistent buffer for filled triangle rendering */
+    void *trifill_buffer; /* actually _TriFill*, but opaque here */
+    size_t trifill_capacity;
 } object_t;
+
+typedef struct {
+    float depth;      /* average NDC z */
+    Polygonf_t poly;  /* 3 points normalized to [0,1] */
+    RGB vcolor[3];    /* per-vertex shaded color */
+} _TriFill;
 
 
 
@@ -600,6 +619,8 @@ typedef struct scene3d_t {
     transform_t *(*get_transform)(struct scene3d_t *os, uint16_t id);
 } scene3d_t;
 
+
+void object_free(object_t *obj);
 
 typedef struct {
     void (*clear)();
@@ -704,6 +725,7 @@ void api_scene3d_set_directional_pose(uint16_t id, light_vec3 position, light_ve
 #define COLOR_GREY         (RGBF){ 0.501961f, 0.501961f, 0.501961f } /* (128,128,128) */
 #define COLOR_LIGHT_GREY   (RGBF){ 0.827451f, 0.827451f, 0.827451f } /* (211,211,211) */
 #define COLOR_DARK_GREY    (RGBF){ 0.25f, 0.25f, 0.25f }
+#define COLOR_DARK_DARK_GREY (RGBF){ 0.12f, 0.12f, 0.12f }
 #define COLOR_BROWN        (RGBF){ 0.647059f, 0.164706f, 0.164706f } /* (165,42,42) */
 #define COLOR_GOLD         (RGBF){ 1.0f, 0.843137f, 0.0f }           /* (255,215,0) */
 #define COLOR_INDIGO       (RGBF){ 0.294118f, 0.0f, 0.509804f }      /* (75,0,130) */
