@@ -37,18 +37,51 @@
 #include <math.h>
 #include <time.h>
 
-#include <rpihub75/hub75gpu.h>
+#include "hub75gpu.h"
 
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wconversion"
-#pragma GCC diagnostic ignored "-Wsign-conversion"
-#pragma GCC diagnostic ignored "-Wdouble-promotion"
-#define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
-
-#include "stb_image_write.h"
-#pragma GCC diagnostic pop
+#ifdef HAVE_LIBPNG
+#include <png.h>
+/* Minimal PNG writer for RGB8 scene->image */
+static bool write_png_file(const char *filename, const hub75_display_t *scene) {
+    if (!scene || !scene->image || scene->stride < 3) return false;
+    FILE *fp = fopen(filename, "wb");
+    if (!fp) return false;
+    png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png_ptr) { fclose(fp); return false; }
+    png_infop info_ptr = png_create_info_struct(png_ptr);
+    if (!info_ptr) { png_destroy_write_struct(&png_ptr, NULL); fclose(fp); return false; }
+    if (setjmp(png_jmpbuf(png_ptr))) {
+        png_destroy_write_struct(&png_ptr, &info_ptr); fclose(fp); return false;
+    }
+    png_init_io(png_ptr, fp);
+    png_set_IHDR(png_ptr, info_ptr,
+                 scene->width, scene->height,
+                 8, PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE,
+                 PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png_ptr, info_ptr);
+    png_bytep row = (png_bytep)malloc((size_t)scene->width * 3u);
+    if (!row) { png_destroy_write_struct(&png_ptr, &info_ptr); fclose(fp); return false; }
+    for (uint16_t y = 0; y < scene->height; ++y) {
+        const uint8_t *src = scene->image + (size_t)y * (size_t)scene->width * (size_t)scene->stride;
+        /* If stride==3, we can write directly; otherwise, pack into row */
+        if (scene->stride == 3) {
+            png_write_row(png_ptr, (png_bytep)src);
+        } else {
+            for (uint16_t x = 0; x < scene->width; ++x) {
+                row[x*3+0] = src[x*scene->stride + 0];
+                row[x*3+1] = src[x*scene->stride + 1];
+                row[x*3+2] = src[x*scene->stride + 2];
+            }
+            png_write_row(png_ptr, row);
+        }
+    }
+    free(row);
+    png_write_end(png_ptr, NULL);
+    png_destroy_write_struct(&png_ptr, &info_ptr);
+    fclose(fp);
+    return true;
+}
+#endif
 
 // --------------- Utility Helpers (example only) -----------------
 
@@ -85,26 +118,32 @@ static void *render_3d(void *arg) {
     camera_t *cam = api.geo_camera();
 
     // create a cube object
-    object_t    *cube       = api.geo_torus(24, 10);  // Using sphere for better appearance on small displays
+    //object_t    *cube       = api.geo_torus(24, 10);  // Using sphere for better appearance on small displays
+    object_t    *cube       = api.geo_sphere(2);  // Using sphere for better appearance on small displays
     transform_t *cube_xform = api.geo_transform();
     cube_xform->scale       = (vec3){1.25f, 1.25f, 1.25f};  // Scale up the cube 
     cube->draw_mode = DRAW_FILLED;
     cube->cull_backface = true;
+    cube->shadow_enabled = true;
+    cube->specular_strength = 0.9f;
+    /* Gouraud specular: use a moderate shininess so highlights appear on low-tessellation meshes */
+    cube->specular_shininess = 24.0f;
 
-    object_t    *plane       = api.geo_plane(4, 4);
+    object_t    *plane       = api.geo_plane(12, 12);
     plane->draw_mode = DRAW_FILLED;
     plane->cull_backface = false;
+    plane->shadow_enabled = true;
     transform_t *plane_xform = api.geo_transform();
-    plane_xform->position.y  = 2.0f;  // Move the plane down
-    plane_xform->scale       = (vec3){5.0f, 1.0f, 5.0f};  // Scale up the plane
+    plane_xform->position.y  = 1.25f;  // Move the plane down
+    plane_xform->scale       = (vec3){4.0f, 1.0f, 4.0f};  // Scale up the plane
 
     // set cube edge color to cyan
     for (int i=0; i<cube->edge_colors->length; ++i) {
         cube->edge_colors->list[i] = (RGB){0, 254, 254};
     }
     // set plane edge color to indigo
-    for (int i=0; i<cube->edge_colors->length; ++i) {
-        cube->edge_colors->list[i] = (RGB){75, 0, 130};
+    for (int i=0; i<plane->edge_colors->length; ++i) {
+        plane->edge_colors->list[i] = (RGB){130, 130, 75};
     }
 
 
@@ -118,40 +157,59 @@ static void *render_3d(void *arg) {
     uint16_t cube_id = api.scene3d_add_object(cube, cube_xform);
 
     light_t *light1 = api.scene3d_get_directional(light1_id);
-
+    light1->casts_shadows = false;  // ensure this light actually casts shadows
 
     uint16_t frame = 0;
+
+    SimpleGradient my_gradient;
+    my_gradient.direction = GRADIENT_VERTICAL;
+    my_gradient.easing = EASE_LINEAR;
+    my_gradient.start_color = (RGB){0, 0, 128};// COLOR_NAVY;
+    my_gradient.end_color = (RGB){255, 215, 0};//COLOR_GOLD;
+
     while(scene->do_render) {
 
         frame++;
         api.frame_begin(); 
         api.clear();
-        float t = (float)frame * 0.008f;
+        float t = (float)frame * 0.016f;
 
         // rotate cube and move it a bit 
-        //cube_xform->rotation.x = t * 0.7f;
-        //cube_xform->rotation.y = 1.14f;
+        cube_xform->rotation.x = t * 0.9f;
+        cube_xform->rotation.y = t * 0.14f;
 
         // orbit camera around origin while looking at cube - closer distance with wider FOV
         //cam->position.x = 5.0f * cosf(t * 0.3f);  // Reduced distance with wider FOV for better fit 
         //cam->position.z = 5.0f * sinf(t * 0.3f);  // Reduced distance with wider FOV for better fit 
         //cam->target     = cube_xform->position;
+        
 
         // Animate a directional light by orbiting its position and pointing at the object
-        light_vec3 pos = { 10.0f * cosf(t * 0.5f), 3.0f, 10.0f * sinf(t * 0.5f) };
+        //light_vec3 pos = { 10.0f * cosf(t * 0.5f), 3.0f, 10.0f * sinf(t * 0.5f) };
+        light_vec3 pos = { 1.0f, -2.0f, 10.0f * sinf(t * 0.5f) };
         light_vec3 look = { cube_xform->position.x, cube_xform->position.y, cube_xform->position.z };
         api.scene3d_set_directional_pose(light1_id, pos, look);
 
         // Render using scene-owned lighting (pass NULL)
         api.render_scene3d(cam, os, NULL);
 
+        //api.fill_gradient(10, 10, 120, &my_gradient, 10, 10, 120, 120) ;
+
+        if (frame == 10) {
+            printf("write out.png\n");
+            write_png_file("out.png", scene);
+        }
         api.frame_end();
 
         // FPS calculation
         calculate_fps(scene->fps, scene->show_fps);
     }
 
-    //stbi_write_png("out2.png", scene->width, scene->height, 3, scene->image, scene->width * scene->stride);
+    /* Optional: dump a frame capture (requires libpng)
+    #ifdef HAVE_LIBPNG
+    write_png_file("out2.png", scene);
+    #endif
+    */
     
     /* cleanup */
     api.scene3d_clear_current();
