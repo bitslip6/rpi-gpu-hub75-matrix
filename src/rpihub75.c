@@ -203,6 +203,8 @@ void hub75_display_start(hub75_display_t *scene) {
     scene->image = aligned_alloc(16, image_alloc);
     memset(scene->image, 0, image_alloc);
 
+    /* Z-buffer is managed by scene3d_t now (allocated lazily per frame) */
+
     // bcm mapper ring, always allocate for RGBA
     if (!(scene->ring_buf_mapper = spsc_create(8, (size_t)(scene->width * scene->height * 4)))) {
         die("failed to create mapper ring buffer\n");

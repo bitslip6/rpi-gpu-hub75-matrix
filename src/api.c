@@ -40,6 +40,65 @@ static inline vec3 v3_norm(vec3 v){ float d = sqrtf(v3_dot(v,v)); return d>0? (v
 static inline vec4 mat4_mul_point_clip_xyw(const mat4 m, const vec3 p);
 static inline float tri_orientation_clip_xyw(vec4 v0, vec4 v1, vec4 v2);
 
+/* --- Minimal struct to carry clip-space vertex + per-vertex color during clipping --- */
+typedef struct {
+    vec4 clip;   /* clip-space position (x,y,z,w) */
+    RGB  color;  /* Gouraud per-vertex color */
+} ClipVert;
+
+/* Sutherland–Hodgman against near plane (OpenGL clip space): z + w >= 0 */
+static inline int clip_polygon_near(const ClipVert *in, int in_count, ClipVert *out, int out_capacity) {
+    if (in_count <= 0) return 0;
+    int out_count = 0;
+
+    ClipVert S = in[in_count - 1];
+    float fS = S.clip.z + S.clip.w;
+    for (int i = 0; i < in_count; ++i) {
+        ClipVert E = in[i];
+        float fE = E.clip.z + E.clip.w;
+        bool Sin = (fS >= 0.0f);
+        bool Ein = (fE >= 0.0f);
+        if (Sin && Ein) {
+            /* both inside: keep E */
+            if (out_count < out_capacity) out[out_count++] = E;
+        } else if (Sin && !Ein) {
+            /* S in, E out: keep intersection */
+            float denom = (fS - fE);
+            float t = (fabsf(denom) > 1e-12f) ? (fS / denom) : 0.0f;
+            if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
+            ClipVert I;
+            I.clip.x = S.clip.x + t * (E.clip.x - S.clip.x);
+            I.clip.y = S.clip.y + t * (E.clip.y - S.clip.y);
+            I.clip.z = S.clip.z + t * (E.clip.z - S.clip.z);
+            I.clip.w = S.clip.w + t * (E.clip.w - S.clip.w);
+            /* Interpolate color linearly along the edge */
+            I.color.r = (uint8_t)lrintf((float)S.color.r + t * ((float)E.color.r - (float)S.color.r));
+            I.color.g = (uint8_t)lrintf((float)S.color.g + t * ((float)E.color.g - (float)S.color.g));
+            I.color.b = (uint8_t)lrintf((float)S.color.b + t * ((float)E.color.b - (float)S.color.b));
+            if (out_count < out_capacity) out[out_count++] = I;
+        } else if (!Sin && Ein) {
+            /* S out, E in: keep intersection then E */
+            float denom = (fS - fE);
+            float t = (fabsf(denom) > 1e-12f) ? (fS / denom) : 0.0f;
+            if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
+            ClipVert I;
+            I.clip.x = S.clip.x + t * (E.clip.x - S.clip.x);
+            I.clip.y = S.clip.y + t * (E.clip.y - S.clip.y);
+            I.clip.z = S.clip.z + t * (E.clip.z - S.clip.z);
+            I.clip.w = S.clip.w + t * (E.clip.w - S.clip.w);
+            I.color.r = (uint8_t)lrintf((float)S.color.r + t * ((float)E.color.r - (float)S.color.r));
+            I.color.g = (uint8_t)lrintf((float)S.color.g + t * ((float)E.color.g - (float)S.color.g));
+            I.color.b = (uint8_t)lrintf((float)S.color.b + t * ((float)E.color.b - (float)S.color.b));
+            if (out_count < out_capacity) out[out_count++] = I;
+            if (out_count < out_capacity) out[out_count++] = E;
+        } else {
+            /* both outside: keep nothing */
+        }
+        S = E; fS = fE;
+    }
+    return out_count;
+}
+
 /* ---------------- Shadows: column-major math helpers (match 3d.c) ---------------- */
 typedef struct { int w, h; float *depth; mat4 VP; mat4 V; float z_bias; bool valid; } ShadowMap;
 static _Thread_local ShadowMap *tls_shadow_maps = NULL;
@@ -155,6 +214,7 @@ static RGB compute_face_shaded_color(size_t face_index,
 static RGB compute_vertex_shaded_color(RGB base_rgb,
                                        vec3 v_world,
                                        vec3 n_world,
+                                       vec3 cam_pos,
                                        const object_t *obj,
                                        const scene3d_lighting_t *lighting){
     if (!lighting) return base_rgb;
@@ -164,7 +224,19 @@ static RGB compute_vertex_shaded_color(RGB base_rgb,
     if (nlen > 1e-6f) { n_world.x/=nlen; n_world.y/=nlen; n_world.z/=nlen; }
 
     float br = base_rgb.r/255.0f, bg = base_rgb.g/255.0f, bb = base_rgb.b/255.0f;
-    float lr = lighting->ambient.r, lg = lighting->ambient.g, lb = lighting->ambient.b;
+    /* Split diffuse/ambient (Ld) and specular (Ls) so specular is NOT modulated by albedo */
+    float Ld_r = lighting->ambient.r, Ld_g = lighting->ambient.g, Ld_b = lighting->ambient.b;
+    float Ls_r = 0.0f, Ls_g = 0.0f, Ls_b = 0.0f;
+
+    /* view vector for specular */
+    float Vx = cam_pos.x - v_world.x;
+    float Vy = cam_pos.y - v_world.y;
+    float Vz = cam_pos.z - v_world.z;
+    float Vlen = sqrtf(Vx*Vx + Vy*Vy + Vz*Vz);
+    if (Vlen > 1e-6f) { Vx/=Vlen; Vy/=Vlen; Vz/=Vlen; }
+
+    const float ks = (obj ? obj->specular_strength : 0.0f);
+    const float shin = (obj ? obj->specular_shininess : 32.0f);
 
     for (uint16_t li = 0; li < lighting->num_lights; ++li) {
         const light_t *L = &lighting->lights[li];
@@ -196,17 +268,36 @@ static RGB compute_vertex_shaded_color(RGB base_rgb,
                     }
                 }
                 if (vis > 0.0f) {
-                    lr += L->color.r * L->intensity * ndotl;
-                    lg += L->color.g * L->intensity * ndotl;
-                    lb += L->color.b * L->intensity * ndotl;
+                    /* Diffuse */
+                    float diff = ndotl;
+                    Ld_r += L->color.r * L->intensity * diff;
+                    Ld_g += L->color.g * L->intensity * diff;
+                    Ld_b += L->color.b * L->intensity * diff;
+
+                    /* Blinn-Phong specular (per-vertex) */
+                    if (ks > 0.0f) {
+                        float Hx = Lx + Vx;
+                        float Hy = Ly + Vy;
+                        float Hz = Lz + Vz;
+                        float Hlen = sqrtf(Hx*Hx + Hy*Hy + Hz*Hz);
+                        if (Hlen > 1e-6f) { Hx/=Hlen; Hy/=Hlen; Hz/=Hlen; }
+                        float ndoth = n_world.x*Hx + n_world.y*Hy + n_world.z*Hz;
+                        if (ndoth > 0.0f) {
+                            float spec = ks * powf(ndoth, shin) * L->intensity;
+                            Ls_r += L->color.r * spec;
+                            Ls_g += L->color.g * spec;
+                            Ls_b += L->color.b * spec;
+                        }
+                    }
                 }
             }
         }
     }
 
-    float cr = fminf(fmaxf(br * lr, 0.0f), 1.0f);
-    float cg = fminf(fmaxf(bg * lg, 0.0f), 1.0f);
-    float cb = fminf(fmaxf(bb * lb, 0.0f), 1.0f);
+    /* Final color: albedo * (ambient+diffuse) + specular */
+    float cr = fminf(fmaxf(br * Ld_r + Ls_r, 0.0f), 1.0f);
+    float cg = fminf(fmaxf(bg * Ld_g + Ls_g, 0.0f), 1.0f);
+    float cb = fminf(fmaxf(bb * Ld_b + Ls_b, 0.0f), 1.0f);
     RGB shaded_rgb;
     shaded_rgb.r = (uint8_t)(cr * 255.0f);
     shaded_rgb.g = (uint8_t)(cg * 255.0f);
@@ -668,15 +759,24 @@ void draw_polygon_fill(hub75_display_t *scene, Polygonf_t *poly, RGB color)
 
 /* Gouraud-shaded triangle rasterization (normalized coords -> screen)
  * Integer edge functions for inside test + fixed-point color interpolation for speed.
+ * Optional per-pixel Z-buffer test using provided z-buffer (uint16, near=0; far=65535).
  */
-static inline void draw_triangle_gouraud(hub75_display_t *scene, const Polygonf_t *poly, const RGB vcolor[3]) {
+static inline void draw_triangle_gouraud(hub75_display_t *scene,
+                                         const Polygonf_t *poly,
+                                         const RGB vcolor[3],
+                                         const uint16_t zv[3],
+                                         uint16_t *zbuf,
+                                         int zbuf_width) {
     if (!scene || !scene->image || !poly || poly->num_points != 3) return;
+    const bool use_z = (zbuf != NULL);
 
-    /* Fast path: solid color triangle -> reuse existing solid fill */
-    if (vcolor[0].r == vcolor[1].r && vcolor[0].g == vcolor[1].g && vcolor[0].b == vcolor[1].b &&
-        vcolor[0].r == vcolor[2].r && vcolor[0].g == vcolor[2].g && vcolor[0].b == vcolor[2].b) {
-        draw_polygon_fill(scene, (Polygonf_t*)poly, vcolor[0]);
-        return;
+    /* Fast path only allowed when Z-buffer is disabled */
+    if (!use_z) {
+        if (vcolor[0].r == vcolor[1].r && vcolor[0].g == vcolor[1].g && vcolor[0].b == vcolor[1].b &&
+            vcolor[0].r == vcolor[2].r && vcolor[0].g == vcolor[2].g && vcolor[0].b == vcolor[2].b) {
+            draw_polygon_fill(scene, (Polygonf_t*)poly, vcolor[0]);
+            return;
+        }
     }
 
     /* Convert to pixel space */
@@ -781,25 +881,53 @@ static inline void draw_triangle_gouraud(hub75_display_t *scene, const Polygonf_
     int b_row = (int)lrintf((w0_row_f*b0 + w1_row_f*b1 + w2_row_f*b2) * (float)ONE);
 
     size_t row_stride = (size_t)scene->width * (size_t)scene->stride;
+    const int fb_width = scene->width;
+
+    /* Optional depth interpolation setup (use uint16 range in float domain) */
+    int dzdx = 0, dzdy = 0, z_row = 0;
+    if (use_z) {
+        float z0 = (float)zv[0], z1 = (float)zv[1], z2 = (float)zv[2];
+        float dzdx_f = dw0dx_f*z0 + dw1dx_f*z1 + w2dx_f*z2;
+        float dzdy_f = dw0dy_f*z0 + dw1dy_f*z1 + w2dy_f*z2;
+        dzdx = (int)lrintf(dzdx_f);
+        dzdy = (int)lrintf(dzdy_f);
+        z_row = (int)lrintf(w0_row_f*z0 + w1_row_f*z1 + w2_row_f*z2);
+    }
     for (int py = miny; py <= maxy; ++py) {
         uint8_t *p = scene->image + (size_t)py * row_stride + (size_t)minx * (size_t)scene->stride;
+    uint16_t *pz = use_z ? (zbuf + (size_t)py * (size_t)zbuf_width + (size_t)minx) : NULL;
         int E0 = E0_row, E1 = E1_row, E2 = E2_row;
         int rfp = r_row, gfp = g_row, bfp = b_row;
+        int zfp = z_row;
         for (int px = minx; px <= maxx; ++px) {
             if ( (E0 > 0 || (E0 == 0 && tl0)) &&
                  (E1 > 0 || (E1 == 0 && tl1)) &&
                  (E2 > 0 || (E2 == 0 && tl2)) ) {
-                int r8 = rfp >> FP; if (r8 < 0) r8 = 0; else if (r8 > 255) r8 = 255;
-                int g8 = gfp >> FP; if (g8 < 0) g8 = 0; else if (g8 > 255) g8 = 255;
-                int b8 = bfp >> FP; if (b8 < 0) b8 = 0; else if (b8 > 255) b8 = 255;
-                p[0] = (uint8_t)r8; p[1] = (uint8_t)g8; p[2] = (uint8_t)b8;
+                if (use_z) {
+                    int zcl = zfp;
+                    if (zcl < 0) zcl = 0; else if (zcl > 65535) zcl = 65535;
+                    if (zcl < (int)*pz) {
+                        int r8 = rfp >> FP; if (r8 < 0) r8 = 0; else if (r8 > 255) r8 = 255;
+                        int g8 = gfp >> FP; if (g8 < 0) g8 = 0; else if (g8 > 255) g8 = 255;
+                        int b8 = bfp >> FP; if (b8 < 0) b8 = 0; else if (b8 > 255) b8 = 255;
+                        p[0] = (uint8_t)r8; p[1] = (uint8_t)g8; p[2] = (uint8_t)b8;
+                        *pz = (uint16_t)zcl;
+                    }
+                } else {
+                    int r8 = rfp >> FP; if (r8 < 0) r8 = 0; else if (r8 > 255) r8 = 255;
+                    int g8 = gfp >> FP; if (g8 < 0) g8 = 0; else if (g8 > 255) g8 = 255;
+                    int b8 = bfp >> FP; if (b8 < 0) b8 = 0; else if (b8 > 255) b8 = 255;
+                    p[0] = (uint8_t)r8; p[1] = (uint8_t)g8; p[2] = (uint8_t)b8;
+                }
             }
             E0 += dE0dx; E1 += dE1dx; E2 += dE2dx;
             rfp += drdx; gfp += dgdx; bfp += dbdx;
+            if (use_z) { zfp += dzdx; pz++; }
             p += scene->stride;
         }
         E0_row += dE0dy; E1_row += dE1dy; E2_row += dE2dy;
         r_row += drdy; g_row += dgdy; b_row += dbdy;
+        if (use_z) { z_row += dzdy; }
     }
 }
 
@@ -1181,22 +1309,19 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
     if (obj->vertex_normals && !obj->vertex_normals_ready) {
         object_build_vertex_normals(obj);
     }
-    if (!obj->trifill_buffer || obj->trifill_capacity < nf) {
-        void *newbuf = realloc(obj->trifill_buffer, sizeof(_TriFill) * nf);
+    /* With near-plane clipping, a triangle can split into 2. Reserve 2x faces. */
+    size_t needed_tri_capacity = nf * 2u;
+    if (!obj->trifill_buffer || obj->trifill_capacity < needed_tri_capacity) {
+        void *newbuf = realloc(obj->trifill_buffer, sizeof(_TriFill) * needed_tri_capacity);
         if (!newbuf) return;
         obj->trifill_buffer = newbuf;
-        obj->trifill_capacity = nf;
+        obj->trifill_capacity = needed_tri_capacity;
     }
     _TriFill *tri = (_TriFill*)obj->trifill_buffer;
     size_t tcount = 0;
 
     for (size_t i = 0; i < nf; i++) {
         vec3 face = obj->faces->list[i];
-        vec3 v[3] = {
-            obj->rendered_vertices[(size_t)face.x],
-            obj->rendered_vertices[(size_t)face.y],
-            obj->rendered_vertices[(size_t)face.z]
-        };
         /* Robust backface culling in clip-space XYW (pre-divide) */
         if (obj->cull_backface) {
             vec3 p0 = obj->verticies->list[(uint16_t)face.x];
@@ -1209,40 +1334,70 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
             bool back = FRONT_FACE_CCW ? (orient <= 0.0f) : (orient >= 0.0f);
             if (back) continue;
         }
-
-        float nx[3], ny[3];
-        for (int vi = 0; vi < 3; ++vi) {
-            nx[vi] = 0.5f * (v[vi].x + 1.0f);
-            ny[vi] = 0.5f * (v[vi].y + 1.0f);
-        }
         /* Base material color per face (matches prior behavior) */
         RGB base_rgb = (i < obj->edge_colors->length) ? obj->edge_colors->list[i] : (RGB){255,255,255};
-        RGB vcolor[3];
-        /* Compute per-vertex world positions and normals, then shade */
+        /* Compute per-vertex world positions and normals, then shade (for original triangle) */
+        RGB base_vcol[3];
+        vec4 clip_in[3];
         uint16_t idx[3] = { (uint16_t)face.x, (uint16_t)face.y, (uint16_t)face.z };
         for (int vi = 0; vi < 3; ++vi) {
             vec3 vw = cm_m4_mul_point3(M_model, obj->verticies->list[idx[vi]]);
             vec3 n_obj = obj->vertex_normals && obj->vertex_normals->list ? obj->vertex_normals->list[idx[vi]] : (vec3){0,0,1};
             vec3 nw = mat3_mul_vec3(N3, n_obj);
-            vcolor[vi] = compute_vertex_shaded_color(base_rgb, vw, nw, obj, lighting);
+            base_vcol[vi] = compute_vertex_shaded_color(base_rgb, vw, nw, cam->position, obj, lighting);
+            /* clip-space position for clipping */
+            clip_in[vi] = mat4_mul_point_clip_xyw(mvp, obj->verticies->list[idx[vi]]);
         }
-        _TriFill t;
-        t.depth = (v[0].z + v[1].z + v[2].z) / 3.0f;
-        t.poly.num_points = 3;
-        t.poly.points[0] = (Pointf_t){nx[0], ny[0]};
-        t.poly.points[1] = (Pointf_t){nx[1], ny[1]};
-        t.poly.points[2] = (Pointf_t){nx[2], ny[2]};
-        t.vcolor[0] = vcolor[0];
-        t.vcolor[1] = vcolor[1];
-        t.vcolor[2] = vcolor[2];
-        tri[tcount++] = t;
+
+        /* Build input polygon for near-plane clip */
+        ClipVert poly_in[3];
+        for (int vi = 0; vi < 3; ++vi) {
+            poly_in[vi].clip = clip_in[vi];
+            poly_in[vi].color = base_vcol[vi];
+        }
+        ClipVert poly_out[8];
+        int m = clip_polygon_near(poly_in, 3, poly_out, 8);
+        if (m < 3) continue;
+
+        /* Triangulate fan: (0,i,i+1) for i=1..m-2 */
+        for (int k = 1; k + 1 < m; ++k) {
+            ClipVert a = poly_out[0];
+            ClipVert b = poly_out[k];
+            ClipVert c = poly_out[k+1];
+
+            _TriFill t;
+            t.poly.num_points = 3;
+
+            /* Convert to NDC and then to normalized 0..1 coords */
+            vec3 ndc[3];
+            vec4 cv[3] = { a.clip, b.clip, c.clip };
+            RGB  col[3] = { a.color, b.color, c.color };
+            for (int vi = 0; vi < 3; ++vi) {
+                float iw = (fabsf(cv[vi].w) > 1e-12f) ? (1.0f / cv[vi].w) : 1.0f;
+                ndc[vi].x = cv[vi].x * iw;
+                ndc[vi].y = cv[vi].y * iw;
+                ndc[vi].z = cv[vi].z * iw;
+            }
+            t.poly.points[0] = (Pointf_t){ 0.5f * (ndc[0].x + 1.0f), 0.5f * (ndc[0].y + 1.0f) };
+            t.poly.points[1] = (Pointf_t){ 0.5f * (ndc[1].x + 1.0f), 0.5f * (ndc[1].y + 1.0f) };
+            t.poly.points[2] = (Pointf_t){ 0.5f * (ndc[2].x + 1.0f), 0.5f * (ndc[2].y + 1.0f) };
+            t.vcolor[0] = col[0];
+            t.vcolor[1] = col[1];
+            t.vcolor[2] = col[2];
+            /* Map NDC z [-1,1] -> [0..65535] for depth buffer */
+            for (int vi = 0; vi < 3; ++vi) {
+                float z01 = ndc[vi].z * 0.5f + 0.5f;
+                int zi = (int)lrintf(z01 * 65535.0f);
+                if (zi < 0) zi = 0; else if (zi > 65535) zi = 65535;
+                t.z16[vi] = (uint16_t)zi;
+            }
+            /* Use average ndc.z as triangle depth hint (optional, used only for debug prints) */
+            t.depth = (ndc[0].z + ndc[1].z + ndc[2].z) / 3.0f;
+            tri[tcount++] = t;
+        }
     }
 
-    /* Painter's algorithm: draw far to near => sort by depth descending (far ~ +1) */
-    if (tcount > 1) {
-        qsort(tri, tcount, sizeof(_TriFill), _cmp_trifill_desc);
-    }
-
+    /* With Z-buffering, triangle order doesn't matter; skip painter's sort entirely */
     for (size_t i = 0; i < tcount; ++i) {
         if (tls_scene && tls_scene->enhanced_debug) {
             printf("Filling triangle p1 (%.3f, %.3f), p2 (%.3f, %.3f), p3 (%.3f, %.3f) depth=%.3f\n",
@@ -1251,8 +1406,13 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
                 (double)tri[i].poly.points[2].x, (double)tri[i].poly.points[2].y,
                 (double)tri[i].depth);
         }
-        /* Gouraud fill using per-vertex colors */
-        draw_triangle_gouraud(tls_scene, &tri[i].poly, tri[i].vcolor);
+        /* Gouraud fill using per-vertex colors + Z-buffer if available (from scene3d) */
+        uint16_t *zptr = NULL; int zw = 0;
+        if (tls_current_os && tls_current_os->zbuffer_enabled) {
+            zptr = tls_current_os->zbuf;
+            zw = (int)(tls_current_os->zbuf_width);
+        }
+        draw_triangle_gouraud(tls_scene, &tri[i].poly, tri[i].vcolor, tri[i].z16, zptr, zw);
     }
 
     /* trifill_buffer is persistent, do not free here */
@@ -1388,6 +1548,20 @@ static void api_render_scene3d(const camera_t *cam, const scene3d_t *os, const s
     if (!os || !os->instances || os->count == 0) return;
     /* Prefer explicitly provided lighting; else fall back to scene-owned lighting */
     const scene3d_lighting_t *L = lighting ? lighting : &os->lighting;
+    /* Ensure Z-buffer exists and matches current framebuffer size; clear per frame */
+    if (tls_scene && ((scene3d_t*)os)->zbuffer_enabled) {
+        uint16_t W = tls_scene->width, H = tls_scene->height;
+        bool need_alloc = (os->zbuf == NULL) || (os->zbuf_width != W) || (os->zbuf_height != H);
+        if (need_alloc) {
+            if (((scene3d_t*)os)->zbuf) free(((scene3d_t*)os)->zbuf);
+            ((scene3d_t*)os)->zbuf = (uint16_t*)aligned_alloc(16, (size_t)W * (size_t)H * sizeof(uint16_t));
+            ((scene3d_t*)os)->zbuf_width = W;
+            ((scene3d_t*)os)->zbuf_height = H;
+        }
+        if (((scene3d_t*)os)->zbuf) {
+            memset(((scene3d_t*)os)->zbuf, 0xFF, (size_t)W * (size_t)H * sizeof(uint16_t));
+        }
+    }
     /* ---------------- Build per-light shadow maps (centroid-based) ---------------- */
     tls_shadow_maps = NULL; tls_shadow_count = 0;
     /* --- Stable shadow map: cache VP/bias in light_t, only recompute if needed --- */
@@ -1674,6 +1848,10 @@ scene3d_t *api_object_scene_new(uint16_t object_count) {
     os->add_object = os_add_object;
     os->get_object = os_get_object;
     os->get_transform = os_get_transform;
+    /* Enable Z-buffer by default; allocate lazily on first render */
+    os->zbuffer_enabled = true;
+    os->zbuf = NULL;
+    os->zbuf_width = os->zbuf_height = 0;
     return os;
 }
 
@@ -1793,5 +1971,26 @@ void api_scene3d_set_directional_pose(uint16_t id, light_vec3 position, light_ve
     if (tls_current_os && tls_current_os->set_directional_pose) {
         tls_current_os->set_directional_pose(tls_current_os, id, position, look_at);
     }
+}
+
+/* -------- Object material helpers -------- */
+void api_object_set_specular(object_t *obj, float strength, float shininess) {
+    if (!obj) return;
+    if (strength < 0.0f) strength = 0.0f;
+    obj->specular_strength = strength;
+    if (shininess < 1.0f) shininess = 1.0f;
+    obj->specular_shininess = shininess;
+}
+
+void api_object_set_specular_strength(object_t *obj, float strength) {
+    if (!obj) return;
+    if (strength < 0.0f) strength = 0.0f;
+    obj->specular_strength = strength;
+}
+
+void api_object_set_specular_shininess(object_t *obj, float shininess) {
+    if (!obj) return;
+    if (shininess < 1.0f) shininess = 1.0f;
+    obj->specular_shininess = shininess;
 }
 

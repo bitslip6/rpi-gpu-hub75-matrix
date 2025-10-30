@@ -275,6 +275,9 @@ object_t* object_new(const uint16_t num_vertices, const uint16_t num_edges, cons
     obj->cull_backface = true;
     obj->draw_mode = DRAW_WIRE;
     obj->shadow_enabled = true; /* default: objects cast/receive shadows */
+    /* default material */
+    obj->specular_strength = 0.35f;
+    obj->specular_shininess = 24.0f;
     return obj;
 }
 

@@ -218,6 +218,7 @@ typedef struct hub75_display {
     /** @brief pointer to a single frame for CPU drawing functions */
     uint8_t *image;
 
+
     /** @brief accumulator for quantization errors */
     int32_t *accum;
 
@@ -558,12 +559,17 @@ typedef struct {
     /* Persistent buffer for filled triangle rendering */
     void *trifill_buffer; /* actually _TriFill*, but opaque here */
     size_t trifill_capacity;
+
+    /* Simple material for specular highlights (Blinn-Phong) */
+    float specular_strength;   /* scales specular contribution (0..1 typical) */
+    float specular_shininess;  /* Blinn shininess exponent (e.g., 8..128) */
 } object_t;
 
 typedef struct {
     float depth;      /* average NDC z */
     Polygonf_t poly;  /* 3 points normalized to [0,1] */
     RGB vcolor[3];    /* per-vertex shaded color */
+    uint16_t z16[3];  /* per-vertex depth mapped from NDC [-1,1] -> [0..65535] */
 } _TriFill;
 
 
@@ -621,6 +627,12 @@ typedef struct scene3d_t {
     uint16_t (*add_object)(struct scene3d_t *os, object_t *obj, transform_t *xform);
     object_t *(*get_object)(struct scene3d_t *os, uint16_t id);
     transform_t *(*get_transform)(struct scene3d_t *os, uint16_t id);
+
+    /* Z-buffer owned by the scene for CPU rasterizer */
+    uint16_t *zbuf;
+    bool zbuffer_enabled;
+    uint16_t zbuf_width;
+    uint16_t zbuf_height;
 } scene3d_t;
 
 
@@ -696,6 +708,11 @@ void api_object_scene_set(scene3d_t *os, uint16_t index, object_t *obj, transfor
 void api_object_scene_free(scene3d_t *os);
 void api_object_set_draw_mode(object_t *obj, object_draw_mode_t mode);
 void api_render_geo(const camera_t *cam, const scene3d_t *os, const scene3d_lighting_t *lighting);
+
+/* Object material helpers */
+void api_object_set_specular(object_t *obj, float strength, float shininess);
+void api_object_set_specular_strength(object_t *obj, float strength);
+void api_object_set_specular_shininess(object_t *obj, float shininess);
 
 /* Convenience scene3d wrappers (thread-local current scene3d) */
 void api_scene3d_set_current(scene3d_t *os);
