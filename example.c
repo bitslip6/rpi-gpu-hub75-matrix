@@ -38,50 +38,10 @@
 #include <time.h>
 
 #include "hub75gpu.h"
+#include "util.h"
+#include "text_sdf.h"
 
-#ifdef HAVE_LIBPNG
-#include <png.h>
-/* Minimal PNG writer for RGB8 scene->image */
-static bool write_png_file(const char *filename, const hub75_display_t *scene) {
-    if (!scene || !scene->image || scene->stride < 3) return false;
-    FILE *fp = fopen(filename, "wb");
-    if (!fp) return false;
-    png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
-    if (!png_ptr) { fclose(fp); return false; }
-    png_infop info_ptr = png_create_info_struct(png_ptr);
-    if (!info_ptr) { png_destroy_write_struct(&png_ptr, NULL); fclose(fp); return false; }
-    if (setjmp(png_jmpbuf(png_ptr))) {
-        png_destroy_write_struct(&png_ptr, &info_ptr); fclose(fp); return false;
-    }
-    png_init_io(png_ptr, fp);
-    png_set_IHDR(png_ptr, info_ptr,
-                 scene->width, scene->height,
-                 8, PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE,
-                 PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
-    png_write_info(png_ptr, info_ptr);
-    png_bytep row = (png_bytep)malloc((size_t)scene->width * 3u);
-    if (!row) { png_destroy_write_struct(&png_ptr, &info_ptr); fclose(fp); return false; }
-    for (uint16_t y = 0; y < scene->height; ++y) {
-        const uint8_t *src = scene->image + (size_t)y * (size_t)scene->width * (size_t)scene->stride;
-        /* If stride==3, we can write directly; otherwise, pack into row */
-        if (scene->stride == 3) {
-            png_write_row(png_ptr, (png_bytep)src);
-        } else {
-            for (uint16_t x = 0; x < scene->width; ++x) {
-                row[x*3+0] = src[x*scene->stride + 0];
-                row[x*3+1] = src[x*scene->stride + 1];
-                row[x*3+2] = src[x*scene->stride + 2];
-            }
-            png_write_row(png_ptr, row);
-        }
-    }
-    free(row);
-    png_write_end(png_ptr, NULL);
-    png_destroy_write_struct(&png_ptr, &info_ptr);
-    fclose(fp);
-    return true;
-}
-#endif
+/* PNG writing now provided via util.c: write_png_file(string_t*, hub75_display_t*) */
 
 // --------------- Utility Helpers (example only) -----------------
 
@@ -129,7 +89,7 @@ static void *render_3d(void *arg) {
     /* Gouraud specular: use a moderate shininess so highlights appear on low-tessellation meshes */
     cube->specular_shininess = 24.0f;
 
-    object_t    *plane       = api.geo_plane(12, 12);
+    object_t    *plane       = api.geo_plane(12, 12, true);
     plane->draw_mode = DRAW_FILLED;
     plane->cull_backface = false;
     plane->shadow_enabled = true;
@@ -152,7 +112,7 @@ static void *render_3d(void *arg) {
     scene3d_t *os = api.scene3d_new(1);
     api.scene3d_set_current(os);
     api.scene3d_set_ambient(COLOR_DARK_GREY);
-    uint16_t light1_id = api.scene3d_add_directional((light_vec3){-0.5f, 1.0f, 3.2f}, COLOR_WHITE, 1.0f, true);
+    uint16_t light1_id = api.scene3d_add_directional((vec3){-0.5f, 1.0f, 3.2f}, COLOR_WHITE, 1.0f, true);
     uint16_t plane_id = api.scene3d_add_object(plane, plane_xform);
     uint16_t cube_id = api.scene3d_add_object(cube, cube_xform);
 
@@ -166,6 +126,8 @@ static void *render_3d(void *arg) {
     my_gradient.easing = EASE_LINEAR;
     my_gradient.start_color = (RGB){0, 0, 128};// COLOR_NAVY;
     my_gradient.end_color = (RGB){255, 215, 0};//COLOR_GOLD;
+
+    string_t *outfile = string_new("out.png", 256);
 
     while(scene->do_render) {
 
@@ -185,9 +147,9 @@ static void *render_3d(void *arg) {
         
 
         // Animate a directional light by orbiting its position and pointing at the object
-        //light_vec3 pos = { 10.0f * cosf(t * 0.5f), 3.0f, 10.0f * sinf(t * 0.5f) };
-        light_vec3 pos = { 1.0f, -2.0f, 10.0f * sinf(t * 0.5f) };
-        light_vec3 look = { cube_xform->position.x, cube_xform->position.y, cube_xform->position.z };
+        //vec3 pos = { 10.0f * cosf(t * 0.5f), 3.0f, 10.0f * sinf(t * 0.5f) };
+        vec3 pos = { 1.0f, -2.0f, 10.0f * sinf(t * 0.5f) };
+        vec3 look = { cube_xform->position.x, cube_xform->position.y, cube_xform->position.z };
         api.scene3d_set_directional_pose(light1_id, pos, look);
 
         // Render using scene-owned lighting (pass NULL)
@@ -196,8 +158,8 @@ static void *render_3d(void *arg) {
         //api.fill_gradient(10, 10, 120, &my_gradient, 10, 10, 120, 120) ;
 
         if (frame == 10) {
-            printf("write out.png\n");
-            write_png_file("out.png", scene);
+            printf("create frame\n");
+            write_png_file(outfile, scene);
         }
         api.frame_end();
 
@@ -286,6 +248,78 @@ static void *render_cpu(void *arg) {
 }
 // ...existing code...
 
+/* ---------------- Text SDF Demo (Task 5.1) ---------------- */
+static void *render_text_sdf(void *arg) {
+    hub75_display_t *scene = (hub75_display_t*)arg;
+    printf("[TEXT] SDF text scroller demo (Ctrl+C to exit)\n");
+
+    // Ensure 24bpp RGB unless caller overrides to RGBA elsewhere
+    //if (scene->stride != 3 && scene->stride != 4) scene->stride = 3;
+
+    /* Configure font: load and scale to 64px line height */
+    const char *font_dir = getenv("TEXT_FONT_DIR");
+    if (!font_dir || !*font_dir) font_dir = "assets/roboto"; /* default path */
+    float target_h = 64.0f;
+    sdf_font_t *font = sdf_font_load_scaled(font_dir, target_h);
+    if (!font) {
+        fprintf(stderr, "[TEXT] Failed to load SDF font from '%s' (expect metrics.csv + PNGs).\n", font_dir);
+        scene->do_render = false;
+        return NULL;
+    }
+
+    /* Create text object */
+    const char *msg = getenv("TEXT_MESSAGE");
+    if (!msg || !*msg) msg = "Hello, HUB75 SDF Scroller!  ";
+    sdf_text_t *txt = sdf_text_create(font, msg);
+    txt->size_px = 24.0f;
+    txt->color = (RGB){0, 255, 128};
+    txt->alpha = 128;
+    txt->tracking = 3.0f;
+    txt->wrap = true;
+    txt->valign = SDF_VALIGN_BOTTOM;
+    txt->y = 100.0f;
+    txt->dir_x = -1.0f;
+    txt->speed = 255.0f;
+    sdf_text_update(txt);
+
+
+    
+    /* Render loop */
+    hub75gpu_t api = hub75_api(scene);
+    const bool rgba = (scene->stride == 4);
+    const int row_stride = (int)scene->width * (int)scene->stride;
+    float dt = 0.0f;
+    const bool dump_once = true;//(dump_env && *dump_env && dump_env[0] != '0');
+    string_t *dump_path = string_new("text_debug.png", 128);
+    uint32_t frame = 0;
+
+    float last_time = 0.0f;
+    float this_time = 0.0f;
+    while (scene->do_render) {
+        frame++;
+        api.frame_begin();
+        api.clear(); /* black background */
+
+        sdf_text_render(txt, scene->image, (int)scene->width, (int)scene->height, row_stride, rgba, dt);
+
+        if (dump_once && frame == 30) {
+            write_png_file(dump_path, scene);
+            fprintf(stderr, "[TEXT] Wrote debug frame to %s\n", dump_path->str);
+        }
+
+        api.frame_end();
+        this_time = calculate_fps(scene->fps, scene->show_fps);
+        dt = this_time - last_time;
+        last_time = this_time;
+    }
+
+    /* Cleanup */
+    if (dump_path) string_free(dump_path);
+    sdf_text_destroy(txt);
+    sdf_font_free(font);
+    return NULL;
+}
+
 
 // --------------- Main Entry Point --------------------------------
 int main(int argc, char **argv) {
@@ -300,7 +334,9 @@ int main(int argc, char **argv) {
 
     signal_handler_install();
 
-    pthread_create(&scene->render_thread, NULL, render_3d, scene);
+    /* To try the text SDF demo, replace render_3d with render_text_sdf */
+    // pthread_create(&scene->render_thread, NULL, render_text_sdf, scene);
+    pthread_create(&scene->render_thread, NULL, render_text_sdf, scene);
 
     hub75_display_run(scene);
 

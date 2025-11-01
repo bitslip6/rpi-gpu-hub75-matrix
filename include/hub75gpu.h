@@ -353,7 +353,7 @@ bool hub_render_video(hub75_display_t *scene, const char *filename);
  * @param target_fps - target a sleep time to achieve this fps
  * @return long - returns sleep time in microseconds
  */
-unsigned long calculate_fps(const uint16_t target_fps, const bool show_fps);
+float calculate_fps(const uint16_t target_fps, const bool show_fps);
 
 
 // graceful shutdown helpers
@@ -466,7 +466,7 @@ typedef enum {
 } light_type_t;
 
 /* local 3-float vector for lighting (avoid dependency on vec3 defined later) */
-typedef struct { float x, y, z; } light_vec3;
+// typedef struct { float x, y, z; } vec3;
 
 typedef struct light_t {
     light_type_t type;     /* light category */
@@ -478,8 +478,8 @@ typedef struct light_t {
     bool   shadow_enabled; /* runtime toggle to enable/disable shadowing for this light */
 
     /* Geometric parameters (interpreted by type) */
-    light_vec3 position;   /* for point/spot lights */
-    light_vec3 direction;  /* for directional/spot lights */
+    vec3 position;   /* for point/spot lights */
+    vec3 direction;  /* for directional/spot lights */
 
     /* Optional falloff / cone controls (POINT/SPOT) */
     float  range;          /* effective radius for point/spot; 0 => infinite */
@@ -489,6 +489,8 @@ typedef struct light_t {
     mat4 shadow_V, shadow_P, shadow_VP;
     float shadow_z_bias;
     bool shadow_vp_valid;
+    /* Debug/quality control: zoom factor for tight-fit SM bounds (1=original size, <1 zoom-in) */
+    float shadow_zoom;
 } light_t;
 
 typedef struct scene3d_lighting_t {
@@ -496,7 +498,7 @@ typedef struct scene3d_lighting_t {
     uint16_t num_lights;   // number of active lights
     light_t *lights;       // dynamic array of lights (NULL when num_lights == 0)
 
-    void (*set_directional)(uint16_t index, light_vec3 direction,
+    void (*set_directional)(uint16_t index, vec3 direction,
                                 RGBF color, float intensity, bool casts_shadows);
 } scene3d_lighting_t;
 
@@ -570,6 +572,14 @@ typedef struct {
     Polygonf_t poly;  /* 3 points normalized to [0,1] */
     RGB vcolor[3];    /* per-vertex shaded color */
     uint16_t z16[3];  /* per-vertex depth mapped from NDC [-1,1] -> [0..65535] */
+    /* Optional per-vertex debug visibility (0..255). Valid when a debug overlay uses it. */
+    uint8_t debug_vis[3];
+    bool debug_vis_valid;
+    /* Per-pixel shadow sampling payload for one light */
+    bool  per_pixel_shadow;
+    uint8_t sm_light_index;
+    vec4  sm_light_clip[3];  /* light clip coords per vertex (SM->VP * world) */
+    float cam_w[3];          /* camera clip w per vertex (for perspective-correct interp) */
 } _TriFill;
 
 
@@ -581,12 +591,14 @@ object_t* object_pyramid(void);
 object_t* object_cylinder(const uint16_t segments, const object_draw_mode_t mode, const bool cull_backface);
 object_t* object_sphere(uint16_t subdivisions);
 object_t* object_torus(uint16_t major_segments, uint16_t minor_segments);
-object_t* object_plane(uint16_t width_segments, uint16_t height_segments);
+object_t* object_plane(uint16_t width_segments, uint16_t height_segments, bool face_up);
 mat4 camera_project(const camera_t *cam, const transform_t *obj_xform);
 void transform_mesh_to_ndc(const vec3 *in_vertices, size_t n, mat4 mvp, vec3 *out_ndc);
 object_t* object_new(uint16_t num_vertices, uint16_t num_edges, uint16_t num_faces);
 /* Build smooth per-vertex normals from faces (averaged and normalized) */
 void object_build_vertex_normals(object_t *obj);
+/* Deform a plane mesh with a time-based rolling sine wave (y displacement, along +X) */
+void plane_apply_sine_wave(object_t *plane, float time_sec);
 
 /* 3D math utilities (normals) */
 /* Build model matrix (T * Rz * Ry * Rx * S) */
@@ -613,14 +625,14 @@ typedef struct scene3d_t {
     /* OO-style helpers (method-like function pointers for ease of use / FFI) */
     void (*set_ambient)(struct scene3d_t *os, RGBF ambient);
     uint16_t (*add_directional)(struct scene3d_t *os,
-                                light_vec3 direction,
+                                vec3 direction,
                                 RGBF color,
                                 float intensity,
                                 bool casts_shadows);
 
     /* Convenience: set position and look_at for a directional light; computes direction */
     void (*set_directional_pose)(struct scene3d_t *os, uint16_t id,
-                                 light_vec3 position, light_vec3 look_at);
+                                 vec3 position, vec3 look_at);
 
     light_t *(*get_directional)(struct scene3d_t *os, uint16_t id);
     /* Object management helpers */
@@ -633,6 +645,20 @@ typedef struct scene3d_t {
     bool zbuffer_enabled;
     uint16_t zbuf_width;
     uint16_t zbuf_height;
+
+    /* Debug/diagnostic visualization toggles */
+    struct {
+        bool overlay_checker;      /* draw a screen-space checker overlay after rendering */
+        uint8_t checker_size;      /* tile size in pixels (default 8) */
+        float checker_strength;    /* 0..1 blend toward checker_color (default 0.3) */
+        RGB checker_color;         /* overlay color (default magenta) */
+
+        bool overlay_shadow_vis;   /* overlay shadow visibility (lit vs shadow) */
+        uint8_t shadow_vis_light;  /* which light index to visualize */
+        float shadow_vis_strength; /* 0..1 blend of overlay */
+        RGB shadow_vis_color_lit;  /* color tint where visible */
+        RGB shadow_vis_color_shadow; /* color tint where shadowed */
+    } debug;
 } scene3d_t;
 
 
@@ -672,19 +698,27 @@ typedef struct {
     object_t* (*geo_cylinder)(const uint16_t segments, const object_draw_mode_t mode, const bool cull_backface);
     object_t* (*geo_sphere)(uint16_t subdivisions);
     object_t* (*geo_torus)(uint16_t major_segments, uint16_t minor_segments);
-    object_t* (*geo_plane)(uint16_t width_segments, uint16_t height_segments);
+    object_t* (*geo_plane)(uint16_t width_segments, uint16_t height_segments, bool face_up);
 
     /* Convenience scene3d wrappers (avoid passing scene3d repeatedly) */
     scene3d_t* (*scene3d_new)(uint16_t count);
     void (*scene3d_set_current)(scene3d_t *os);
     void (*scene3d_clear_current)(void);
     void (*scene3d_set_ambient)(RGBF ambient);
-    uint16_t (*scene3d_add_directional)(light_vec3 direction, RGBF color, float intensity, bool casts_shadows);
-    void (*scene3d_set_directional_pose)(uint16_t id, light_vec3 position, light_vec3 look_at);
+    uint16_t (*scene3d_add_directional)(vec3 direction, RGBF color, float intensity, bool casts_shadows);
+    void (*scene3d_set_directional_pose)(uint16_t id, vec3 position, vec3 look_at);
     light_t* (*scene3d_get_directional)(uint16_t id);
     uint16_t (*scene3d_add_object)(object_t *obj, transform_t *xform);
     object_t* (*scene3d_get_object)(uint16_t id);
     transform_t* (*scene3d_get_transform)(uint16_t id);
+
+    /* Debug helpers */
+    void (*scene3d_set_debug_checker)(bool enabled, uint8_t tile_px, float strength, RGB color);
+    void (*scene3d_set_debug_shadow_vis)(bool enabled, uint8_t light_index, float strength, RGB lit_color, RGB shadow_color);
+    /* Debug: dump a light's shadow map to a PNG file for inspection */
+    void (*scene3d_dump_shadowmap_png)(uint16_t light_index, const char *filepath);
+    /* Debug/quality: set an explicit zoom on the shadow map fit for a light */
+    void (*scene3d_set_shadowmap_zoom)(uint16_t light_index, float zoom);
 
 } hub75gpu_t;
 
@@ -699,7 +733,7 @@ scene3d_lighting_t *api_lighting_new(uint16_t num_lights, RGBF ambient);
 void api_lighting_free(scene3d_lighting_t *l);
 void api_lighting_set_ambient(scene3d_lighting_t *l, RGBF color);
 void api_lighting_set_directional(scene3d_lighting_t *l, uint16_t index,
-                                  light_vec3 direction,
+                                  vec3 direction,
                                   RGBF color,
                                   float intensity, bool casts_shadows);
 
@@ -718,12 +752,20 @@ void api_object_set_specular_shininess(object_t *obj, float shininess);
 void api_scene3d_set_current(scene3d_t *os);
 void api_scene3d_clear_current(void);
 void api_scene3d_set_ambient(RGBF ambient);
-uint16_t api_scene3d_add_directional(light_vec3 direction, RGBF color, float intensity, bool casts_shadows);
+uint16_t api_scene3d_add_directional(vec3 direction, RGBF color, float intensity, bool casts_shadows);
 uint16_t api_scene3d_add_object(object_t *obj, transform_t *xform);
 object_t* api_scene3d_get_object(uint16_t id);
 light_t* api_scene3d_get_directional(uint16_t id);
 transform_t* api_scene3d_get_transform(uint16_t id);
-void api_scene3d_set_directional_pose(uint16_t id, light_vec3 position, light_vec3 look_at);
+void api_scene3d_set_directional_pose(uint16_t id, vec3 position, vec3 look_at);
+
+/* Debug/diagnostic helpers */
+void api_scene3d_set_debug_checker(bool enabled, uint8_t tile_px, float strength, RGB color);
+void api_scene3d_set_debug_shadow_vis(bool enabled, uint8_t light_index, float strength, RGB lit_color, RGB shadow_color);
+/* Debug: request dumping the current frame's shadow map for a light to a PNG file */
+void api_scene3d_dump_shadowmap_png(uint16_t light_index, const char *filepath);
+/* Debug/quality: control zoom for tight-fit shadow map bounds per light (1=default, <1 zoom in) */
+void api_scene3d_set_shadowmap_zoom(uint16_t light_index, float zoom);
 
 /* Common web colors (RGBF normalized 0..1) */
 #define COLOR_BLACK        (RGBF){ 0.0f, 0.0f, 0.0f }

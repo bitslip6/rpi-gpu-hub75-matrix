@@ -9,6 +9,9 @@
 #include "mymath.h"
 
 #include "debug.h"
+#ifdef HAVE_LIBPNG
+#include <png.h>
+#endif
 
 
 /* per-thread current scene */
@@ -24,6 +27,8 @@
 /* Thread-local storage for the current scene being processed by this thread */
 static _Thread_local hub75_display_t *tls_scene = NULL;
 static _Thread_local scene3d_t *tls_current_os = NULL;
+/* When true, skip per-vertex shadow sampling; per-pixel sampling will be applied in the raster loop */
+static _Thread_local bool tls_use_pixel_shadows = false;
 
 /* Minimal 3D helpers for normal-based culling */
 static inline vec3 v3_add(vec3 a, vec3 b){ return (vec3){a.x+b.x,a.y+b.y,a.z+b.z}; }
@@ -44,6 +49,7 @@ static inline float tri_orientation_clip_xyw(vec4 v0, vec4 v1, vec4 v2);
 typedef struct {
     vec4 clip;   /* clip-space position (x,y,z,w) */
     RGB  color;  /* Gouraud per-vertex color */
+    vec3 world;  /* world-space position for debug overlays */
 } ClipVert;
 
 /* Sutherland–Hodgman against near plane (OpenGL clip space): z + w >= 0 */
@@ -75,6 +81,10 @@ static inline int clip_polygon_near(const ClipVert *in, int in_count, ClipVert *
             I.color.r = (uint8_t)lrintf((float)S.color.r + t * ((float)E.color.r - (float)S.color.r));
             I.color.g = (uint8_t)lrintf((float)S.color.g + t * ((float)E.color.g - (float)S.color.g));
             I.color.b = (uint8_t)lrintf((float)S.color.b + t * ((float)E.color.b - (float)S.color.b));
+            /* Interpolate world-space for debug */
+            I.world.x = S.world.x + t * (E.world.x - S.world.x);
+            I.world.y = S.world.y + t * (E.world.y - S.world.y);
+            I.world.z = S.world.z + t * (E.world.z - S.world.z);
             if (out_count < out_capacity) out[out_count++] = I;
         } else if (!Sin && Ein) {
             /* S out, E in: keep intersection then E */
@@ -89,6 +99,9 @@ static inline int clip_polygon_near(const ClipVert *in, int in_count, ClipVert *
             I.color.r = (uint8_t)lrintf((float)S.color.r + t * ((float)E.color.r - (float)S.color.r));
             I.color.g = (uint8_t)lrintf((float)S.color.g + t * ((float)E.color.g - (float)S.color.g));
             I.color.b = (uint8_t)lrintf((float)S.color.b + t * ((float)E.color.b - (float)S.color.b));
+            I.world.x = S.world.x + t * (E.world.x - S.world.x);
+            I.world.y = S.world.y + t * (E.world.y - S.world.y);
+            I.world.z = S.world.z + t * (E.world.z - S.world.z);
             if (out_count < out_capacity) out[out_count++] = I;
             if (out_count < out_capacity) out[out_count++] = E;
         } else {
@@ -103,6 +116,33 @@ static inline int clip_polygon_near(const ClipVert *in, int in_count, ClipVert *
 typedef struct { int w, h; float *depth; mat4 VP; mat4 V; float z_bias; bool valid; } ShadowMap;
 static _Thread_local ShadowMap *tls_shadow_maps = NULL;
 static _Thread_local uint16_t tls_shadow_count = 0;
+/* Debug: deferred shadowmap dump request (per-thread) */
+static _Thread_local int tls_dump_sm_index = -1;
+static _Thread_local char tls_dump_sm_path[256];
+
+/* Simple 2x2 PCF sampler in shadow map NDC space */
+static inline float sm_sample_pcf2x2(const ShadowMap *SM, float x_ndc, float y_ndc, float z_ndc) {
+    if (!SM || !SM->valid || !SM->depth) return 1.0f;
+    /* Map NDC [-1,1] to SM pixel coordinates [0, w-1]/[0, h-1] without rounding */
+    float sx_f = (x_ndc * 0.5f + 0.5f) * (float)(SM->w - 1);
+    float sy_f = (y_ndc * 0.5f + 0.5f) * (float)(SM->h - 1);
+    int ix = (int)floorf(sx_f);
+    int iy = (int)floorf(sy_f);
+    float acc = 0.0f; int taps = 0;
+    for (int dy = 0; dy < 2; ++dy) {
+        int sy = iy + dy;
+        if ((unsigned)sy >= (unsigned)SM->h) continue;
+        for (int dx = 0; dx < 2; ++dx) {
+            int sx = ix + dx;
+            if ((unsigned)sx >= (unsigned)SM->w) continue;
+            size_t sidx = (size_t)sy * (size_t)SM->w + (size_t)sx;
+            float map_z = SM->depth[sidx];
+            acc += (z_ndc > map_z + SM->z_bias) ? 0.0f : 1.0f;
+            taps++;
+        }
+    }
+    return (taps > 0) ? (acc / (float)taps) : 1.0f;
+}
 
 static inline mat4 cm_m4_identity(void){ mat4 r = { .m={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1} }; return r; }
 static inline mat4 cm_m4_mul(mat4 a, mat4 b){
@@ -130,12 +170,218 @@ static inline vec3 cm_m4_mul_point3(const mat4 m, const vec3 p){
     return (vec3){v.x, v.y, v.z};
 }
 
+/* Build 8 world-space corners of the camera view frustum */
+static inline void camera_frustum_corners_ws(const camera_t *cam, vec3 out8[8]){
+    /* Camera basis */
+    vec3 fwd = v3_sub(cam->target, cam->position);
+    float fl = sqrtf(fwd.x*fwd.x + fwd.y*fwd.y + fwd.z*fwd.z);
+    if (fl > 1e-6f) { fwd.x/=fl; fwd.y/=fl; fwd.z/=fl; } else { fwd = (vec3){0,0,-1}; }
+    vec3 upn = (vec3){ cam->up.x, cam->up.y, cam->up.z };
+    float ul = sqrtf(upn.x*upn.x + upn.y*upn.y + upn.z*upn.z);
+    if (ul > 1e-6f) { upn.x/=ul; upn.y/=ul; upn.z/=ul; } else { upn = (vec3){0,1,0}; }
+    vec3 right = v3_norm(v3_cross(fwd, upn));
+    vec3 true_up = v3_cross(right, fwd);
+
+    float zn = cam->z_near > 1e-6f ? cam->z_near : 0.01f;
+    float zf = cam->z_far > zn ? cam->z_far : zn+1.0f;
+    float tanY = tanf(cam->fov_y * 0.5f);
+    float hN = 2.0f * tanY * zn;
+    float wN = hN * cam->aspect;
+    float hF = 2.0f * tanY * zf;
+    float wF = hF * cam->aspect;
+
+    vec3 cN = (vec3){ cam->position.x + fwd.x*zn, cam->position.y + fwd.y*zn, cam->position.z + fwd.z*zn };
+    vec3 cF = (vec3){ cam->position.x + fwd.x*zf, cam->position.y + fwd.y*zf, cam->position.z + fwd.z*zf };
+    vec3 rN = (vec3){ right.x*(wN*0.5f), right.y*(wN*0.5f), right.z*(wN*0.5f) };
+    vec3 uN = (vec3){ true_up.x*(hN*0.5f), true_up.y*(hN*0.5f), true_up.z*(hN*0.5f) };
+    vec3 rF = (vec3){ right.x*(wF*0.5f), right.y*(wF*0.5f), right.z*(wF*0.5f) };
+    vec3 uF = (vec3){ true_up.x*(hF*0.5f), true_up.y*(hF*0.5f), true_up.z*(hF*0.5f) };
+
+    /* Near plane */
+    out8[0] = (vec3){ cN.x - rN.x - uN.x, cN.y - rN.y - uN.y, cN.z - rN.z - uN.z }; /* nbl */
+    out8[1] = (vec3){ cN.x + rN.x - uN.x, cN.y + rN.y - uN.y, cN.z + rN.z - uN.z }; /* nbr */
+    out8[2] = (vec3){ cN.x - rN.x + uN.x, cN.y - rN.y + uN.y, cN.z - rN.z + uN.z }; /* ntl */
+    out8[3] = (vec3){ cN.x + rN.x + uN.x, cN.y + rN.y + uN.y, cN.z + rN.z + uN.z }; /* ntr */
+    /* Far plane */
+    out8[4] = (vec3){ cF.x - rF.x - uF.x, cF.y - rF.y - uF.y, cF.z - rF.z - uF.z }; /* fbl */
+    out8[5] = (vec3){ cF.x + rF.x - uF.x, cF.y + rF.y - uF.y, cF.z + rF.z - uF.z }; /* fbr */
+    out8[6] = (vec3){ cF.x - rF.x + uF.x, cF.y - rF.y + uF.y, cF.z - rF.z + uF.z }; /* ftl */
+    out8[7] = (vec3){ cF.x + rF.x + uF.x, cF.y + rF.y + uF.y, cF.z + rF.z + uF.z }; /* ftr */
+}
+
+#ifdef HAVE_LIBPNG
+static bool write_shadowmap_png(const char *filename, const ShadowMap *SM) {
+    if (!SM || !SM->depth || SM->w <= 0 || SM->h <= 0) return false;
+    /* Compute auto-contrast range over valid samples (z < 1e8) */
+    int total = SM->w * SM->h;
+    int valid = 0;
+    float zmin = 1e9f, zmax = -1e9f;
+    for (int i = 0; i < total; ++i) {
+        float z = SM->depth[i];
+        if (z < 1e8f) {
+            valid++;
+            if (z < zmin) zmin = z;
+            if (z > zmax) zmax = z;
+        }
+    }
+    FILE *fp = fopen(filename, "wb");
+    if (!fp) return false;
+    png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png_ptr) { fclose(fp); return false; }
+    png_infop info_ptr = png_create_info_struct(png_ptr);
+    if (!info_ptr) { png_destroy_write_struct(&png_ptr, NULL); fclose(fp); return false; }
+    if (setjmp(png_jmpbuf(png_ptr))) {
+        png_destroy_write_struct(&png_ptr, &info_ptr); fclose(fp); return false;
+    }
+    png_init_io(png_ptr, fp);
+    png_set_IHDR(png_ptr, info_ptr, (png_uint_32)SM->w, (png_uint_32)SM->h,
+                 8, PNG_COLOR_TYPE_GRAY, PNG_INTERLACE_NONE,
+                 PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png_ptr, info_ptr);
+    uint8_t *row = (uint8_t*)malloc((size_t)SM->w);
+    if (!row) { png_destroy_write_struct(&png_ptr, &info_ptr); fclose(fp); return false; }
+    const bool use_autorange = (valid > 0 && zmax > zmin);
+    /* Optional clamp to NDC range for visualization */
+    const float vis_min = -1.0f, vis_max = 1.0f;
+    for (int y = 0; y < SM->h; ++y) {
+        for (int x = 0; x < SM->w; ++x) {
+            float z = SM->depth[(size_t)y*(size_t)SM->w + (size_t)x];
+            float v = 1.0f;
+            if (z < 1e8f) {
+                /* Clamp for display, then map */
+                if (z < vis_min) z = vis_min; if (z > vis_max) z = vis_max;
+                if (use_autorange) {
+                    /* Auto-contrast to [0,1]; invert so closer-to-light appears brighter */
+                    float t = (z - zmin) / (zmax - zmin);
+                    if (t < 0.f) t = 0.f; if (t > 1.f) t = 1.f;
+                    v = 1.0f - t;
+                } else {
+                    /* Fallback to fixed mapping [-1,1] -> [0,1] */
+                    v = 1.0f - (z * 0.5f + 0.5f);
+                    if (v < 0.f) v = 0.f; if (v > 1.f) v = 1.f;
+                }
+            } else {
+                /* Unwritten -> pure white */
+                v = 1.0f;
+            }
+            row[x] = (uint8_t)lrintf(v * 255.0f);
+        }
+        png_write_row(png_ptr, row);
+    }
+    free(row);
+    png_write_end(png_ptr, NULL);
+    png_destroy_write_struct(&png_ptr, &info_ptr);
+    fclose(fp);
+    return true;
+}
+#endif
+
+void api_scene3d_dump_shadowmap_png(uint16_t light_index, const char *filepath) {
+    if (!filepath) return;
+    tls_dump_sm_index = (int)light_index;
+    snprintf(tls_dump_sm_path, sizeof(tls_dump_sm_path), "%s", filepath);
+}
+
+/* Rasterize a world-space triangle into a directional light's shadow map (orthographic).
+   Depth written is light-view z; lower is nearer to light (use min-compare). */
+static void shadowmap_rasterize_triangle(ShadowMap *SM, vec3 v0w, vec3 v1w, vec3 v2w) {
+    /* Write into the SM as long as the buffer exists; 'valid' will be set after population */
+    if (!SM || !SM->depth || SM->w <= 0 || SM->h <= 0) return;
+    /* Transform to clip for screen mapping and to light-view for depth */
+    vec4 c0 = cm_m4_mul_point4(SM->VP, v0w);
+    vec4 c1 = cm_m4_mul_point4(SM->VP, v1w);
+    vec4 c2 = cm_m4_mul_point4(SM->VP, v2w);
+    float iw0 = fabsf(c0.w) > 1e-6f ? 1.0f / c0.w : 1.0f;
+    float iw1 = fabsf(c1.w) > 1e-6f ? 1.0f / c1.w : 1.0f;
+    float iw2 = fabsf(c2.w) > 1e-6f ? 1.0f / c2.w : 1.0f;
+    float x0 = c0.x * iw0, y0 = c0.y * iw0;
+    float x1 = c1.x * iw1, y1 = c1.y * iw1;
+    float x2 = c2.x * iw2, y2 = c2.y * iw2;
+    /* Map to SM pixels */
+    float sx0f = (x0 * 0.5f + 0.5f) * (float)(SM->w - 1);
+    float sy0f = (y0 * 0.5f + 0.5f) * (float)(SM->h - 1);
+    float sx1f = (x1 * 0.5f + 0.5f) * (float)(SM->w - 1);
+    float sy1f = (y1 * 0.5f + 0.5f) * (float)(SM->h - 1);
+    float sx2f = (x2 * 0.5f + 0.5f) * (float)(SM->w - 1);
+    float sy2f = (y2 * 0.5f + 0.5f) * (float)(SM->h - 1);
+
+    int sx0 = (int)floorf(sx0f + 0.5f);
+    int sy0 = (int)floorf(sy0f + 0.5f);
+    int sx1 = (int)floorf(sx1f + 0.5f);
+    int sy1 = (int)floorf(sy1f + 0.5f);
+    int sx2 = (int)floorf(sx2f + 0.5f);
+    int sy2 = (int)floorf(sy2f + 0.5f);
+
+    /* Compute bounding box */
+    int minx = sx0, maxx = sx0, miny = sy0, maxy = sy0;
+    if (sx1 < minx) minx = sx1; if (sx1 > maxx) maxx = sx1;
+    if (sx2 < minx) minx = sx2; if (sx2 > maxx) maxx = sx2;
+    if (sy1 < miny) miny = sy1; if (sy1 > maxy) maxy = sy1;
+    if (sy2 < miny) miny = sy2; if (sy2 > maxy) maxy = sy2;
+    if (maxx < 0 || maxy < 0 || minx >= SM->w || miny >= SM->h) return;
+    if (minx < 0) minx = 0; if (miny < 0) miny = 0;
+    if (maxx >= SM->w) maxx = SM->w - 1; if (maxy >= SM->h) maxy = SM->h - 1;
+
+    /* Use light NDC depth (post-projection z/w) so depth test and bias are well-defined */
+    float z0 = c0.z * iw0;
+    float z1 = c1.z * iw1;
+    float z2 = c2.z * iw2;
+
+    /* Set up edge functions in float (sufficient for SM size) */
+    float Ax = (float)(sy1 - sy2), Ay = (float)(sx2 - sx1), Ac = (float)(sx1*sy2 - sx2*sy1);
+    float Bx = (float)(sy2 - sy0), By = (float)(sx0 - sx2), Bc = (float)(sx2*sy0 - sx0*sy2);
+    float Cx = (float)(sy0 - sy1), Cy = (float)(sx1 - sx0), Cc = (float)(sx0*sy1 - sx1*sy0);
+    float area2 = Ax * (float)sx0 + Ay * (float)sy0 + Ac;
+    if (fabsf(area2) < 1e-6f) return; /* degenerate */
+    if (area2 < 0.0f) { Ax=-Ax; Ay=-Ay; Ac=-Ac; Bx=-Bx; By=-By; Bc=-Bc; Cx=-Cx; Cy=-Cy; Cc=-Cc; area2 = -area2; }
+    float inv_area = 1.0f / area2;
+
+    for (int y = miny; y <= maxy; ++y) {
+        float yf = (float)y + 0.5f;
+        for (int x = minx; x <= maxx; ++x) {
+            float xf = (float)x + 0.5f;
+            float E0 = Ax*xf + Ay*yf + Ac;
+            float E1 = Bx*xf + By*yf + Bc;
+            float E2 = Cx*xf + Cy*yf + Cc;
+            if (E0 >= 0.0f && E1 >= 0.0f && E2 >= 0.0f) {
+                float w0 = E0 * inv_area;
+                float w1 = E1 * inv_area;
+                float w2 = 1.0f - w0 - w1;
+                float z = w0*z0 + w1*z1 + w2*z2;
+                size_t idx = (size_t)y * (size_t)SM->w + (size_t)x;
+                if (z < SM->depth[idx]) SM->depth[idx] = z;
+            }
+        }
+    }
+}
+
 /* -------- Helpers for filled renderer -------- */
 static inline bool is_backface_ndc(const vec3 v0, const vec3 v1, const vec3 v2){
     float ax = v1.x - v0.x, ay = v1.y - v0.y;
     float bx = v2.x - v0.x, by = v2.y - v0.y;
     float area = ax * by - ay * bx;
     return (area < 0.0f);
+}
+
+/* Sample shadow map visibility at a world-space point for a given light index.
+   Returns 1.0f if visible, 0.0f if occluded, or 1.0f if no shadow map exists. */
+static float sample_shadow_visibility(uint16_t li, vec3 v_world) {
+    if (!tls_shadow_maps || li >= tls_shadow_count) return 1.0f;
+    ShadowMap *SM = &tls_shadow_maps[li];
+    if (!SM || !SM->valid || !SM->depth) return 1.0f;
+    vec4 cclip = cm_m4_mul_point4(SM->VP, v_world);
+    float invw = (fabsf(cclip.w) > 1e-6f) ? (1.0f / cclip.w) : 1.0f;
+    float x_ndc = cclip.x * invw;
+    float y_ndc = cclip.y * invw;
+    float z_ndc = cclip.z * invw;
+    int sx = (int)((x_ndc * 0.5f + 0.5f) * (float)(SM->w - 1) + 0.5f);
+    int sy = (int)((y_ndc * 0.5f + 0.5f) * (float)(SM->h - 1) + 0.5f);
+    if ((unsigned)sx < (unsigned)SM->w && (unsigned)sy < (unsigned)SM->h) {
+        size_t sidx = (size_t)sy * (size_t)SM->w + (size_t)sx;
+    float map_z = SM->depth[sidx];
+    return (z_ndc > map_z + SM->z_bias) ? 0.0f : 1.0f;
+    }
+    return 1.0f;
 }
 
 /* Compute shaded color for a face using face normal + centroid shadow test (matches prior behavior) */
@@ -172,20 +418,20 @@ static RGB compute_face_shaded_color(size_t face_index,
             float ndotl = n_world.x*Lx + n_world.y*Ly + n_world.z*Lz;
             if (ndotl > 0.0f) {
                 float vis = 1.0f;
-                if (tls_shadow_maps && li < tls_shadow_count && obj->shadow_enabled && L->casts_shadows && L->shadow_enabled) {
+                if (!tls_use_pixel_shadows && tls_shadow_maps && li < tls_shadow_count && obj->shadow_enabled && L->casts_shadows && L->shadow_enabled) {
                     ShadowMap *SM = &tls_shadow_maps[li];
                     if (SM && SM->valid && SM->depth) {
                         vec4 cclip = cm_m4_mul_point4(SM->VP, cw);
                         float invw = (fabsf(cclip.w) > 1e-6f) ? (1.0f / cclip.w) : 1.0f;
                         float x_ndc = cclip.x * invw;
                         float y_ndc = cclip.y * invw;
-                        float z_lv = cm_m4_mul_point3(SM->V, cw).z;
+                        float z_ndc = cclip.z * invw;
                         int sx = (int)((x_ndc * 0.5f + 0.5f) * (float)(SM->w - 1) + 0.5f);
                         int sy = (int)((y_ndc * 0.5f + 0.5f) * (float)(SM->h - 1) + 0.5f);
                         if ((unsigned)sx < (unsigned)SM->w && (unsigned)sy < (unsigned)SM->h) {
                             size_t sidx = (size_t)sy * (size_t)SM->w + (size_t)sx;
                             float map_z = SM->depth[sidx];
-                            if (z_lv > map_z + SM->z_bias) {
+                            if (z_ndc > map_z + SM->z_bias) {
                                 vis = 0.0f;
                             }
                         }
@@ -248,20 +494,20 @@ static RGB compute_vertex_shaded_color(RGB base_rgb,
             float ndotl = n_world.x*Lx + n_world.y*Ly + n_world.z*Lz;
             if (ndotl > 0.0f) {
                 float vis = 1.0f;
-                if (tls_shadow_maps && li < tls_shadow_count && obj->shadow_enabled && L->casts_shadows && L->shadow_enabled) {
+                if (!tls_use_pixel_shadows && tls_shadow_maps && li < tls_shadow_count && obj->shadow_enabled && L->casts_shadows && L->shadow_enabled) {
                     ShadowMap *SM = &tls_shadow_maps[li];
                     if (SM && SM->valid && SM->depth) {
                         vec4 cclip = cm_m4_mul_point4(SM->VP, v_world);
                         float invw = (fabsf(cclip.w) > 1e-6f) ? (1.0f / cclip.w) : 1.0f;
                         float x_ndc = cclip.x * invw;
                         float y_ndc = cclip.y * invw;
-                        float z_lv = cm_m4_mul_point3(SM->V, v_world).z;
+                        float z_ndc = cclip.z * invw;
                         int sx = (int)((x_ndc * 0.5f + 0.5f) * (float)(SM->w - 1) + 0.5f);
                         int sy = (int)((y_ndc * 0.5f + 0.5f) * (float)(SM->h - 1) + 0.5f);
                         if ((unsigned)sx < (unsigned)SM->w && (unsigned)sy < (unsigned)SM->h) {
                             size_t sidx = (size_t)sy * (size_t)SM->w + (size_t)sx;
                             float map_z = SM->depth[sidx];
-                            if (z_lv > map_z + SM->z_bias) {
+                            if (z_ndc > map_z + SM->z_bias) {
                                 vis = 0.0f;
                             }
                         }
@@ -319,7 +565,8 @@ static inline mat4 cm_m4_ortho(float l, float r, float b, float t, float n, floa
     mat4 m = (mat4){0};
     m.m[0] = 2.0f/(r-l);
     m.m[5] = 2.0f/(t-b);
-    m.m[10] = -2.0f/(f-n);
+    /* Map z in [n,f] to NDC [-1,1]: z_ndc = (2z - (f+n)) / (f-n) */
+    m.m[10] =  2.0f/(f-n);
     m.m[12] = -(r+l)/(r-l);
     m.m[13] = -(t+b)/(t-b);
     m.m[14] = -(f+n)/(f-n);
@@ -762,12 +1009,14 @@ void draw_polygon_fill(hub75_display_t *scene, Polygonf_t *poly, RGB color)
  * Optional per-pixel Z-buffer test using provided z-buffer (uint16, near=0; far=65535).
  */
 static inline void draw_triangle_gouraud(hub75_display_t *scene,
-                                         const Polygonf_t *poly,
-                                         const RGB vcolor[3],
-                                         const uint16_t zv[3],
+                                         const _TriFill *tri_in,
                                          uint16_t *zbuf,
                                          int zbuf_width) {
-    if (!scene || !scene->image || !poly || poly->num_points != 3) return;
+    if (!scene || !scene->image || !tri_in) return;
+    const Polygonf_t *poly = &tri_in->poly;
+    if (poly->num_points != 3) return;
+    const RGB *vcolor = tri_in->vcolor;
+    const uint16_t *zv = tri_in->z16;
     const bool use_z = (zbuf != NULL);
 
     /* Fast path only allowed when Z-buffer is disabled */
@@ -883,6 +1132,42 @@ static inline void draw_triangle_gouraud(hub75_display_t *scene,
     size_t row_stride = (size_t)scene->width * (size_t)scene->stride;
     const int fb_width = scene->width;
 
+    /* Per-pixel shadow inputs using camera w for perspective-correct interpolation */
+    const bool do_px_shadow = (tri_in->per_pixel_shadow && tls_shadow_maps && tri_in->sm_light_index < tls_shadow_count);
+    const ShadowMap *SM = (do_px_shadow ? &tls_shadow_maps[tri_in->sm_light_index] : NULL);
+    float tx0=0, ty0=0, tz0=0, tw0=0, iwc0=1.0f;
+    float tx1=0, ty1=0, tz1=0, tw1=0, iwc1=1.0f;
+    float tx2=0, ty2=0, tz2=0, tw2=0, iwc2=1.0f;
+    float dtxdx=0, dtydx=0, dtzdx=0, dtwdx=0, diwcdx=0;
+    float dtxdy=0, dtydy=0, dtzdy=0, dtwdy=0, diwcdy=0;
+    float tx_row=0, ty_row=0, tz_row=0, tw_row=0, iwc_row=1.0f;
+    if (do_px_shadow && SM && SM->valid && SM->depth) {
+        /* Prepare attributes divided by camera clip w */
+        vec4 lc0 = tri_in->sm_light_clip[0]; float wc0 = tri_in->cam_w[0]; float invwc0 = (fabsf(wc0)>1e-6f)? 1.0f/wc0 : 1.0f;
+        vec4 lc1 = tri_in->sm_light_clip[1]; float wc1 = tri_in->cam_w[1]; float invwc1 = (fabsf(wc1)>1e-6f)? 1.0f/wc1 : 1.0f;
+        vec4 lc2 = tri_in->sm_light_clip[2]; float wc2 = tri_in->cam_w[2]; float invwc2 = (fabsf(wc2)>1e-6f)? 1.0f/wc2 : 1.0f;
+        tx0 = lc0.x * invwc0; ty0 = lc0.y * invwc0; tz0 = lc0.z * invwc0; tw0 = lc0.w * invwc0; iwc0 = invwc0;
+        tx1 = lc1.x * invwc1; ty1 = lc1.y * invwc1; tz1 = lc1.z * invwc1; tw1 = lc1.w * invwc1; iwc1 = invwc1;
+        tx2 = lc2.x * invwc2; ty2 = lc2.y * invwc2; tz2 = lc2.z * invwc2; tw2 = lc2.w * invwc2; iwc2 = invwc2;
+
+        dtxdx = dw0dx_f*tx0 + dw1dx_f*tx1 + w2dx_f*tx2;
+        dtydx = dw0dx_f*ty0 + dw1dx_f*ty1 + w2dx_f*ty2;
+        dtzdx = dw0dx_f*tz0 + dw1dx_f*tz1 + w2dx_f*tz2;
+        dtwdx = dw0dx_f*tw0 + dw1dx_f*tw1 + w2dx_f*tw2;
+        diwcdx= dw0dx_f*iwc0+ dw1dx_f*iwc1+ w2dx_f*iwc2;
+        dtxdy = dw0dy_f*tx0 + dw1dy_f*tx1 + w2dy_f*tx2;
+        dtydy = dw0dy_f*ty0 + dw1dy_f*ty1 + w2dy_f*ty2;
+        dtzdy = dw0dy_f*tz0 + dw1dy_f*tz1 + w2dy_f*tz2;
+        dtwdy = dw0dy_f*tw0 + dw1dy_f*tw1 + w2dy_f*tw2;
+        diwcdy= dw0dy_f*iwc0+ dw1dy_f*iwc1+ w2dy_f*iwc2;
+
+        tx_row = w0_row_f*tx0 + w1_row_f*tx1 + w2_row_f*tx2;
+        ty_row = w0_row_f*ty0 + w1_row_f*ty1 + w2_row_f*ty2;
+        tz_row = w0_row_f*tz0 + w1_row_f*tz1 + w2_row_f*tz2;
+        tw_row = w0_row_f*tw0 + w1_row_f*tw1 + w2_row_f*tw2;
+        iwc_row= w0_row_f*iwc0+ w1_row_f*iwc1+ w2_row_f*iwc2;
+    }
+
     /* Optional depth interpolation setup (use uint16 range in float domain) */
     int dzdx = 0, dzdy = 0, z_row = 0;
     if (use_z) {
@@ -910,6 +1195,22 @@ static inline void draw_triangle_gouraud(hub75_display_t *scene,
                         int r8 = rfp >> FP; if (r8 < 0) r8 = 0; else if (r8 > 255) r8 = 255;
                         int g8 = gfp >> FP; if (g8 < 0) g8 = 0; else if (g8 > 255) g8 = 255;
                         int b8 = bfp >> FP; if (b8 < 0) b8 = 0; else if (b8 > 255) b8 = 255;
+                        if (do_px_shadow && SM) {
+                            float invw_sum = iwc_row;
+                            if (fabsf(invw_sum) > 1e-6f) {
+                                float x_lc = tx_row / invw_sum;
+                                float y_lc = ty_row / invw_sum;
+                                float z_lc = tz_row / invw_sum;
+                                float w_lc = tw_row / invw_sum;
+                                float x_ndc = x_lc / w_lc;
+                                float y_ndc = y_lc / w_lc;
+                                float z_ndc = z_lc / w_lc;
+                                float vis = sm_sample_pcf2x2(SM, x_ndc, y_ndc, z_ndc);
+                                r8 = (int)lrintf(vis * (float)r8);
+                                g8 = (int)lrintf(vis * (float)g8);
+                                b8 = (int)lrintf(vis * (float)b8);
+                            }
+                        }
                         p[0] = (uint8_t)r8; p[1] = (uint8_t)g8; p[2] = (uint8_t)b8;
                         *pz = (uint16_t)zcl;
                     }
@@ -917,17 +1218,35 @@ static inline void draw_triangle_gouraud(hub75_display_t *scene,
                     int r8 = rfp >> FP; if (r8 < 0) r8 = 0; else if (r8 > 255) r8 = 255;
                     int g8 = gfp >> FP; if (g8 < 0) g8 = 0; else if (g8 > 255) g8 = 255;
                     int b8 = bfp >> FP; if (b8 < 0) b8 = 0; else if (b8 > 255) b8 = 255;
+                    if (do_px_shadow && SM) {
+                        float invw_sum = iwc_row;
+                        if (fabsf(invw_sum) > 1e-6f) {
+                            float x_lc = tx_row / invw_sum;
+                            float y_lc = ty_row / invw_sum;
+                            float z_lc = tz_row / invw_sum;
+                            float w_lc = tw_row / invw_sum;
+                            float x_ndc = x_lc / w_lc;
+                            float y_ndc = y_lc / w_lc;
+                            float z_ndc = z_lc / w_lc;
+                            float vis = sm_sample_pcf2x2(SM, x_ndc, y_ndc, z_ndc);
+                            r8 = (int)lrintf(vis * (float)r8);
+                            g8 = (int)lrintf(vis * (float)g8);
+                            b8 = (int)lrintf(vis * (float)b8);
+                        }
+                    }
                     p[0] = (uint8_t)r8; p[1] = (uint8_t)g8; p[2] = (uint8_t)b8;
                 }
             }
             E0 += dE0dx; E1 += dE1dx; E2 += dE2dx;
             rfp += drdx; gfp += dgdx; bfp += dbdx;
             if (use_z) { zfp += dzdx; pz++; }
+            if (do_px_shadow && SM) { tx_row += dtxdx; ty_row += dtydx; tz_row += dtzdx; tw_row += dtwdx; iwc_row += diwcdx; }
             p += scene->stride;
         }
         E0_row += dE0dy; E1_row += dE1dy; E2_row += dE2dy;
         r_row += drdy; g_row += dgdy; b_row += dbdy;
         if (use_z) { z_row += dzdy; }
+        if (do_px_shadow && SM) { tx_row += dtxdy; ty_row += dtydy; tz_row += dtzdy; tw_row += dtwdy; iwc_row += diwcdy; }
     }
 }
 
@@ -1124,8 +1443,9 @@ object_t *api_new_sphere(uint16_t subs) {
     return object_sphere(subs);
 }
 
-object_t *api_new_plane(uint16_t width_segments, uint16_t height_segments) {
-    return object_plane(width_segments, height_segments);
+object_t *api_new_plane(uint16_t width_segments, uint16_t height_segments, bool face_up) {
+    /* Default previous behavior: plane faces +Y (face_up=true) */
+    return object_plane(width_segments, height_segments, face_up);
 }
 
 
@@ -1304,6 +1624,24 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
         normal_matrix_from_model(M_model, N3);
     }
 
+    /* Decide if we will use per-pixel shadowing for this object (pick first valid caster) */
+    bool saved_tls_pp = tls_use_pixel_shadows;
+    int selected_light = -1;
+    if (obj->shadow_enabled && lighting && tls_shadow_maps && tls_shadow_count > 0) {
+        for (uint16_t li = 0; li < lighting->num_lights; ++li) {
+            const light_t *L = &lighting->lights[li];
+            if (!L) continue;
+            if (L->type != LIGHT_DIRECTIONAL) continue;
+            if (!L->casts_shadows || !L->shadow_enabled) continue;
+            if (li >= tls_shadow_count) continue;
+            ShadowMap *SM = &tls_shadow_maps[li];
+            if (!SM || !SM->valid || !SM->depth) continue;
+            selected_light = (int)li;
+            break;
+        }
+    }
+    tls_use_pixel_shadows = (selected_light >= 0);
+
     size_t nf = obj->faces->length;
     /* Ensure vertex normals exist once */
     if (obj->vertex_normals && !obj->vertex_normals_ready) {
@@ -1347,6 +1685,8 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
             base_vcol[vi] = compute_vertex_shaded_color(base_rgb, vw, nw, cam->position, obj, lighting);
             /* clip-space position for clipping */
             clip_in[vi] = mat4_mul_point_clip_xyw(mvp, obj->verticies->list[idx[vi]]);
+            /* world position into clip vertex for debug */
+            /* Note: clip_in is vec4, but we store world in a parallel ClipVert below */
         }
 
         /* Build input polygon for near-plane clip */
@@ -1354,6 +1694,8 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
         for (int vi = 0; vi < 3; ++vi) {
             poly_in[vi].clip = clip_in[vi];
             poly_in[vi].color = base_vcol[vi];
+            /* pass world-space position for accurate debug sampling */
+            poly_in[vi].world = cm_m4_mul_point3(M_model, obj->verticies->list[idx[vi]]);
         }
         ClipVert poly_out[8];
         int m = clip_polygon_near(poly_in, 3, poly_out, 8);
@@ -1391,6 +1733,36 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
                 if (zi < 0) zi = 0; else if (zi > 65535) zi = 65535;
                 t.z16[vi] = (uint16_t)zi;
             }
+            /* Populate per-vertex shadow visibility for debug overlay (first matching light) */
+            t.debug_vis_valid = false;
+            if (tls_current_os && tls_current_os->debug.overlay_shadow_vis) {
+                uint16_t li = tls_current_os->debug.shadow_vis_light;
+                if (tls_shadow_maps && li < tls_shadow_count) {
+                    /* Use world-space of the clipped triangle vertices for accurate sampling */
+                    t.debug_vis[0] = (uint8_t)lrintf(sample_shadow_visibility(li, a.world) * 255.0f);
+                    t.debug_vis[1] = (uint8_t)lrintf(sample_shadow_visibility(li, b.world) * 255.0f);
+                    t.debug_vis[2] = (uint8_t)lrintf(sample_shadow_visibility(li, c.world) * 255.0f);
+                    t.debug_vis_valid = true;
+                }
+            }
+            /* Per-pixel shadow payload (single light index) */
+            if (selected_light >= 0) {
+                ShadowMap *SM = &tls_shadow_maps[(uint16_t)selected_light];
+                if (SM && SM->valid && SM->depth) {
+                    t.per_pixel_shadow = true;
+                    t.sm_light_index = (uint8_t)selected_light;
+                    vec3 wpos[3] = { a.world, b.world, c.world };
+                    for (int vi = 0; vi < 3; ++vi) {
+                        t.cam_w[vi] = cv[vi].w;
+                        vec4 lc = cm_m4_mul_point4(SM->VP, wpos[vi]);
+                        t.sm_light_clip[vi] = lc;
+                    }
+                } else {
+                    t.per_pixel_shadow = false;
+                }
+            } else {
+                t.per_pixel_shadow = false;
+            }
             /* Use average ndc.z as triangle depth hint (optional, used only for debug prints) */
             t.depth = (ndc[0].z + ndc[1].z + ndc[2].z) / 3.0f;
             tri[tcount++] = t;
@@ -1399,6 +1771,7 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
 
     /* With Z-buffering, triangle order doesn't matter; skip painter's sort entirely */
     for (size_t i = 0; i < tcount; ++i) {
+        /*
         if (tls_scene && tls_scene->enhanced_debug) {
             printf("Filling triangle p1 (%.3f, %.3f), p2 (%.3f, %.3f), p3 (%.3f, %.3f) depth=%.3f\n",
                 (double)tri[i].poly.points[0].x, (double)tri[i].poly.points[0].y,
@@ -1406,14 +1779,134 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
                 (double)tri[i].poly.points[2].x, (double)tri[i].poly.points[2].y,
                 (double)tri[i].depth);
         }
+                */
         /* Gouraud fill using per-vertex colors + Z-buffer if available (from scene3d) */
         uint16_t *zptr = NULL; int zw = 0;
         if (tls_current_os && tls_current_os->zbuffer_enabled) {
             zptr = tls_current_os->zbuf;
             zw = (int)(tls_current_os->zbuf_width);
         }
-        draw_triangle_gouraud(tls_scene, &tri[i].poly, tri[i].vcolor, tri[i].z16, zptr, zw);
+    draw_triangle_gouraud(tls_scene, &tri[i], zptr, zw);
+        /* Debug overlay: shadow visibility per triangle (blend after main draw) */
+        if (tls_current_os && tls_current_os->debug.overlay_shadow_vis && tri[i].debug_vis_valid) {
+            RGB lit = tls_current_os->debug.shadow_vis_color_lit;
+            RGB shd = tls_current_os->debug.shadow_vis_color_shadow;
+            float strength = tls_current_os->debug.shadow_vis_strength;
+            if (strength > 0.0f) {
+                /* Rasterize a simple overlay with Z agreement check */
+                const Polygonf_t *poly = &tri[i].poly;
+                int x[3], y[3];
+                for (int v = 0; v < 3; ++v) {
+                    x[v] = norm_to_px(poly->points[v].x, tls_scene->width);
+                    y[v] = norm_to_px(poly->points[v].y, tls_scene->height);
+                }
+                int minx = x[0], maxx = x[0], miny = y[0], maxy = y[0];
+                for (int v = 1; v < 3; ++v) {
+                    if (x[v] < minx) minx = x[v];
+                    if (x[v] > maxx) maxx = x[v];
+                    if (y[v] < miny) miny = y[v];
+                    if (y[v] > maxy) maxy = y[v];
+                }
+                minx = clamp_int(minx, 0, tls_scene->width - 1);
+                maxx = clamp_int(maxx, 0, tls_scene->width - 1);
+                miny = clamp_int(miny, 0, tls_scene->height - 1);
+                maxy = clamp_int(maxy, 0, tls_scene->height - 1);
+
+                int x0 = x[0], y0 = y[0];
+                int x1 = x[1], y1 = y[1];
+                int x2 = x[2], y2 = y[2];
+                int A0 = (y1 - y2), B0 = (x2 - x1), C0 = x1 * y2 - x2 * y1;
+                int A1 = (y2 - y0), B1 = (x0 - x2), C1 = x2 * y0 - x0 * y2;
+                int A2 = (y0 - y1), B2 = (x1 - x0), C2 = x0 * y1 - x1 * y0;
+                int area2 = A0 * x0 + B0 * y0 + C0;
+                if (area2 != 0) {
+                    if (area2 < 0) {
+                        A0 = -A0; B0 = -B0; C0 = -C0;
+                        A1 = -A1; B1 = -B1; C1 = -C1;
+                        A2 = -A2; B2 = -B2; C2 = -C2;
+                        area2 = -area2;
+                    }
+                    /* Top-left rule */
+                    const int tl0 = (A0 > 0) || (A0 == 0 && B0 < 0);
+                    const int tl1 = (A1 > 0) || (A1 == 0 && B1 < 0);
+                    const int tl2 = (A2 > 0) || (A2 == 0 && B2 < 0);
+                    const int FP = 8, ONE = 1 << FP, HALF = ONE >> 1;
+                    int dE0dx = A0 * ONE, dE0dy = B0 * ONE;
+                    int dE1dx = A1 * ONE, dE1dy = B1 * ONE;
+                    int dE2dx = A2 * ONE, dE2dy = B2 * ONE;
+                    int X = (minx << FP) + HALF, Y = (miny << FP) + HALF;
+                    int E0_row = A0 * X + B0 * Y + C0 * ONE;
+                    int E1_row = A1 * X + B1 * Y + C1 * ONE;
+                    int E2_row = A2 * X + B2 * Y + C2 * ONE;
+
+                    float inv_area2 = 1.0f / (float)area2;
+                    /* interpolate vis as scalar 0..255 */
+                    float v0 = (float)tri[i].debug_vis[0];
+                    float v1f = (float)tri[i].debug_vis[1];
+                    float v2f = (float)tri[i].debug_vis[2];
+                    float dw0dx = (float)A0 * inv_area2, dw0dy = (float)B0 * inv_area2;
+                    float dw1dx = (float)A1 * inv_area2, dw1dy = (float)B1 * inv_area2;
+                    float w2dx = -dw0dx - dw1dx;
+                    float w2dy = -dw0dy - dw1dy;
+                    float w0_row = ((float)(A0 * minx + B0 * miny) + (float)(A0 + B0) * 0.5f + (float)C0) * inv_area2;
+                    float w1_row = ((float)(A1 * minx + B1 * miny) + (float)(A1 + B1) * 0.5f + (float)C1) * inv_area2;
+                    float w2_row = 1.0f - w0_row - w1_row;
+                    float vis_row = w0_row * v0 + w1_row * v1f + w2_row * v2f;
+
+                    /* Depth interpolation for Z-agreement */
+                    float z0 = (float)tri[i].z16[0];
+                    float z1f = (float)tri[i].z16[1];
+                    float z2f = (float)tri[i].z16[2];
+                    float dzdx = dw0dx * z0 + dw1dx * z1f + w2dx * z2f;
+                    float dzdy = dw0dy * z0 + dw1dy * z1f + w2dy * z2f;
+                    float z_row = w0_row * z0 + w1_row * z1f + w2_row * z2f;
+
+                    size_t row_stride = (size_t)tls_scene->width * (size_t)tls_scene->stride;
+                    for (int py = miny; py <= maxy; ++py) {
+                        uint8_t *p = tls_scene->image + (size_t)py * row_stride + (size_t)minx * (size_t)tls_scene->stride;
+                        uint16_t *pz = (zptr ? zptr + (size_t)py * (size_t)zw + (size_t)minx : NULL);
+                        int E0 = E0_row, E1 = E1_row, E2 = E2_row;
+                        float vis_fp = vis_row;
+                        float zfp = z_row;
+                        for (int px = minx; px <= maxx; ++px) {
+                            if ((E0 > 0 || (E0 == 0 && tl0)) && (E1 > 0 || (E1 == 0 && tl1)) && (E2 > 0 || (E2 == 0 && tl2))) {
+                                bool blend_ok = true;
+                                if (pz) {
+                                    int zcl = (int)lrintf(zfp);
+                                    int zb = (int)*pz;
+                                    if (zcl < zb - 3 || zcl > zb + 3) blend_ok = false;
+                                }
+                                if (blend_ok) {
+                                    float v = vis_fp * (1.0f / 255.0f);
+                                    float lr = (float)shd.r + v * ((float)lit.r - (float)shd.r);
+                                    float lg = (float)shd.g + v * ((float)lit.g - (float)shd.g);
+                                    float lb = (float)shd.b + v * ((float)lit.b - (float)shd.b);
+                                    float s = strength, invs = 1.0f - s;
+                                    float r = invs * (float)p[0] + s * lr;
+                                    float g = invs * (float)p[1] + s * lg;
+                                    float b = invs * (float)p[2] + s * lb;
+                                    if (r < 0) r = 0; if (r > 255) r = 255;
+                                    if (g < 0) g = 0; if (g > 255) g = 255;
+                                    if (b < 0) b = 0; if (b > 255) b = 255;
+                                    p[0] = (uint8_t)r; p[1] = (uint8_t)g; p[2] = (uint8_t)b;
+                                }
+                            }
+                            E0 += dE0dx; E1 += dE1dx; E2 += dE2dx;
+                            vis_fp += (dw0dx * v0 + dw1dx * v1f + w2dx * v2f);
+                            zfp += dzdx;
+                            p += tls_scene->stride; if (pz) ++pz;
+                        }
+                        E0_row += dE0dy; E1_row += dE1dy; E2_row += dE2dy;
+                        vis_row += (dw0dy * v0 + dw1dy * v1f + w2dy * v2f);
+                        z_row += dzdy;
+                    }
+                }
+            }
+        }
     }
+
+    /* Restore per-pixel shadow TLS flag for other passes */
+    tls_use_pixel_shadows = saved_tls_pp;
 
     /* trifill_buffer is persistent, do not free here */
 }
@@ -1566,25 +2059,16 @@ static void api_render_scene3d(const camera_t *cam, const scene3d_t *os, const s
     tls_shadow_maps = NULL; tls_shadow_count = 0;
     /* --- Stable shadow map: cache VP/bias in light_t, only recompute if needed --- */
     if (L && L->num_lights > 0) {
-        /* Compute world-space AABB of shadow-enabled objects ONCE for all lights */
+        /* Compute camera frustum center for initial light aiming */
+        vec3 frustum_ws[8];
+        camera_frustum_corners_ws(cam, frustum_ws);
         vec3 bb_min = { +1e9f, +1e9f, +1e9f };
         vec3 bb_max = { -1e9f, -1e9f, -1e9f };
-        for (uint16_t i = 0; i < os->count; ++i) {
-            const object_instance_t *inst = &os->instances[i];
-            if (!inst || !inst->object || !inst->xform) continue;
-            if (!inst->object->shadow_enabled || !inst->object->verticies) continue;
-            mat4 M = model_matrix(inst->xform);
-            vec3 *V = inst->object->verticies->list;
-            uint16_t nV = inst->object->verticies->length;
-            for (uint16_t vi = 0; vi < nV; ++vi) {
-                vec3 wp = cm_m4_mul_point3(M, V[vi]);
-                if (wp.x < bb_min.x) { bb_min.x = wp.x; }
-                if (wp.x > bb_max.x) { bb_max.x = wp.x; }
-                if (wp.y < bb_min.y) { bb_min.y = wp.y; }
-                if (wp.y > bb_max.y) { bb_max.y = wp.y; }
-                if (wp.z < bb_min.z) { bb_min.z = wp.z; }
-                if (wp.z > bb_max.z) { bb_max.z = wp.z; }
-            }
+        for (int ci = 0; ci < 8; ++ci) {
+            vec3 wp = frustum_ws[ci];
+            if (wp.x < bb_min.x) bb_min.x = wp.x; if (wp.x > bb_max.x) bb_max.x = wp.x;
+            if (wp.y < bb_min.y) bb_min.y = wp.y; if (wp.y > bb_max.y) bb_max.y = wp.y;
+            if (wp.z < bb_min.z) bb_min.z = wp.z; if (wp.z > bb_max.z) bb_max.z = wp.z;
         }
         vec3 bb_center = { (bb_min.x+bb_max.x)*0.5f, (bb_min.y+bb_max.y)*0.5f, (bb_min.z+bb_max.z)*0.5f };
         vec3 bb_extent = { (bb_max.x-bb_min.x)*0.5f, (bb_max.y-bb_min.y)*0.5f, (bb_max.z-bb_min.z)*0.5f };
@@ -1594,7 +2078,7 @@ static void api_render_scene3d(const camera_t *cam, const scene3d_t *os, const s
         tls_shadow_maps = (ShadowMap*)calloc(tls_shadow_count, sizeof(ShadowMap));
         if (!tls_shadow_maps) { tls_shadow_count = 0; }
 
-        const int SM_W = 128, SM_H = 128;
+    const int SM_W = 512, SM_H = 512;
         for (uint16_t li = 0; li < L->num_lights; ++li) {
             light_t *Lt = &L->lights[li];
             ShadowMap *SM = &tls_shadow_maps[li];
@@ -1604,52 +2088,126 @@ static void api_render_scene3d(const camera_t *cam, const scene3d_t *os, const s
             if (Lt->intensity <= 0.0f) continue;
             if (!Lt->casts_shadows || !Lt->shadow_enabled) continue;
 
-            /* Only recompute shadow VP if not valid (first frame or after scene change) */
+            /* Recompute shadow VP every frame for robustness in dynamic scenes */
+            Lt->shadow_vp_valid = false;
             if (!Lt->shadow_vp_valid) {
                 vec3 dir = v3_norm((vec3){ Lt->direction.x, Lt->direction.y, Lt->direction.z });
                 if (fabsf(dir.x)+fabsf(dir.y)+fabsf(dir.z) < 1e-6f) dir = (vec3){0,-1,0};
-                vec3 eye = (vec3){ Lt->position.x, Lt->position.y, Lt->position.z };
-                float eye_len = sqrtf(eye.x*eye.x + eye.y*eye.y + eye.z*eye.z);
-                if (eye_len < 1e-6f) {
-                    eye = (vec3){ bb_center.x - dir.x*(bb_radius*2.5f),
-                                  bb_center.y - dir.y*(bb_radius*2.5f),
-                                  bb_center.z - dir.z*(bb_radius*2.5f) };
-                }
-                vec3 up = pick_up_from_dir(dir);
+                     /* For directional lights, derive an eye from direction instead of using position.
+                         This avoids "underneath" views when a pose was provided for direction only. */
+                    float dist = bb_radius * 2.5f;
+                    /* For consistency with shading (which uses -L->direction), render SM looking along -dir */
+                    vec3 eye = (vec3){ bb_center.x + dir.x*dist,
+                                       bb_center.y + dir.y*dist,
+                                       bb_center.z + dir.z*dist };
+                    vec3 up = pick_up_from_dir((vec3){ -dir.x, -dir.y, -dir.z });
                 mat4 V = cm_m4_look_at(eye, bb_center, up);
-                vec3 corners[8] = {
-                    {bb_min.x, bb_min.y, bb_min.z}, {bb_max.x, bb_min.y, bb_min.z},
-                    {bb_min.x, bb_max.y, bb_min.z}, {bb_max.x, bb_max.y, bb_min.z},
-                    {bb_min.x, bb_min.y, bb_max.z}, {bb_max.x, bb_min.y, bb_max.z},
-                    {bb_min.x, bb_max.y, bb_max.z}, {bb_max.x, bb_max.y, bb_max.z}
-                };
+
+                /* Tight-fit: bound only casters intersecting the camera frustum, in light-view space */
                 float lxmin=1e9f, lxmax=-1e9f, lymin=1e9f, lymax=-1e9f, lzmin=1e9f, lzmax=-1e9f;
-                for (int ci=0; ci<8; ++ci) {
-                    vec3 lv = cm_m4_mul_point3(V, corners[ci]);
-                    if (lv.x < lxmin) { lxmin = lv.x; }
-                    if (lv.x > lxmax) { lxmax = lv.x; }
-                    if (lv.y < lymin) { lymin = lv.y; }
-                    if (lv.y > lymax) { lymax = lv.y; }
-                    if (lv.z < lzmin) { lzmin = lv.z; }
-                    if (lv.z > lzmax) { lzmax = lv.z; }
+                bool have_bounds = false;
+                for (uint16_t oi = 0; oi < os->count; ++oi) {
+                    const object_instance_t *inst_b = &os->instances[oi];
+                    if (!inst_b || !inst_b->object || !inst_b->xform) continue;
+                    /* For bounds, include any mesh (receivers and/or casters) so the SM covers tested pixels */
+                    if (!inst_b->object->faces || !inst_b->object->verticies) continue;
+                    /* MVP for camera-space culling */
+                    mat4 mvp = camera_project(cam, inst_b->xform);
+                    mat4 M   = model_matrix(inst_b->xform);
+                    vec3 *Vtx= inst_b->object->verticies->list;
+                    face_list_t *F = inst_b->object->faces;
+                    for (uint16_t fi = 0; fi < F->length; ++fi) {
+                        vec3 f = F->list[fi];
+                        /* coarse visibility: any vertex inside camera NDC cube? */
+                        vec4 c0c = cm_m4_mul_point4(mvp, Vtx[(uint16_t)f.x]);
+                        vec4 c1c = cm_m4_mul_point4(mvp, Vtx[(uint16_t)f.y]);
+                        vec4 c2c = cm_m4_mul_point4(mvp, Vtx[(uint16_t)f.z]);
+                        float iw0c = (fabsf(c0c.w) > 1e-6f) ? (1.0f / c0c.w) : 1.0f;
+                        float iw1c = (fabsf(c1c.w) > 1e-6f) ? (1.0f / c1c.w) : 1.0f;
+                        float iw2c = (fabsf(c2c.w) > 1e-6f) ? (1.0f / c2c.w) : 1.0f;
+                        vec3 n0 = { c0c.x * iw0c, c0c.y * iw0c, c0c.z * iw0c };
+                        vec3 n1 = { c1c.x * iw1c, c1c.y * iw1c, c1c.z * iw1c };
+                        vec3 n2 = { c2c.x * iw2c, c2c.y * iw2c, c2c.z * iw2c };
+                        bool v0_in = (fabsf(n0.x) <= 1.0f && fabsf(n0.y) <= 1.0f && n0.z >= -1.0f && n0.z <= 1.0f);
+                        bool v1_in = (fabsf(n1.x) <= 1.0f && fabsf(n1.y) <= 1.0f && n1.z >= -1.0f && n1.z <= 1.0f);
+                        bool v2_in = (fabsf(n2.x) <= 1.0f && fabsf(n2.y) <= 1.0f && n2.z >= -1.0f && n2.z <= 1.0f);
+                        if (!(v0_in || v1_in || v2_in)) continue;
+                        /* include this triangle in light-view bounds */
+                        vec3 v0w = cm_m4_mul_point3(M, Vtx[(uint16_t)f.x]);
+                        vec3 v1w = cm_m4_mul_point3(M, Vtx[(uint16_t)f.y]);
+                        vec3 v2w = cm_m4_mul_point3(M, Vtx[(uint16_t)f.z]);
+                        vec3 l0 = cm_m4_mul_point3(V, v0w);
+                        vec3 l1 = cm_m4_mul_point3(V, v1w);
+                        vec3 l2 = cm_m4_mul_point3(V, v2w);
+                        /* expand bounds */
+                        if (l0.x < lxmin) lxmin = l0.x; if (l0.x > lxmax) lxmax = l0.x;
+                        if (l0.y < lymin) lymin = l0.y; if (l0.y > lymax) lymax = l0.y;
+                        if (l0.z < lzmin) lzmin = l0.z; if (l0.z > lzmax) lzmax = l0.z;
+                        if (l1.x < lxmin) lxmin = l1.x; if (l1.x > lxmax) lxmax = l1.x;
+                        if (l1.y < lymin) lymin = l1.y; if (l1.y > lymax) lymax = l1.y;
+                        if (l1.z < lzmin) lzmin = l1.z; if (l1.z > lzmax) lzmax = l1.z;
+                        if (l2.x < lxmin) lxmin = l2.x; if (l2.x > lxmax) lxmax = l2.x;
+                        if (l2.y < lymin) lymin = l2.y; if (l2.y > lymax) lymax = l2.y;
+                        if (l2.z < lzmin) lzmin = l2.z; if (l2.z > lzmax) lzmax = l2.z;
+                        have_bounds = true;
+                    }
                 }
-                float pad = 0.10f * fmaxf(fmaxf(lxmax-lxmin, lymax-lymin), lzmax-lzmin);
-                mat4 P = cm_m4_ortho(lxmin-pad, lxmax+pad, lymin-pad, lymax+pad, lzmin-pad, lzmax+pad);
+
+                /* Fallback: if nothing intersected the camera frustum, use frustum-fit */
+                if (!have_bounds) {
+                    for (int ci=0; ci<8; ++ci) {
+                        vec3 lv = cm_m4_mul_point3(V, frustum_ws[ci]);
+                        if (lv.x < lxmin) { lxmin = lv.x; }
+                        if (lv.x > lxmax) { lxmax = lv.x; }
+                        if (lv.y < lymin) { lymin = lv.y; }
+                        if (lv.y > lymax) { lymax = lv.y; }
+                        if (lv.z < lzmin) { lzmin = lv.z; }
+                        if (lv.z > lzmax) { lzmax = lv.z; }
+                    }
+                }
+
+                /* Apply user-controlled zoom about the light-space center: zoom < 1 shrinks extents */
+                float cx = (lxmin + lxmax) * 0.5f;
+                float cy = (lymin + lymax) * 0.5f;
+                float cz = (lzmin + lzmax) * 0.5f;
+                float ex = (lxmax - lxmin) * 0.5f;
+                float ey = (lymax - lymin) * 0.5f;
+                float ez = (lzmax - lzmin) * 0.5f;
+                float zoom = Lt->shadow_zoom;
+                if (!(zoom > 0.0f)) zoom = 1.0f; /* guard */
+                ex *= zoom; ey *= zoom; ez *= zoom;
+                lxmin = cx - ex; lxmax = cx + ex;
+                lymin = cy - ey; lymax = cy + ey;
+                lzmin = cz - ez; lzmax = cz + ez;
+
+                float span = fmaxf(fmaxf(lxmax-lxmin, lymax-lymin), lzmax-lzmin);
+                float pad = 0.02f * span + 1e-4f; /* padding proportional to zoomed span */
+                /* Flip Y in ortho so +Y in light space appears at the top of the shadow map image */
+                mat4 P = cm_m4_ortho(lxmin-pad, lxmax+pad, lymax+pad, lymin-pad, lzmin-pad, lzmax+pad);
                 Lt->shadow_V = V;
                 Lt->shadow_P = P;
                 Lt->shadow_VP = cm_m4_mul(P, V);
-                Lt->shadow_z_bias = 0.002f * (lzmax - lzmin) + 1e-5f;
+                Lt->shadow_z_bias = 0.0005f * (lzmax - lzmin) + 1e-5f; /* slightly reduced bias for tighter fit */
                 Lt->shadow_vp_valid = true;
+                if (tls_scene && tls_scene->enhanced_debug) {
+                    printf("[shadow] li=%u %s bounds x[%.3f,%.3f] y[%.3f,%.3f] z[%.3f,%.3f] pad=%.3f bias=%.6f zoom=%.3f SM=%dx%d\n",
+                        (unsigned)li, have_bounds ? "TIGHT" : "FRUSTUM",
+                        (double)lxmin, (double)lxmax, (double)lymin, (double)lymax,
+                        (double)lzmin, (double)lzmax, (double)pad, (double)Lt->shadow_z_bias, (double)zoom, SM_W, SM_H);
+                }
             }
             SM->V  = Lt->shadow_V;
             SM->VP = Lt->shadow_VP;
-            SM->z_bias = Lt->shadow_z_bias;
+            /* Convert world LV bias into NDC units using |P.m[10]| scaling */
+            float proj_scale = fabsf(Lt->shadow_P.m[10]);
+            SM->z_bias = proj_scale * Lt->shadow_z_bias;
 
             SM->w = SM_W; SM->h = SM_H;
             SM->depth = (float*)malloc((size_t)SM_W * (size_t)SM_H * sizeof(float));
             if (!SM->depth) { SM->valid = false; continue; }
             for (int i = 0; i < SM_W*SM_H; ++i) SM->depth[i] = 1e9f;
 
+            int tri_count = 0;
             for (uint16_t oi = 0; oi < os->count; ++oi) {
                 const object_instance_t *inst = &os->instances[oi];
                 if (!inst || !inst->object || !inst->xform) continue;
@@ -1662,21 +2220,14 @@ static void api_render_scene3d(const camera_t *cam, const scene3d_t *os, const s
                     vec3 v0w = cm_m4_mul_point3(M, Vtx[(uint16_t)f.x]);
                     vec3 v1w = cm_m4_mul_point3(M, Vtx[(uint16_t)f.y]);
                     vec3 v2w = cm_m4_mul_point3(M, Vtx[(uint16_t)f.z]);
-                    vec3 cw = { (v0w.x+v1w.x+v2w.x)/3.0f, (v0w.y+v1w.y+v2w.y)/3.0f, (v0w.z+v1w.z+v2w.z)/3.0f };
-                    vec4 cclip = cm_m4_mul_point4(SM->VP, cw);
-                    float invw = (fabsf(cclip.w) > 1e-6f) ? (1.0f / cclip.w) : 1.0f;
-                    float x_ndc = cclip.x * invw;
-                    float y_ndc = cclip.y * invw;
-                    float z_lv = cm_m4_mul_point3(SM->V, cw).z;
-                    int sx = (int)((x_ndc * 0.5f + 0.5f) * (float)(SM->w - 1) + 0.5f);
-                    int sy = (int)((y_ndc * 0.5f + 0.5f) * (float)(SM->h - 1) + 0.5f);
-                    if ((unsigned)sx < (unsigned)SM->w && (unsigned)sy < (unsigned)SM->h) {
-                        size_t idx = (size_t)sy * (size_t)SM->w + (size_t)sx;
-                        if (z_lv < SM->depth[idx]) SM->depth[idx] = z_lv;
-                    }
+                    shadowmap_rasterize_triangle(SM, v0w, v1w, v2w);
+                    tri_count++;
                 }
             }
             SM->valid = true;
+            if (tls_scene && tls_scene->enhanced_debug) {
+                printf("[shadow] li=%u rasterized %d tris into SM\n", (unsigned)li, tri_count);
+            }
         }
     }
     for (uint16_t i = 0; i < os->count; ++i) {
@@ -1695,6 +2246,68 @@ static void api_render_scene3d(const camera_t *cam, const scene3d_t *os, const s
                 break;
         }
     }
+
+    /* Debug overlay: screen-space checker drawn after rendering */
+    if (tls_scene && os->debug.overlay_checker && tls_scene->image) {
+        const int W = tls_scene->width;
+        const int H = tls_scene->height;
+        const int stride = tls_scene->stride;
+        const int tile = os->debug.checker_size > 0 ? os->debug.checker_size : 8;
+        const float s = os->debug.checker_strength;
+        const float invs = 1.0f - s;
+        const float cr = (float)os->debug.checker_color.r;
+        const float cg = (float)os->debug.checker_color.g;
+        const float cb = (float)os->debug.checker_color.b;
+        for (int y = 0; y < H; ++y) {
+            uint8_t *row = tls_scene->image + (size_t)y * (size_t)W * (size_t)stride;
+            int ty = (y / tile);
+            for (int x = 0; x < W; ++x) {
+                int tx = (x / tile);
+                if (((tx + ty) & 1) == 0) {
+                    uint8_t *p = row + (size_t)x * (size_t)stride;
+                    float r = (float)p[0];
+                    float g = (float)p[1];
+                    float b = (float)p[2];
+                    r = invs * r + s * cr;
+                    g = invs * g + s * cg;
+                    b = invs * b + s * cb;
+                    if (r < 0.f) r = 0.f; if (r > 255.f) r = 255.f;
+                    if (g < 0.f) g = 0.f; if (g > 255.f) g = 255.f;
+                    if (b < 0.f) b = 0.f; if (b > 255.f) b = 255.f;
+                    p[0] = (uint8_t)r; p[1] = (uint8_t)g; p[2] = (uint8_t)b;
+                }
+            }
+        }
+    }
+
+    /* If a shadow map dump was requested, write it now before cleanup */
+#ifdef HAVE_LIBPNG
+    if (tls_shadow_maps && tls_dump_sm_index >= 0 && (uint16_t)tls_dump_sm_index < tls_shadow_count) {
+        ShadowMap *SM = &tls_shadow_maps[tls_dump_sm_index];
+        if (SM && SM->valid && SM->depth) {
+            /* Optional stats to help debug: how much of the SM was written? */
+            if (tls_scene && tls_scene->enhanced_debug) {
+                int total = SM->w * SM->h;
+                int filled = 0;
+                float minz = 1e9f, maxz = -1e9f;
+                for (int i = 0; i < total; ++i) {
+                    float z = SM->depth[i];
+                    if (z < 1e8f) { /* treated as written */
+                        filled++;
+                        if (z < minz) minz = z;
+                        if (z > maxz) maxz = z;
+                    }
+                }
+                float cov = (total > 0) ? ((float)filled * 100.0f / (float)total) : 0.0f;
+                printf("[shadow] dump li=%d coverage=%.1f%% z_ndc[min=%.4f max=%.4f] -> %s\n",
+                       tls_dump_sm_index, (double)cov, (double)minz, (double)maxz,
+                       (tls_dump_sm_path[0] ? tls_dump_sm_path : "shadowmap.png"));
+            }
+            write_shadowmap_png(tls_dump_sm_path[0] ? tls_dump_sm_path : "shadowmap.png", SM);
+        }
+    }
+#endif
+    tls_dump_sm_index = -1; tls_dump_sm_path[0] = '\0';
 
     /* Cleanup shadow maps */
     if (tls_shadow_maps) {
@@ -1731,7 +2344,7 @@ void api_lighting_free(scene3d_lighting_t *l) {
 }
 
 void api_lighting_set_directional(scene3d_lighting_t *l, uint16_t index,
-                                  light_vec3 direction, RGBF color,
+                                  vec3 direction, RGBF color,
                                   float intensity, bool casts_shadows) {
     if (!l || !l->lights || index >= l->num_lights) return;
     light_t *L = &l->lights[index];
@@ -1741,6 +2354,8 @@ void api_lighting_set_directional(scene3d_lighting_t *l, uint16_t index,
     L->intensity = intensity;
     L->casts_shadows = casts_shadows;
     L->shadow_enabled = casts_shadows; /* default runtime toggle aligns with casts_shadows */
+    /* 1.0 = no zoom, <1.0 zooms in (tighter bounds), >1.0 zooms out */
+    L->shadow_zoom = 0.5f;
 }
 
 /* -------- Object scene helpers (FFI-friendly) -------- */
@@ -1751,7 +2366,7 @@ static void os_set_ambient(scene3d_t *os, RGBF ambient) {
 }
 
 static uint16_t os_add_directional(scene3d_t *os,
-                                   light_vec3 direction,
+                                   vec3 direction,
                                    RGBF color,
                                    float intensity,
                                    bool casts_shadows) {
@@ -1767,7 +2382,9 @@ static uint16_t os_add_directional(scene3d_t *os,
     L->intensity = intensity;
     L->casts_shadows = casts_shadows;
     L->shadow_enabled = casts_shadows; /* enable by default if configured to cast */
-    L->position = (light_vec3){0,0,0};
+    L->position = (vec3){0,0,0};
+    /* Default zoom: 1.0 (no zoom); users can set <1.0 to tighten the fit further */
+    L->shadow_zoom = 0.5f;
     L->range = 0.0f; L->inner_cos = 1.0f; L->outer_cos = 1.0f;
     os->lighting.num_lights = (uint16_t)(n + 1);
     return n;
@@ -1775,7 +2392,7 @@ static uint16_t os_add_directional(scene3d_t *os,
 
 /* Set a directional light using a camera-like pose (position + look_at) */
 static void os_set_directional_pose(scene3d_t *os, uint16_t id,
-                                    light_vec3 position, light_vec3 look_at) {
+                                    vec3 position, vec3 look_at) {
     if (!os || id >= os->lighting.num_lights || !os->lighting.lights) return;
     light_t *L = &os->lighting.lights[id];
     /* Store position for completeness */
@@ -1787,7 +2404,9 @@ static void os_set_directional_pose(scene3d_t *os, uint16_t id,
     float len = sqrtf(dx*dx + dy*dy + dz*dz);
     if (len > 1e-6f) { dx/=len; dy/=len; dz/=len; }
     else { dx = 0.0f; dy = -1.0f; dz = 0.0f; }
-    L->direction = (light_vec3){ dx, dy, dz };
+    L->direction = (vec3){ dx, dy, dz };
+    /* Invalidate cached shadow view-projection when pose changes */
+    L->shadow_vp_valid = false;
 }
 
 static uint16_t os_add_object(scene3d_t *os, object_t *obj, transform_t *xform) {
@@ -1852,6 +2471,16 @@ scene3d_t *api_object_scene_new(uint16_t object_count) {
     os->zbuffer_enabled = true;
     os->zbuf = NULL;
     os->zbuf_width = os->zbuf_height = 0;
+    /* Debug defaults */
+    os->debug.overlay_checker = false;
+    os->debug.checker_size = 8;
+    os->debug.checker_strength = 0.3f;
+    os->debug.checker_color = (RGB){255, 0, 255};
+    os->debug.overlay_shadow_vis = false;
+    os->debug.shadow_vis_light = 0;
+    os->debug.shadow_vis_strength = 0.35f;
+    os->debug.shadow_vis_color_lit = (RGB){0, 255, 0};
+    os->debug.shadow_vis_color_shadow = (RGB){255, 0, 0};
     return os;
 }
 
@@ -1920,6 +2549,11 @@ static const hub75gpu_t api_table = {
     .scene3d_add_object = api_scene3d_add_object,
     .scene3d_get_object = api_scene3d_get_object,
     .scene3d_get_transform = api_scene3d_get_transform,
+    /* debug helpers */
+    .scene3d_set_debug_checker = api_scene3d_set_debug_checker,
+    .scene3d_set_debug_shadow_vis = api_scene3d_set_debug_shadow_vis,
+    .scene3d_dump_shadowmap_png = api_scene3d_dump_shadowmap_png,
+    .scene3d_set_shadowmap_zoom = api_scene3d_set_shadowmap_zoom,
 };
 
 
@@ -1945,7 +2579,7 @@ void api_scene3d_clear_current(void) { tls_current_os = NULL; }
 void api_scene3d_set_ambient(RGBF ambient) {
     if (tls_current_os && tls_current_os->set_ambient) tls_current_os->set_ambient(tls_current_os, ambient);
 }
-uint16_t api_scene3d_add_directional(light_vec3 direction, RGBF color, float intensity, bool casts_shadows) {
+uint16_t api_scene3d_add_directional(vec3 direction, RGBF color, float intensity, bool casts_shadows) {
     if (!tls_current_os || !tls_current_os->add_directional) return UINT16_MAX;
     return tls_current_os->add_directional(tls_current_os, direction, color, intensity, casts_shadows);
 }
@@ -1967,10 +2601,42 @@ transform_t* api_scene3d_get_transform(uint16_t id) {
     return tls_current_os->get_transform(tls_current_os, id);
 }
 
-void api_scene3d_set_directional_pose(uint16_t id, light_vec3 position, light_vec3 look_at) {
+void api_scene3d_set_directional_pose(uint16_t id, vec3 position, vec3 look_at) {
     if (tls_current_os && tls_current_os->set_directional_pose) {
         tls_current_os->set_directional_pose(tls_current_os, id, position, look_at);
     }
+}
+
+/* Control shadow map tight-fit zoom for a light (1.0 = default; <1.0 zoom in; >1.0 zoom out) */
+void api_scene3d_set_shadowmap_zoom(uint16_t light_index, float zoom) {
+    if (!tls_current_os) return;
+    if (!tls_current_os->lighting.lights || light_index >= tls_current_os->lighting.num_lights) return;
+    if (!(zoom > 0.0f)) zoom = 1.0f; /* ignore non-positive values */
+    light_t *L = &tls_current_os->lighting.lights[light_index];
+    L->shadow_zoom = zoom;
+    /* Force recompute of cached VP/bias next frame */
+    L->shadow_vp_valid = false;
+}
+
+/* -------- Debug helpers (thread-local current scene3d) -------- */
+void api_scene3d_set_debug_checker(bool enabled, uint8_t tile_px, float strength, RGB color) {
+    if (!tls_current_os) return;
+    tls_current_os->debug.overlay_checker = enabled;
+    if (tile_px == 0) tile_px = 8;
+    tls_current_os->debug.checker_size = tile_px;
+    if (strength < 0.0f) strength = 0.0f; else if (strength > 1.0f) strength = 1.0f;
+    tls_current_os->debug.checker_strength = strength;
+    tls_current_os->debug.checker_color = color;
+}
+
+void api_scene3d_set_debug_shadow_vis(bool enabled, uint8_t light_index, float strength, RGB lit_color, RGB shadow_color) {
+    if (!tls_current_os) return;
+    tls_current_os->debug.overlay_shadow_vis = enabled;
+    tls_current_os->debug.shadow_vis_light = light_index;
+    if (strength < 0.0f) strength = 0.0f; else if (strength > 1.0f) strength = 1.0f;
+    tls_current_os->debug.shadow_vis_strength = strength;
+    tls_current_os->debug.shadow_vis_color_lit = lit_color;
+    tls_current_os->debug.shadow_vis_color_shadow = shadow_color;
 }
 
 /* -------- Object material helpers -------- */

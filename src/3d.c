@@ -968,7 +968,7 @@ object_t* object_torus(uint16_t major_segments, uint16_t minor_segments) {
  * @param width_segments Number of segments along X axis
  * @param height_segments Number of segments along Z axis
  */
-object_t* object_plane(uint16_t width_segments, uint16_t height_segments) {
+object_t* object_plane(uint16_t width_segments, uint16_t height_segments, bool face_up_not_implemented) {
     if (width_segments < 1) width_segments = 1;
     if (height_segments < 1) height_segments = 1;
     

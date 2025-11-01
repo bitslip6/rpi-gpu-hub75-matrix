@@ -5,6 +5,7 @@
 #ifndef __UTIL_H__
 #define __UTIL_H__
 #include "rpihub75.h"
+#include "lists.h"
 
 
 /**
@@ -202,5 +203,19 @@ void* receive_udp_data(void *arg);
  */
 bool file_exists(const char *filename);
 
+void write_png_file(string_t *filename, hub75_display_t *d);
+
+/* Generic PNG helpers (libpng) */
+/* Read an image as 8-bit grayscale (tightly packed, stride=w). Returns 0 on success. */
+int png_read_gray8(const char *path, uint8_t **out_pixels, int *out_w, int *out_h, int *out_stride);
+
+/* Read an image as 8-bit RGBA (tightly packed, stride=4*w). Returns 0 on success. */
+int png_read_rgba8(const char *path, uint8_t **out_pixels, int *out_w, int *out_h, int *out_stride);
+
+/* Write an 8-bit grayscale image. Returns 0 on success. */
+int png_write_gray8(const char *path, const uint8_t *pixels, int w, int h, int stride);
+
+/* Write an 8-bit RGBA image. Returns 0 on success. */
+int png_write_rgba8(const char *path, const uint8_t *pixels, int w, int h, int stride);
 
 #endif

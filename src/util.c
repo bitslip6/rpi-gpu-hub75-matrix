@@ -19,6 +19,7 @@
 #include <sys/param.h>
 #include <sys/types.h>
 #include <netinet/in.h>
+#include <png.h>
 
 #ifndef CLOCK_MONOTONIC
 #define CLOCK_MONOTONIC			1
@@ -32,6 +33,7 @@
 #include "hub75gpu.h"
 #include "transformers.h"
 #include "scene.h"
+#include "lists.h"
 
 //#define MEMGUARD_OVERRIDE_STDLIB
 #include "memguard2.h"
@@ -861,6 +863,284 @@ int64_t ts_diff_us(const struct timespec *a, const struct timespec *b) {
          + (int64_t)(a->tv_nsec - b->tv_nsec) / 1000LL;
 }
 
+void write_png_file(string_t *filename, hub75_display_t *d) {
+    if (!filename || !filename->str || !d || !d->image) return;
+    printf("open PNG file for writing: %s\n", filename->str);
+    FILE *fp = fopen(filename->str, "wb");
+    if (!fp) { printf("no fp1\n");return; }
+
+    png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png_ptr) { fclose(fp); return; }
+    png_infop info_ptr = png_create_info_struct(png_ptr);
+    if (!info_ptr) { png_destroy_write_struct(&png_ptr, NULL); fclose(fp); return; }
+    if (setjmp(png_jmpbuf(png_ptr))) {
+        png_destroy_write_struct(&png_ptr, &info_ptr); fclose(fp); return;
+    }
+
+    png_init_io(png_ptr, fp);
+
+    /* Choose PNG color type based on framebuffer stride (3=RGB888, 4=RGBA8888) */
+    int color_type = (d->stride >= 4) ? PNG_COLOR_TYPE_RGBA : PNG_COLOR_TYPE_RGB;
+    int out_bpp = (color_type == PNG_COLOR_TYPE_RGBA) ? 4 : 3;
+
+    /* Always write 8-bit per channel PNG regardless of panel bit depth */
+    png_set_IHDR(png_ptr, info_ptr,
+                 (png_uint_32)d->width,
+                 (png_uint_32)d->height,
+                 8, /* bit depth */
+                 color_type,
+                 PNG_INTERLACE_NONE,
+                 PNG_COMPRESSION_TYPE_DEFAULT,
+                 PNG_FILTER_TYPE_DEFAULT);
+
+    png_write_info(png_ptr, info_ptr);
+
+    if (d->stride == out_bpp) {
+        /* Direct rows */
+        for (uint16_t y = 0; y < d->height; ++y) {
+            png_bytep row = (png_bytep)(d->image + (size_t)y * (size_t)d->width * (size_t)d->stride);
+            png_write_row(png_ptr, row);
+        }
+    } else {
+        /* Pack rows to match requested color_type */
+        png_bytep rowbuf = (png_bytep)malloc((size_t)d->width * (size_t)out_bpp);
+        if (!rowbuf) { png_destroy_write_struct(&png_ptr, &info_ptr); fclose(fp); return; }
+        for (uint16_t y = 0; y < d->height; ++y) {
+            const uint8_t *src = d->image + (size_t)y * (size_t)d->width * (size_t)d->stride;
+            for (uint16_t x = 0; x < d->width; ++x) {
+                rowbuf[(size_t)x*out_bpp + 0] = src[(size_t)x*d->stride + 0];
+                rowbuf[(size_t)x*out_bpp + 1] = src[(size_t)x*d->stride + 1];
+                rowbuf[(size_t)x*out_bpp + 2] = src[(size_t)x*d->stride + 2];
+                if (out_bpp == 4) {
+                    rowbuf[(size_t)x*4 + 3] = (d->stride >= 4) ? src[(size_t)x*d->stride + 3] : 255;
+                }
+            }
+            png_write_row(png_ptr, rowbuf);
+        }
+        free(rowbuf);
+    }
+
+    png_write_end(png_ptr, NULL);
+    png_destroy_write_struct(&png_ptr, &info_ptr);
+    fclose(fp);
+}
+
+/* ---- Generic PNG helpers ---- */
+
+int png_read_gray8(const char *path, uint8_t **out_pixels, int *out_w, int *out_h, int *out_stride) {
+    if (!path || !out_pixels || !out_w || !out_h || !out_stride) return -1;
+    *out_pixels = NULL; *out_w = *out_h = *out_stride = 0;
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+
+    png_byte sig[8];
+    if (fread(sig, 1, 8, fp) != 8 || png_sig_cmp(sig, 0, 8)) { fclose(fp); return -1; }
+
+    png_structp png_ptr = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png_ptr) { fclose(fp); return -1; }
+    png_infop info_ptr = png_create_info_struct(png_ptr);
+    if (!info_ptr) { png_destroy_read_struct(&png_ptr, NULL, NULL); fclose(fp); return -1; }
+    if (setjmp(png_jmpbuf(png_ptr))) {
+        png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
+        fclose(fp);
+        return -1;
+    }
+
+    png_init_io(png_ptr, fp);
+    png_set_sig_bytes(png_ptr, 8);
+    png_read_info(png_ptr, info_ptr);
+
+    png_uint_32 width, height; int bit_depth, color_type, interlace, comp, filt;
+    png_get_IHDR(png_ptr, info_ptr, &width, &height, &bit_depth, &color_type, &interlace, &comp, &filt);
+
+    if (bit_depth == 16) png_set_strip_16(png_ptr);
+    if (color_type == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png_ptr);
+    if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8) png_set_expand_gray_1_2_4_to_8(png_ptr);
+    if (png_get_valid(png_ptr, info_ptr, PNG_INFO_tRNS)) png_set_tRNS_to_alpha(png_ptr);
+    if (color_type & PNG_COLOR_MASK_ALPHA) png_set_strip_alpha(png_ptr);
+    if (color_type == PNG_COLOR_TYPE_RGB || color_type == PNG_COLOR_TYPE_RGB_ALPHA || color_type == PNG_COLOR_TYPE_PALETTE) {
+        png_set_rgb_to_gray_fixed(png_ptr, 1, -1, -1);
+    }
+
+    png_read_update_info(png_ptr, info_ptr);
+
+    png_size_t rowbytes = png_get_rowbytes(png_ptr, info_ptr);
+    uint8_t *pixels = (uint8_t*)malloc((size_t)width * (size_t)height);
+    if (!pixels) { png_destroy_read_struct(&png_ptr, &info_ptr, NULL); fclose(fp); return -1; }
+
+    png_bytep *rows = (png_bytep*)malloc(sizeof(png_bytep) * height);
+    if (!rows) { free(pixels); png_destroy_read_struct(&png_ptr, &info_ptr, NULL); fclose(fp); return -1; }
+    for (png_uint_32 y = 0; y < height; ++y) {
+        rows[y] = (png_bytep)malloc(rowbytes);
+        if (!rows[y]) { for (png_uint_32 k=0;k<y;++k) free(rows[k]); free(rows); free(pixels); png_destroy_read_struct(&png_ptr,&info_ptr,NULL); fclose(fp); return -1; }
+    }
+
+    png_read_image(png_ptr, rows);
+    png_read_end(png_ptr, NULL);
+    fclose(fp);
+
+    if (rowbytes == width) {
+        for (png_uint_32 y = 0; y < height; ++y) memcpy(pixels + y*width, rows[y], width);
+    } else {
+        png_size_t comps = rowbytes / width;
+        for (png_uint_32 y = 0; y < height; ++y) {
+            uint8_t *dst = pixels + y*width;
+            uint8_t *src = rows[y];
+            for (png_uint_32 x = 0; x < width; ++x) dst[x] = src[x*comps + 0];
+        }
+    }
+
+    for (png_uint_32 y = 0; y < height; ++y) free(rows[y]);
+    free(rows);
+    png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
+
+    *out_pixels = pixels; *out_w = (int)width; *out_h = (int)height; *out_stride = (int)width;
+    return 0;
+}
+
+int png_read_rgba8(const char *path, uint8_t **out_pixels, int *out_w, int *out_h, int *out_stride) {
+    if (!path || !out_pixels || !out_w || !out_h || !out_stride) return -1;
+    *out_pixels = NULL; *out_w = *out_h = *out_stride = 0;
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+    png_byte sig[8];
+    if (fread(sig, 1, 8, fp) != 8 || png_sig_cmp(sig, 0, 8)) { fclose(fp); return -1; }
+
+    png_structp png_ptr = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png_ptr) { fclose(fp); return -1; }
+    png_infop info_ptr = png_create_info_struct(png_ptr);
+    if (!info_ptr) { png_destroy_read_struct(&png_ptr, NULL, NULL); fclose(fp); return -1; }
+    if (setjmp(png_jmpbuf(png_ptr))) {
+        png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
+        fclose(fp);
+        return -1;
+    }
+
+    png_init_io(png_ptr, fp);
+    png_set_sig_bytes(png_ptr, 8);
+    png_read_info(png_ptr, info_ptr);
+
+    png_uint_32 width, height; int bit_depth, color_type, interlace, comp, filt;
+    png_get_IHDR(png_ptr, info_ptr, &width, &height, &bit_depth, &color_type, &interlace, &comp, &filt);
+
+    if (bit_depth == 16) png_set_strip_16(png_ptr);
+    png_set_expand(png_ptr); /* expand palette/tRNS/gray1-4 to 8-bit */
+    if (color_type == PNG_COLOR_TYPE_GRAY || color_type == PNG_COLOR_TYPE_GRAY_ALPHA) {
+        png_set_gray_to_rgb(png_ptr);
+    }
+    /* Ensure we have an alpha channel; place at end */
+    if (!(color_type & PNG_COLOR_MASK_ALPHA)) {
+        png_set_filler(png_ptr, 0xFF, PNG_FILLER_AFTER);
+    }
+
+    png_read_update_info(png_ptr, info_ptr);
+    png_size_t rowbytes = png_get_rowbytes(png_ptr, info_ptr);
+
+    uint8_t *pixels = (uint8_t*)malloc((size_t)width * (size_t)height * 4u);
+    if (!pixels) { png_destroy_read_struct(&png_ptr, &info_ptr, NULL); fclose(fp); return -1; }
+
+    png_bytep *rows = (png_bytep*)malloc(sizeof(png_bytep) * height);
+    if (!rows) { free(pixels); png_destroy_read_struct(&png_ptr, &info_ptr, NULL); fclose(fp); return -1; }
+    for (png_uint_32 y = 0; y < height; ++y) {
+        rows[y] = (png_bytep)malloc(rowbytes);
+        if (!rows[y]) { for (png_uint_32 k=0;k<y;++k) free(rows[k]); free(rows); free(pixels); png_destroy_read_struct(&png_ptr,&info_ptr,NULL); fclose(fp); return -1; }
+    }
+
+    png_read_image(png_ptr, rows);
+    png_read_end(png_ptr, NULL);
+    fclose(fp);
+
+    /* Pack to tight RGBA */
+    if (rowbytes == width * 4u) {
+        for (png_uint_32 y = 0; y < height; ++y) memcpy(pixels + y*width*4u, rows[y], width*4u);
+    } else {
+        png_size_t comps = rowbytes / width;
+        for (png_uint_32 y = 0; y < height; ++y) {
+            uint8_t *dst = pixels + y*width*4u;
+            uint8_t *src = rows[y];
+            for (png_uint_32 x = 0; x < width; ++x) {
+                dst[x*4+0] = src[x*comps + 0];
+                dst[x*4+1] = src[x*comps + 1 < rowbytes ? x*comps + 1 : 0];
+                dst[x*4+2] = src[x*comps + 2 < rowbytes ? x*comps + 2 : 0];
+                dst[x*4+3] = (comps > 3) ? src[x*comps + 3] : 0xFF;
+            }
+        }
+    }
+
+    for (png_uint_32 y = 0; y < height; ++y) free(rows[y]);
+    free(rows);
+    png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
+
+    *out_pixels = pixels; *out_w = (int)width; *out_h = (int)height; *out_stride = (int)(width * 4u);
+    return 0;
+}
+
+int png_write_gray8(const char *path, const uint8_t *pixels, int w, int h, int stride) {
+    if (!path || !pixels || w <= 0 || h <= 0 || stride <= 0) return -1;
+    FILE *fp = fopen(path, "wb"); if (!fp) return -1;
+    png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png_ptr) { fclose(fp); return -1; }
+    png_infop info_ptr = png_create_info_struct(png_ptr);
+    if (!info_ptr) { png_destroy_write_struct(&png_ptr, NULL); fclose(fp); return -1; }
+    if (setjmp(png_jmpbuf(png_ptr))) { png_destroy_write_struct(&png_ptr, &info_ptr); fclose(fp); return -1; }
+
+    png_init_io(png_ptr, fp);
+    png_set_IHDR(png_ptr, info_ptr, (png_uint_32)w, (png_uint_32)h, 8, PNG_COLOR_TYPE_GRAY, PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png_ptr, info_ptr);
+
+    for (int y = 0; y < h; ++y) {
+        const png_bytep row = (const png_bytep)(pixels + (size_t)y * (size_t)stride);
+        png_write_row(png_ptr, row);
+    }
+    png_write_end(png_ptr, NULL);
+    png_destroy_write_struct(&png_ptr, &info_ptr);
+    fclose(fp);
+    return 0;
+}
+
+int png_write_rgba8(const char *path, const uint8_t *pixels, int w, int h, int stride) {
+    if (!path || !pixels || w <= 0 || h <= 0 || stride <= 0) return -1;
+    FILE *fp = fopen(path, "wb"); if (!fp) return -1;
+    png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png_ptr) { fclose(fp); return -1; }
+    png_infop info_ptr = png_create_info_struct(png_ptr);
+    if (!info_ptr) { png_destroy_write_struct(&png_ptr, NULL); fclose(fp); return -1; }
+    if (setjmp(png_jmpbuf(png_ptr))) { png_destroy_write_struct(&png_ptr, &info_ptr); fclose(fp); return -1; }
+
+    png_init_io(png_ptr, fp);
+    png_set_IHDR(png_ptr, info_ptr, (png_uint_32)w, (png_uint_32)h, 8, PNG_COLOR_TYPE_RGBA, PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png_ptr, info_ptr);
+
+    /* If input stride matches 4*w, we can write rows directly else pack */
+    if (stride == w * 4) {
+        for (int y = 0; y < h; ++y) {
+            const png_bytep row = (const png_bytep)(pixels + (size_t)y * (size_t)stride);
+            png_write_row(png_ptr, row);
+        }
+    } else {
+        uint8_t *row = (uint8_t*)malloc((size_t)w * 4u);
+        if (!row) { png_destroy_write_struct(&png_ptr, &info_ptr); fclose(fp); return -1; }
+        for (int y = 0; y < h; ++y) {
+            const uint8_t *src = pixels + (size_t)y * (size_t)stride;
+            for (int x = 0; x < w; ++x) {
+                row[x*4+0] = src[x*4+0];
+                row[x*4+1] = src[x*4+1];
+                row[x*4+2] = src[x*4+2];
+                row[x*4+3] = src[x*4+3];
+            }
+            png_write_row(png_ptr, (png_bytep)row);
+        }
+        free(row);
+    }
+
+    png_write_end(png_ptr, NULL);
+    png_destroy_write_struct(&png_ptr, &info_ptr);
+    fclose(fp);
+    return 0;
+}
+
 
 /**
  * @brief Adds a specified number of milliseconds to a timespec structure, handling the overflow
@@ -933,61 +1213,67 @@ long calculate_fps_old(const uint16_t target_fps, const bool show_fps) {
 }
 
 
-unsigned long calculate_fps(const uint16_t target_fps, const bool show_fps) {
-    static bool           inited = false;
-    static struct timespec last_ts;          /* last frame timestamp */
-    static struct timespec window_start_ts;  /* start of current 1 s window */
-    static unsigned long   frame_count = 0;
+float calculate_fps(const uint16_t target_fps, const bool show_fps) {
+    /* Simple, performant frame pacing + elapsed time counter */
+    static bool inited = false;
+    static struct timespec start_ts;   /* first call timestamp */
+    static struct timespec last_ts;    /* previous frame timestamp */
+    static struct timespec win_ts;     /* FPS print window start */
+    static unsigned long frame_count = 0;
 
-    struct timespec now_ts;
-    clock_gettime(CLOCK_MONOTONIC, &now_ts);
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
 
     if (!inited) {
-        last_ts = now_ts;
-        window_start_ts = now_ts;
+        start_ts = now;
+        last_ts = now;
+        win_ts = now;
         inited = true;
     }
 
-    long frame_time_us = ts_diff_us(&now_ts, &last_ts);
-    if (frame_time_us < 0) frame_time_us = 0;
+    /* Time since last frame (microseconds) */
+    long frame_us = ts_diff_us(&now, &last_ts);
+    if (frame_us < 0) frame_us = 0;
 
-    /* compute target frame time in usec, guard divide by zero */
-    uint32_t target_frame_time_us = (target_fps > 0) ? (1000000u / target_fps) : 0u;
+    /* Target frame time (microseconds), if fps > 0 */
+    const uint32_t target_us = (target_fps > 0) ? (1000000u / target_fps) : 0u;
 
-    /* sleep to match target fps */
-    long sleep_time_us = 0;
-    if (target_frame_time_us > 0 && frame_time_us < (long)target_frame_time_us) {
-        sleep_time_us = (long)target_frame_time_us - frame_time_us;
-        if (sleep_time_us > 10 && sleep_time_us < 1000000L) {
-            usleep((useconds_t)sleep_time_us);
-            /* refresh timestamps so next frame delta starts after sleep */
-            clock_gettime(CLOCK_MONOTONIC, &now_ts);
-            frame_time_us = ts_diff_us(&now_ts, &last_ts); /* now includes sleep */
+    /* Sleep to meet the target frame time (if applicable) */
+    long slept_us = 0;
+    if (target_us > 0 && frame_us < (long)target_us) {
+        slept_us = (long)target_us - frame_us;
+        if (slept_us > 10 && slept_us < 1000000L) {
+            usleep((useconds_t)slept_us);
+            clock_gettime(CLOCK_MONOTONIC, &now); /* include sleep in the frame time */
         }
     }
 
+    /* Advance frame counters after pacing */
     frame_count++;
-    last_ts = now_ts;
+    last_ts = now;
 
-    /* once per second, print and reset window, no internal loops */
-    long window_us = ts_diff_us(&now_ts, &window_start_ts);
-    if (window_us >= 1000000L) {
-        if (show_fps) {
-            double percent = 100.0;
-            if (target_frame_time_us > 0 && sleep_time_us > 0) {
-                /* percent cpu used this frame based on sleep ratio, same intent as original */
-                percent = 100.0 - ((double)sleep_time_us / (double)target_frame_time_us) * 100.0;
-                if (percent < 0.0) percent = 0.0;
-                if (percent > 100.0) percent = 100.0;
+    /* Optional once-per-second FPS print */
+    if (show_fps) {
+        long win_us = ts_diff_us(&now, &win_ts);
+        if (win_us >= 1000000L) {
+            /* Estimate CPU percent as time not slept vs target time */
+            double cpu = 100.0;
+            if (target_us > 0) {
+                double used_us = (double)target_us - (double)slept_us;
+                if (used_us < 0.0) used_us = 0.0;
+                cpu = (used_us / (double)target_us) * 100.0;
+                if (cpu > 100.0) cpu = 100.0;
             }
-            printf("[%.1f%%] CPU, FPS: %lu\n", percent, frame_count);
+            printf("[%.1f%%] CPU, FPS: %lu\n", cpu, frame_count);
+            win_ts = now;
+            frame_count = 0;
         }
-        window_start_ts = now_ts;  /* start a new one second window */
-        frame_count = 0;
     }
 
-
-    return frame_count;
+    /* Return precise elapsed seconds since first call */
+    long elapsed_us = ts_diff_us(&now, &start_ts);
+    if (elapsed_us < 0) elapsed_us = 0;
+    return (float)((double)elapsed_us / 1000000.0);
 }
 
 

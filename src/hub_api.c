@@ -14,7 +14,7 @@ extern void scene_start(scene_info *scene);
 extern void hub75_request_shutdown(scene_info *scene);
 extern void hub75_wait_shutdown(scene_info *scene);
 //extern void map_byte_image_to_bcm(scene_info *scene, uint8_t *image);
-extern unsigned long calculate_fps(uint16_t target_fps, bool show_fps);
+extern float calculate_fps(uint16_t target_fps, bool show_fps);
 
 /* Drawing helpers */
 extern void hub_pixel(scene_info *scene, int x, int y, RGB pixel);
