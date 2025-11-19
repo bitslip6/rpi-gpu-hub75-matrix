@@ -61,6 +61,66 @@ void update_bcm_signal_64_rgb(
 );
 
 
+void interpolate_rgb(RGB* result, const RGB* start, const RGB* end, const Normal ratio);
+void composite_rgb(RGB* result, const RGBA* src, const RGBA* dst);
+void composite_rgba(RGBA* result, const RGBA* src, const RGBA* dst);
+
+
+static inline uint8_t u8_mul_div255(uint16_t x) {
+    // (x + 128) * 257 >> 16 is a common fast approximation.
+    return (uint8_t)((x + 128) * 257u >> 16);
+}
+
+// composite: out = src OVER dst, both straight RGBA in, straight RGBA out
+// internally premultiplies, does Porter-Duff over, then un-premultiplies.
+static inline void composite_rgba_over(RGBA *out, const RGBA *src, const RGBA *dst) {
+    const uint8_t as = src->a;
+    const uint8_t ad = dst->a;
+    const uint8_t inv_as = 255u - as;
+
+    // premultiply
+    const uint8_t sr_p = u8_mul_div255((uint16_t)src->r * as);
+    const uint8_t sg_p = u8_mul_div255((uint16_t)src->g * as);
+    const uint8_t sb_p = u8_mul_div255((uint16_t)src->b * as);
+
+    const uint8_t dr_p = u8_mul_div255((uint16_t)dst->r * ad);
+    const uint8_t dg_p = u8_mul_div255((uint16_t)dst->g * ad);
+    const uint8_t db_p = u8_mul_div255((uint16_t)dst->b * ad);
+
+    // over in premultiplied space: C = Cs + Cd * (1 - As), A = As + Ad * (1 - As)
+    const uint8_t out_a = (uint8_t)(as + u8_mul_div255((uint16_t)ad * inv_as));
+
+    const uint8_t out_r_p = (uint8_t)(sr_p + u8_mul_div255((uint16_t)dr_p * inv_as));
+    const uint8_t out_g_p = (uint8_t)(sg_p + u8_mul_div255((uint16_t)dg_p * inv_as));
+    const uint8_t out_b_p = (uint8_t)(sb_p + u8_mul_div255((uint16_t)db_p * inv_as));
+
+    // un-premultiply, guarding out_a==0
+    if (out_a) {
+        // scale = 255 / out_a
+        // out_rgb = round((out_p * 255) / out_a)
+        const uint16_t scale = (uint16_t)((255u << 8) / out_a); // 8-bit fixed point
+        out->r = (uint8_t)((out_r_p * scale + 128) >> 8);
+        out->g = (uint8_t)((out_g_p * scale + 128) >> 8);
+        out->b = (uint8_t)((out_b_p * scale + 128) >> 8);
+    } else {
+        out->r = out->g = out->b = 0;
+    }
+    out->a = out_a;
+}
+
+
+/* Optimized rectangle compositors (straight alpha over) */
+void blit_composite_rgba_over_rgba(uint8_t * __restrict__ dst,
+                                   const vec2u dst_dim,
+                                   const vec4u dst_quad,
+                                   const uint8_t * __restrict__ src,
+                                   const vec2u src_dim,
+                                   const vec4u src_quad);
+ 
+
+void blit_composite_rgb_over_rgb(uint8_t * __restrict__ dst, int dst_stride,
+                                 const uint8_t * __restrict__ src, int src_stride,
+                                 int width, int height, uint8_t global_alpha);
 
 /**
  * @brief this function takes the image data and maps it to the bcm signal.
@@ -216,6 +276,20 @@ void reinhard_tone_mapper(const RGB *__restrict__ in, RGB *__restrict__ out);
  */
 void copy_tone_mapperF(const RGBF *__restrict__ in, RGBF *__restrict__ out, const float level);
 
+/**
+ * @brief Sample a tightly-packed 8-bit grayscale image at floating-point coordinates
+ * using bilinear filtering. Pixel centers are at integer+0.5 in input space.
+ * Coordinates are clamped to the valid [0..width-1] x [0..height-1] range.
+ *
+ * @param pixels  Pointer to grayscale buffer (stride == width)
+ * @param width   Image width in pixels
+ * @param height  Image height in pixels
+ * @param fx      X coordinate in pixel space
+ * @param fy      Y coordinate in pixel space
+ * @return uint8_t Bilinearly filtered sample (0..255)
+ */
+uint8_t sdf_sample_gray8_bilinear_buf(const uint8_t *pixels, int width, int height, float fx, float fy);
+
 
 /**
  * @brief create a lookup table for the pwm values for each pixel value
@@ -321,6 +395,16 @@ float gradient_vert(uint16_t p1, uint16_t p2, uint16_t p3, uint16_t p4, float r0
 float gradient_min(uint16_t p1, uint16_t p2, uint16_t p3, uint16_t p4, float r0, float r1);
 float gradient_max(uint16_t p1, uint16_t p2, uint16_t p3, uint16_t p4, float r0, float r1);
 float gradient_quad(uint16_t p1, uint16_t p2, uint16_t p3, uint16_t p4, float r0, float r1);
+
+uint8_t sample_gray8_bilinear_buf(const uint8_t *__restrict__ pixels,
+                                             int width, int height,
+                                             float fx, float fy);
+/**
+ * Stride-aware variant of gray8 bilinear sampling. Rows are separated by 'stride' bytes.
+ * DEBUG
+ */
+uint8_t sdf_sample_gray8_bilinear_stride(const uint8_t *pixels, int width, int height, int stride, float fx, float fy);
+ 
 
 #endif
 

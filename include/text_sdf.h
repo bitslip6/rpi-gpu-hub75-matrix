@@ -46,7 +46,6 @@ extern "C" {
 typedef struct sdf_glyph_t {
     uint8_t width;              /* glyph bitmap width in pixels */
     uint8_t height;             /* glyph bitmap height in pixels */
-    uint8_t stride;             /* bytes per row in pixels buffer */
 
     float bearing_x;        /* left-side bearing (pixels) */
     float bearing_y;        /* top bearing relative to baseline (pixels, +up) */
@@ -125,11 +124,22 @@ static inline float sdf_font_get_line_height(const sdf_font_t *font) { return fo
 
 typedef struct sdf_effect_t {
     /* Effect placeholders (V2) */
-    float glow_radius;    /* px */
-    float outline_width;  /* px */
-    float weight_grow;    /* px; stroke grow/shrink */
-    float shadow_dx, shadow_dy; /* px offset */
+    RGBA  glow_color;     // the glow color
+    Normal glow_radius;    // px 
+    RGBA  outline_color;  // outline color
+    Normal outline_smooth;  // outline color
+    Normal outline_width;  // px 
+    float weight;         // 1.0 = normal; >1.0 bold (grow), <1.0 thin (shrink) 
 } sdf_effect_t;
+
+/* Feature macro for conditional compilation in C sources */
+#define SDF_HAS_OUTLINE_COLOR 1
+
+/* Text orientation: horizontal (default) or vertical stack */
+typedef enum sdf_orientation_t {
+    SDF_ORIENT_HORIZONTAL = 0,
+    SDF_ORIENT_VERTICAL   = 1
+} sdf_orientation_t;
 
 /* Vertical alignment options for text placement */
 typedef enum sdf_valign_t {
@@ -152,14 +162,18 @@ typedef struct sdf_text_t {
     size_t      text_len; /* cached byte length (excludes NUL) */
 
     /* Transform and motion */
-    float x, y;           /* top-left or baseline origin (dependent on renderer) */
+    float x, y;           /* current position (top-left or baseline origin, dependent on renderer) */
+    float x0, y0;         /* base position at t=0 for absolute-time animation */
     float dir_x, dir_y;   /* normalized direction vector for scrolling */
     float speed;          /* pixels per second (applied along dir) */
     float angle;          /* radians, rotation about (x,y) (optional v1) */
     float size_px;        /* desired line height in pixels; 0 => use current font size */
 
+    float softness;       // softness of the glyph edges
+
+
     /* Appearance */
-    RGB color;      /* color */
+    RGBA color;      /* color */
     uint8_t alpha;        /* overall alpha (0..255) */
 
     /* Layout */
@@ -168,11 +182,11 @@ typedef struct sdf_text_t {
     bool  wrap;           /* enable wrapping (future) */
 
     /* Cached shaping (simple v1 cache) */
-    uint16_t *glyph_indices; /* ASCII codepoints or glyph ids (v1 uses ASCII) */
-    float    *advances;      /* per-glyph advances (pixels) */
-    int      *ofs_x;         /* per-glyph x offset from baseline origin (pixels, integer placement) */
-    int      *ofs_y;         /* per-glyph y offset from baseline origin (pixels, integer placement) */
-    size_t    glyph_count;   /* number of shaped glyphs */
+    uint16_t *_glyph_indices; /* ASCII codepoints or glyph ids (v1 uses ASCII) */
+    float    *_advances;      /* per-glyph advances (pixels) */
+    int      *_ofs_x;         /* per-glyph x offset from baseline origin (pixels, integer placement) */
+    int      *_ofs_y;         /* per-glyph y offset from baseline origin (pixels, integer placement) */
+    size_t    _glyph_count;   /* number of shaped glyphs */
     bool      shape_dirty;   /* recompute layout cache when true */
 
     sdf_effect_t effects;
@@ -182,6 +196,11 @@ typedef struct sdf_text_t {
 
     /* Vertical alignment mode */
     sdf_valign_t valign;
+
+    /* Orientation */
+    sdf_orientation_t orient;
+
+    vec2u dimensions;
 } sdf_text_t;
 
 
@@ -194,7 +213,7 @@ void sdf_text_set_position(sdf_text_t *t, float x, float y);
 void sdf_text_set_direction(sdf_text_t *t, float dx, float dy);
 void sdf_text_set_speed(sdf_text_t *t, float speed);
 void sdf_text_set_size_px(sdf_text_t *t, float size_px);
-void sdf_text_set_color(sdf_text_t *t, RGB color);
+void sdf_text_set_color(sdf_text_t *t, RGBA color);
 void sdf_text_set_alpha(sdf_text_t *t, uint8_t a);
 void sdf_text_set_tracking(sdf_text_t *t, float tracking);
 void sdf_text_set_kerning(sdf_text_t *t, bool enable);
@@ -202,14 +221,16 @@ void sdf_text_set_wrap(sdf_text_t *t, bool enable);
 void sdf_text_set_angle(sdf_text_t *t, float angle);
 void sdf_text_set_text(sdf_text_t *t, const char *text);
 void sdf_text_set_valign(sdf_text_t *t, sdf_valign_t valign);
+void sdf_text_set_orientation(sdf_text_t *t, sdf_orientation_t orient);
 
 /* Force a layout/metrics refresh after batching attribute changes.
  * This recomputes any internal cached data (font scaling, shaping arrays)
  * so the text object is consistent and ready to render. */
 void sdf_text_update(sdf_text_t *t);
 
-/* Render entry point (implemented in later tasks). For now, it is a stub. */
-void sdf_text_render(sdf_text_t *t, uint8_t *dst, int w, int h, int stride, bool rgba, float time_sec);
+/* Render entry point. time_sec is an ABSOLUTE timestamp (seconds since animation start)
+ * used to position scrolling text deterministically: pos(t) = (x0,y0) + dir*speed*t. */
+void sdf_text_render(sdf_text_t *t, uint8_t *dst, int w, int h, int stride, float time_sec);
 
 /* Layout helpers */
 typedef struct sdf_line_extents_t {
@@ -220,6 +241,13 @@ typedef struct sdf_line_extents_t {
 
 /* Compute line extents for the current text (ASCII v1). Empty/missing -> zeros. */
 sdf_line_extents_t sdf_text_compute_line_extents(const sdf_text_t *t);
+
+
+/* Measure the rendered size of the current text (in pixels).
+ * - Horizontal: width = sum of advances; height = line extents height
+ * - Vertical:   height = sum of advances; width = max glyph width
+ * Ensures pending size/shape updates are applied before measuring. */
+vec2u sdf_text_measure_px(sdf_text_t *t);
 
 /* Baseline helpers (y coordinates in pixels) */
 /*
@@ -232,16 +260,16 @@ float sdf_text_baseline_top(float canvas_top_y, sdf_line_extents_t e);
 float sdf_text_baseline_center(float canvas_top_y, float canvas_height, sdf_line_extents_t e);
 
 /* Scrolling and wrap helpers (3.5) */
-/* Update position by dir*speed*dt (dt in seconds). */
-void sdf_text_animate(sdf_text_t *t, float dt);
+/* Set position for absolute time: pos(t) = (x0,y0) + dir*speed*time_sec. */
+void sdf_text_animate(sdf_text_t *t, float time_sec);
 
 /* Horizontal wrap helpers using total text advance width. */
-void sdf_text_wrap_left_to_right(sdf_text_t *t, float left_x, float right_x);
-void sdf_text_wrap_right_to_left(sdf_text_t *t, float left_x, float right_x);
+void _sdf_text_wrap_left_to_right(sdf_text_t *t, float left_x, float right_x);
+void _sdf_text_wrap_right_to_left(sdf_text_t *t, float left_x, float right_x);
 
 /* Vertical wrap helpers using line extents (top/bottom). */
-void sdf_text_wrap_top_to_bottom(sdf_text_t *t, float top_y, float bottom_y);
-void sdf_text_wrap_bottom_to_top(sdf_text_t *t, float top_y, float bottom_y);
+void _sdf_text_wrap_top_to_bottom(sdf_text_t *t, float top_y, float bottom_y);
+void _sdf_text_wrap_bottom_to_top(sdf_text_t *t, float top_y, float bottom_y);
 
 /* Kerning support (optional kerning.csv) */
 typedef struct sdf_kern_pair_t {

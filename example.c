@@ -1,4 +1,4 @@
-/**
+/*
  * rpi-gpu-hub75 Example Application
  * ---------------------------------
  * This program demonstrates the minimal steps needed to:
@@ -39,9 +39,9 @@
 
 #include "hub75gpu.h"
 #include "util.h"
+#include "pixels.h"
 #include "text_sdf.h"
 
-/* PNG writing now provided via util.c: write_png_file(string_t*, hub75_display_t*) */
 
 // --------------- Utility Helpers (example only) -----------------
 
@@ -68,122 +68,53 @@ static bool has_extension(const char *filename, const char *extension) {
 
 
 
-static void *render_3d(void *arg) {
-
+/* ---------------- Text SDF Demo (Task 5.1) ---------------- */
+static void *render_text_sdf(void *arg) {
     hub75_display_t *scene = (hub75_display_t*)arg;
-    hub75gpu_t api = hub75_api(scene);
-    scene->stride = 3;
+    printf("[TEXT] SDF text scroller demo (Ctrl+C to exit)\n");
 
-    // camera setup 
-    camera_t *cam = api.geo_camera();
-
-    // create a cube object
-    //object_t    *cube       = api.geo_torus(24, 10);  // Using sphere for better appearance on small displays
-    object_t    *cube       = api.geo_sphere(2);  // Using sphere for better appearance on small displays
-    transform_t *cube_xform = api.geo_transform();
-    cube_xform->scale       = (vec3){1.25f, 1.25f, 1.25f};  // Scale up the cube 
-    cube->draw_mode = DRAW_FILLED;
-    cube->cull_backface = true;
-    cube->shadow_enabled = true;
-    cube->specular_strength = 0.9f;
-    /* Gouraud specular: use a moderate shininess so highlights appear on low-tessellation meshes */
-    cube->specular_shininess = 24.0f;
-
-    object_t    *plane       = api.geo_plane(12, 12, true);
-    plane->draw_mode = DRAW_FILLED;
-    plane->cull_backface = false;
-    plane->shadow_enabled = true;
-    transform_t *plane_xform = api.geo_transform();
-    plane_xform->position.y  = 1.25f;  // Move the plane down
-    plane_xform->scale       = (vec3){4.0f, 1.0f, 4.0f};  // Scale up the plane
-
-    // set cube edge color to cyan
-    for (int i=0; i<cube->edge_colors->length; ++i) {
-        cube->edge_colors->list[i] = (RGB){0, 254, 254};
-    }
-    // set plane edge color to indigo
-    for (int i=0; i<plane->edge_colors->length; ++i) {
-        plane->edge_colors->list[i] = (RGB){130, 130, 75};
+    // Configure font: load and scale to 64px line height 
+    sdf_font_t *font = sdf_font_load_scaled("assets/robots", 64.0f);
+    if (!font) {
+        fprintf(stderr, "[TEXT] Failed to load SDF font from 'assets/robots' (expect metrics.csv + PNGs).\n");
+        scene->do_render = false;
+        return NULL;
     }
 
-
-
-    // build an object scene and use convenience wrappers (no need to pass os repeatedly)
-    scene3d_t *os = api.scene3d_new(1);
-    api.scene3d_set_current(os);
-    api.scene3d_set_ambient(COLOR_DARK_GREY);
-    uint16_t light1_id = api.scene3d_add_directional((vec3){-0.5f, 1.0f, 3.2f}, COLOR_WHITE, 1.0f, true);
-    uint16_t plane_id = api.scene3d_add_object(plane, plane_xform);
-    uint16_t cube_id = api.scene3d_add_object(cube, cube_xform);
-
-    light_t *light1 = api.scene3d_get_directional(light1_id);
-    light1->casts_shadows = false;  // ensure this light actually casts shadows
-
-    uint16_t frame = 0;
-
-    SimpleGradient my_gradient;
-    my_gradient.direction = GRADIENT_VERTICAL;
-    my_gradient.easing = EASE_LINEAR;
-    my_gradient.start_color = (RGB){0, 0, 128};// COLOR_NAVY;
-    my_gradient.end_color = (RGB){255, 215, 0};//COLOR_GOLD;
-
-    string_t *outfile = string_new("out.png", 256);
-
-    while(scene->do_render) {
-
-        frame++;
-        api.frame_begin(); 
-        api.clear();
-        float t = (float)frame * 0.016f;
-
-        // rotate cube and move it a bit 
-        cube_xform->rotation.x = t * 0.9f;
-        cube_xform->rotation.y = t * 0.14f;
-
-        // orbit camera around origin while looking at cube - closer distance with wider FOV
-        //cam->position.x = 5.0f * cosf(t * 0.3f);  // Reduced distance with wider FOV for better fit 
-        //cam->position.z = 5.0f * sinf(t * 0.3f);  // Reduced distance with wider FOV for better fit 
-        //cam->target     = cube_xform->position;
-        
-
-        // Animate a directional light by orbiting its position and pointing at the object
-        //vec3 pos = { 10.0f * cosf(t * 0.5f), 3.0f, 10.0f * sinf(t * 0.5f) };
-        vec3 pos = { 1.0f, -2.0f, 10.0f * sinf(t * 0.5f) };
-        vec3 look = { cube_xform->position.x, cube_xform->position.y, cube_xform->position.z };
-        api.scene3d_set_directional_pose(light1_id, pos, look);
-
-        // Render using scene-owned lighting (pass NULL)
-        api.render_scene3d(cam, os, NULL);
-
-        //api.fill_gradient(10, 10, 120, &my_gradient, 10, 10, 120, 120) ;
-
-        if (frame == 10) {
-            printf("create frame\n");
-            write_png_file(outfile, scene);
-        }
-        api.frame_end();
-
-        // FPS calculation
-        calculate_fps(scene->fps, scene->show_fps);
-    }
-
-    /* Optional: dump a frame capture (requires libpng)
-    #ifdef HAVE_LIBPNG
-    write_png_file("out2.png", scene);
-    #endif
-    */
+    // Create text object
+    const char msg[] = "Hello, HUB75 SDF Scroller!  ";
+    sdf_text_t *txt = sdf_text_create(font, msg, scene->width, scene->height);
+    txt->size_px = 128.0f;
+    txt->color = (RGBA){0, 255, 128, 255};
+    txt->alpha = 200;
+    txt->y = 90.0f;
+    txt->x = 100.0f;
+    txt->dir_x = -1.0f;
+    txt->dir_y = 0.0f;
+    txt->speed = 255.0f;
+    txt->softness = 0.08f;
+    txt->effects.weight         = 1.2f;
+    txt->effects.glow_color     = (RGBA){192, 232, 245, 255};
+    txt->effects.glow_radius    = Normal_clamp(1.0f);
+    txt->effects.outline_width  = Normal_clamp(0.1f); // set >0 to enable outline
+    txt->effects.outline_color  = (RGBA){0, 64, 128, 255};
+    txt->effects.outline_smooth = Normal_clamp(0.1f);
     
-    /* cleanup */
-    api.scene3d_clear_current();
-    api_object_scene_free(os);
-
-    return NULL;
-}
+    sdf_text_update(txt);
 
 
-static void *render_cpu(void *arg) {
-    hub75_display_t *scene = (hub75_display_t*)arg;
-    printf("[CPU] CPU Single moving triangle (Ctrl+C to exit)\n");
+    
+    /* Render loop */
+    hub75gpu_t api = hub75_api(scene);
+    //const bool rgba = (scene->stride == 4);
+    //const int row_stride = (int)scene->width * (int)scene->stride;
+    //float dt = 0.0f;
+    const bool dump_once = true;//(dump_env && *dump_env && dump_env[0] != '0');
+    string_t *dump_path = string_new("text_debug.png", 128);
+    uint32_t frame = 0;
+
+    //float last_time = 0.0f;
+    float this_time = 0.0f;
 
     // Random velocities (pixels/frame), small magnitudes
     float vx[3], vy[3];
@@ -204,16 +135,21 @@ static void *render_cpu(void *arg) {
 
     // Triangle base color
     // RGB color = { 255, 160, 32 };
-    RGB color1 = { 32, 255, 160 };
-    // RGB color2 = { 160, 232, 32 };
+    RGBA color1 = { 32, 255, 160, 255 };
+ 
+    size_t text_mem = (size_t)(ceilf(txt->dimensions.x) * ceilf(txt->dimensions.y));
 
-    hub75gpu_t api = hub75_api(scene);
+    printf("Allocating text memory: %zu bytes\n", text_mem);
+    uint8_t *tmem = (uint8_t*)calloc(text_mem, sizeof(RGBA));
 
-    uint32_t frame = 0;
+    this_time = 1.0f;
+    printf("text rendered to: [%dx%d]", txt->dimensions.x, txt->dimensions.y);
+
+    sdf_text_render(txt, tmem, (int)scene->width, (int)scene->height, scene->stride, this_time);
     while (scene->do_render) {
         frame++;
-        api.frame_begin(); 
-        api.clear();
+        api.frame_begin();
+        api.clear(); /* black background */
 
         for (int i = 0; i < 3; ++i) {
             tri.points[i].x += vx[i];
@@ -228,89 +164,32 @@ static void *render_cpu(void *arg) {
         color1.g = (uint8_t)(128 + 127 * sinf((float)frame * 0.03f));
         color1.b = (uint8_t)(128 + 127 * sinf((float)frame * 0.04f));
 
-        /*
-        color2.r = (uint8_t)(128 + 127 * sinf((float)frame * 0.04f + 2.0f));
-        color2.g = (uint8_t)(128 + 127 * sinf((float)frame * 0.02f + 2.0f));
-        color2.b = (uint8_t)(128 + 127 * sinf((float)frame * 0.03f + 2.0f));
-        */
 
         api.poly(&tri, color1);
-        api.frame_end();
 
-        // FPS calculation
-        calculate_fps(scene->fps, scene->show_fps);
-    }
+	    //composite_rgba((RGBA*)scene->image, (RGBA*)tmem, (RGBA*)scene->image);
+        //blit_composite_rgba_over_rgba((uint8_t*)scene->image, scene->stride * scene->width,
+        //blit_composite_rgba_over_rgba((uint8_t*)scene->image, (uint8_t*)tmem, scene->stride * (int)ceilf(txt->dimensions.x), (RGBA){255,255,255,255});
 
-    //printf(" * CPU render thread calling shutdown ...\n");
-    hub75_display_request_shutdown(scene);
-    printf(" ## CPU render thread exiting...\n");
-    return NULL;
-}
-// ...existing code...
+        vec2u ddim = {scene->width, scene->height};
+        vec4u dspec = {0, 10, scene->width, 138};
+        vec4u sspec = {0, 0, MIN(txt->dimensions.x, scene->width), txt->dimensions.y};
 
-/* ---------------- Text SDF Demo (Task 5.1) ---------------- */
-static void *render_text_sdf(void *arg) {
-    hub75_display_t *scene = (hub75_display_t*)arg;
-    printf("[TEXT] SDF text scroller demo (Ctrl+C to exit)\n");
+    //sdf_text_render(txt, scene->image, (int)scene->width, (int)scene->height, scene->stride, this_time);
+    // compositer does not seem to handle alpha blending correctly, RGB vs RGBA
+        blit_composite_rgba_over_rgba(
+            scene->image, ddim,
+            dspec,
+            (uint8_t*)tmem, txt->dimensions, (vec4u){0, 0, (int)ceilf(txt->dimensions.x), (int)ceilf(txt->dimensions.y)});
+ 
 
-    // Ensure 24bpp RGB unless caller overrides to RGBA elsewhere
-    //if (scene->stride != 3 && scene->stride != 4) scene->stride = 3;
-
-    /* Configure font: load and scale to 64px line height */
-    const char *font_dir = getenv("TEXT_FONT_DIR");
-    if (!font_dir || !*font_dir) font_dir = "assets/roboto"; /* default path */
-    float target_h = 64.0f;
-    sdf_font_t *font = sdf_font_load_scaled(font_dir, target_h);
-    if (!font) {
-        fprintf(stderr, "[TEXT] Failed to load SDF font from '%s' (expect metrics.csv + PNGs).\n", font_dir);
-        scene->do_render = false;
-        return NULL;
-    }
-
-    /* Create text object */
-    const char *msg = getenv("TEXT_MESSAGE");
-    if (!msg || !*msg) msg = "Hello, HUB75 SDF Scroller!  ";
-    sdf_text_t *txt = sdf_text_create(font, msg);
-    txt->size_px = 24.0f;
-    txt->color = (RGB){0, 255, 128};
-    txt->alpha = 128;
-    txt->tracking = 3.0f;
-    txt->wrap = true;
-    txt->valign = SDF_VALIGN_BOTTOM;
-    txt->y = 100.0f;
-    txt->dir_x = -1.0f;
-    txt->speed = 255.0f;
-    sdf_text_update(txt);
-
-
-    
-    /* Render loop */
-    hub75gpu_t api = hub75_api(scene);
-    const bool rgba = (scene->stride == 4);
-    const int row_stride = (int)scene->width * (int)scene->stride;
-    float dt = 0.0f;
-    const bool dump_once = true;//(dump_env && *dump_env && dump_env[0] != '0');
-    string_t *dump_path = string_new("text_debug.png", 128);
-    uint32_t frame = 0;
-
-    float last_time = 0.0f;
-    float this_time = 0.0f;
-    while (scene->do_render) {
-        frame++;
-        api.frame_begin();
-        api.clear(); /* black background */
-
-        sdf_text_render(txt, scene->image, (int)scene->width, (int)scene->height, row_stride, rgba, dt);
-
-        if (dump_once && frame == 30) {
+        if (dump_once && frame == 60) {
             write_png_file(dump_path, scene);
             fprintf(stderr, "[TEXT] Wrote debug frame to %s\n", dump_path->str);
         }
 
         api.frame_end();
         this_time = calculate_fps(scene->fps, scene->show_fps);
-        dt = this_time - last_time;
-        last_time = this_time;
     }
 
     /* Cleanup */
@@ -329,6 +208,7 @@ int main(int argc, char **argv) {
     // Parse command line into a new scene. Use -h to see available options.
     hub75_display_t *scene = hub75_display_parse_args(argc, argv);
 
+    //scene->stride = 4;
     // Validate configuration, allocate internal buffers, etc.
     hub75_display_start(scene);
 

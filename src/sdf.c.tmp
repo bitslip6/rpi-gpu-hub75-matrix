@@ -267,24 +267,9 @@ static inline float glyph_sample_bilinear(const glyph_sdf *g, float fx, float fy
     if (fx < 0.0f || fy < 0.0f || fx > (float)(g->width-1) || fy > (float)(g->height-1)) {
         return 0.0f;
     }
-    int x0 = (int)floorf(fx);
-    int y0 = (int)floorf(fy);
-    int x1 = x0 + 1; if (x1 >= g->width)  x1 = g->width - 1;
-    int y1 = y0 + 1; if (y1 >= g->height) y1 = g->height - 1;
-
-    float tx = fx - (float)x0;
-    float ty = fy - (float)y0;
-
-    uint8_t s00 = g->sdf[(size_t)y0 * (size_t)g->width + (size_t)x0];
-    uint8_t s10 = g->sdf[(size_t)y0 * (size_t)g->width + (size_t)x1];
-    uint8_t s01 = g->sdf[(size_t)y1 * (size_t)g->width + (size_t)x0];
-    uint8_t s11 = g->sdf[(size_t)y1 * (size_t)g->width + (size_t)x1];
-
-    float a = (float)s00 * (1.0f - tx) + (float)s10 * tx;
-    float b = (float)s01 * (1.0f - tx) + (float)s11 * tx;
-    float s = a * (1.0f - ty) + b * ty;
-
-    return s * (1.0f / 255.0f);
+    const scale = 1.0f / 255.0f;
+    uint8_t v = sample_grey8_bilinear_buf(g->sdf, g->width, g->height, fx, fy) * scale;
+    return v * scale;
 }
 
 /* Map normalized SDF to coverage in [0,1].

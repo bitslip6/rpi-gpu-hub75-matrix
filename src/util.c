@@ -290,7 +290,7 @@ hub75_display_t *hub75_display_new() {
     scene->panel_width = PANEL_WIDTH;
     scene->num_chains = 0;
     scene->num_ports = 0;
-    scene->stride = 3;
+    scene->stride = 4;
     scene->gamma = GAMMA;
     scene->red_gamma = RED_GAMMA_SCALE;
     scene->green_gamma = GREEN_GAMMA_SCALE;
@@ -863,31 +863,34 @@ int64_t ts_diff_us(const struct timespec *a, const struct timespec *b) {
          + (int64_t)(a->tv_nsec - b->tv_nsec) / 1000LL;
 }
 
-void write_png_file(string_t *filename, hub75_display_t *d) {
-    if (!filename || !filename->str || !d || !d->image) return;
-    printf("open PNG file for writing: %s\n", filename->str);
-    FILE *fp = fopen(filename->str, "wb");
-    if (!fp) { printf("no fp1\n");return; }
+int write_png_image(const char *path,
+                    const uint8_t *pixels,
+                    int width,
+                    int height,
+                    int stride) {
+    if (!path || !pixels || width <= 0 || height <= 0 || (stride != 3 && stride != 4)) return -1;
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return -1;
 
     png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
-    if (!png_ptr) { fclose(fp); return; }
+    if (!png_ptr) { fclose(fp); return -1; }
     png_infop info_ptr = png_create_info_struct(png_ptr);
-    if (!info_ptr) { png_destroy_write_struct(&png_ptr, NULL); fclose(fp); return; }
+    if (!info_ptr) { png_destroy_write_struct(&png_ptr, NULL); fclose(fp); return -1; }
     if (setjmp(png_jmpbuf(png_ptr))) {
-        png_destroy_write_struct(&png_ptr, &info_ptr); fclose(fp); return;
+        png_destroy_write_struct(&png_ptr, &info_ptr);
+        fclose(fp);
+        return -1;
     }
 
     png_init_io(png_ptr, fp);
 
-    /* Choose PNG color type based on framebuffer stride (3=RGB888, 4=RGBA8888) */
-    int color_type = (d->stride >= 4) ? PNG_COLOR_TYPE_RGBA : PNG_COLOR_TYPE_RGB;
-    int out_bpp = (color_type == PNG_COLOR_TYPE_RGBA) ? 4 : 3;
+    uint8_t color_type = (stride == 4) ? PNG_COLOR_TYPE_RGBA : PNG_COLOR_TYPE_RGB;
+    uint8_t out_bpp = (color_type == PNG_COLOR_TYPE_RGBA) ? 4 : 3;
 
-    /* Always write 8-bit per channel PNG regardless of panel bit depth */
     png_set_IHDR(png_ptr, info_ptr,
-                 (png_uint_32)d->width,
-                 (png_uint_32)d->height,
-                 8, /* bit depth */
+                 (png_uint_32)width,
+                 (png_uint_32)height,
+                 8,
                  color_type,
                  PNG_INTERLACE_NONE,
                  PNG_COMPRESSION_TYPE_DEFAULT,
@@ -895,24 +898,26 @@ void write_png_file(string_t *filename, hub75_display_t *d) {
 
     png_write_info(png_ptr, info_ptr);
 
-    if (d->stride == out_bpp) {
-        /* Direct rows */
-        for (uint16_t y = 0; y < d->height; ++y) {
-            png_bytep row = (png_bytep)(d->image + (size_t)y * (size_t)d->width * (size_t)d->stride);
+    if (stride == out_bpp) {
+        for (int y = 0; y < height; ++y) {
+            const png_bytep row = (const png_bytep)(pixels + (size_t)y * (size_t)width * (size_t)stride);
             png_write_row(png_ptr, row);
         }
     } else {
-        /* Pack rows to match requested color_type */
-        png_bytep rowbuf = (png_bytep)malloc((size_t)d->width * (size_t)out_bpp);
-        if (!rowbuf) { png_destroy_write_struct(&png_ptr, &info_ptr); fclose(fp); return; }
-        for (uint16_t y = 0; y < d->height; ++y) {
-            const uint8_t *src = d->image + (size_t)y * (size_t)d->width * (size_t)d->stride;
-            for (uint16_t x = 0; x < d->width; ++x) {
-                rowbuf[(size_t)x*out_bpp + 0] = src[(size_t)x*d->stride + 0];
-                rowbuf[(size_t)x*out_bpp + 1] = src[(size_t)x*d->stride + 1];
-                rowbuf[(size_t)x*out_bpp + 2] = src[(size_t)x*d->stride + 2];
+        png_bytep rowbuf = (png_bytep)malloc((size_t)width * (size_t)out_bpp);
+        if (!rowbuf) {
+            png_destroy_write_struct(&png_ptr, &info_ptr);
+            fclose(fp);
+            return -1;
+        }
+        for (int y = 0; y < height; ++y) {
+            const uint8_t *src = pixels + (size_t)y * (size_t)width * (size_t)stride;
+            for (int x = 0; x < width; ++x) {
+                rowbuf[(size_t)x*out_bpp + 0] = src[(size_t)x*stride + 0];
+                rowbuf[(size_t)x*out_bpp + 1] = src[(size_t)x*stride + 1];
+                rowbuf[(size_t)x*out_bpp + 2] = src[(size_t)x*stride + 2];
                 if (out_bpp == 4) {
-                    rowbuf[(size_t)x*4 + 3] = (d->stride >= 4) ? src[(size_t)x*d->stride + 3] : 255;
+                    rowbuf[(size_t)x*4 + 3] = (stride >= 4) ? src[(size_t)x*stride + 3] : 255;
                 }
             }
             png_write_row(png_ptr, rowbuf);
@@ -923,6 +928,12 @@ void write_png_file(string_t *filename, hub75_display_t *d) {
     png_write_end(png_ptr, NULL);
     png_destroy_write_struct(&png_ptr, &info_ptr);
     fclose(fp);
+    return 0;
+}
+
+void write_png_file(string_t *filename, hub75_display_t *d) {
+    if (!filename || !filename->str || !d || !d->image) return;
+    (void)write_png_image(filename->str, d->image, (int)d->width, (int)d->height, (int)d->stride);
 }
 
 /* ---- Generic PNG helpers ---- */
@@ -1445,7 +1456,7 @@ void usage(__attribute__((unused))int argc, char **argv) {
         "     -r                clock in data on the FALLING edge of the clock (default is rising)\n"
         "     -a <cycles>       latch delay CPU cycles for slow panels. (0 - 1024) (default 0)\n"
         "     -v                display current FPS and Panel refresh Hz\n"
-    "     -K                enable backface culling for filled geometry\n"
+        "     -K                enable backface culling for filled geometry\n"
         "     -O <r:g:b,r:g:b>  panel color correction offset ammount, +-128 for each color, comma delimited\n"
         "                       add or subtract this ammount to each panels rgb channels\n"
         "                       example '-O 0:10:5,0:0:0'  adds 10 to green and 5 to blue on panel type 0\n\n"
@@ -1556,14 +1567,14 @@ void *calibrate_panels(void *arg) {
             scene->red_gamma += 0.01f;
             printf("red_gamma up      = %f\n", (double)scene->red_gamma);
         } 
-         else if (ch == 'n') {
+        else if (ch == 'n') {
             scene->blue_gamma -= 0.01f;
             printf("blue_gamma down   = %f\n", (double)scene->blue_gamma);
         } else if (ch == 'N') {
             scene->blue_gamma += 0.01f;
             printf("blue_gamma up     = %f\n", (double)scene->blue_gamma);
         } 
-         else if (ch == 'b') {
+        else if (ch == 'b') {
             scene->blue_linear -= 0.01f;
             printf("blue_linear down  = %f\n", (double)scene->blue_linear);
         } else if (ch == 'B') {

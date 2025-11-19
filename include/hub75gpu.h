@@ -35,6 +35,27 @@
  * @brief just a float, should be normalized to 0-1
  */
 typedef float Normal;
+typedef float NormalSigned;
+
+#define NormalSAT 1.0f;
+#define NormalZERO 0.0f;
+#define NormalSignedZERO 0.0f;
+#define NormalSignedSAT 1.0f;
+#define NormalSignedNEGSAT -1.0f;
+
+static inline Normal Normal_clamp(float x) {
+    if (x < 0.0f) return 0.0f;
+    if (x > 1.0f) return 1.0f;
+    return (Normal)x;
+}
+
+static inline NormalSigned NormalSigned_clamp(float x) {
+    if (x < -1.0f) return -1.0f;
+    if (x > 1.0f) return 1.0f;
+    return (NormalSigned)x;
+}
+
+
 
 /**
  * @brief pointer to a single 24bpp RGB pixel (3 bytes)
@@ -360,7 +381,7 @@ float calculate_fps(const uint16_t target_fps, const bool show_fps);
 void hub75_display_request_shutdown(struct hub75_display *scene);
 void hub75_display_wait(struct hub75_display *scene);
 
-void draw_polygon_fill(hub75_display_t *scene, Polygonf_t *poly, RGB color);
+void draw_polygon_fill(hub75_display_t *scene, Polygonf_t *poly, RGBA color);
 void gradient_polygon(hub75_display_t *scene, Polygonf_t *poly, SimpleGradient gradient);
 
 /* Easing function implementations */
@@ -442,6 +463,10 @@ typedef struct hub75_api {
 // const hub75_api *hub75_get_api(scene_info *scene);
 
 // poly_winding_t polygon_winding(const Polygonf_t *poly);
+
+typedef struct { int32_t x, y; } vec2u;
+typedef struct { int32_t x, y, z; } vec3u;
+typedef struct { int32_t x, y, z, w; } vec4u;
 
 typedef struct { float x, y; } vec2;
 typedef struct { float x, y, z; } vec3;
@@ -671,7 +696,7 @@ typedef struct {
     void (*pixel_alpha)(int x, int y, RGBA pixel);
     void (*line)(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, RGB c);
     void (*line_aa)(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, RGB c);
-    void (*poly)(Polygonf_t *poly, RGB color1);
+    void (*poly)(Polygonf_t *poly, RGBA color1);
     void (*poly_gradient)(Polygonf_t *poly, SimpleGradient gradient);
     void (*fill_gradient)(int y, int x0, int x1, const SimpleGradient *gradient, 
                             int minx, int miny, int maxx, int maxy);

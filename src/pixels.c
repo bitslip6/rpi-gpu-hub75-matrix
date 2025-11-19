@@ -63,13 +63,287 @@ void *mapper_thread_main(void *arg)
  * 
  */
 __attribute__((hot))
-void interpolate_rgb(RGB* result, const RGB start, const RGB end, const Normal ratio) {
-    result->r = (uint8_t)(start.r + (end.r - start.r) * ratio);
-    result->g = (uint8_t)(start.g + (end.g - start.g) * ratio);
-    result->b = (uint8_t)(start.b + (end.b - start.b) * ratio);
+void interpolate_rgb(RGB* result, const RGB* start, const RGB* end, const Normal ratio) {
+    result->r = (uint8_t)(start->r + (end->r - start->r) * ratio);
+    result->g = (uint8_t)(start->g + (end->g - start->g) * ratio);
+    result->b = (uint8_t)(start->b + (end->b - start->b) * ratio);
 }
 
 
+
+__attribute__((hot))
+void composite_rgb(RGB* result, const RGBA* src, const RGBA* dst) {
+    // Standard straight-alpha "over": out = src*alpha + dst*(1 - alpha)
+    const uint8_t inv_a = 255 - src->a;
+    const Normal bg_percent = Normal_clamp((float)((float)inv_a / 255.0f));
+    const Normal fg_percent = Normal_clamp(1.0f - bg_percent);
+    result->r = (uint8_t)(src->r * fg_percent) + (uint8_t)(dst->r * bg_percent);
+    result->g = (uint8_t)(src->g * fg_percent) + (uint8_t)(dst->g * bg_percent);
+    result->b = (uint8_t)(src->b * fg_percent) + (uint8_t)(dst->b * bg_percent);
+}
+
+
+__attribute__((hot))
+inline void composite_rgba(RGBA* result, const RGBA* src, const RGBA* dst) {
+    // Standard straight-alpha "over": out = src*alpha + dst*(1 - alpha)
+    const uint8_t inv_a = 255 - src->a;
+    const Normal bg_percent = Normal_clamp((float)((float)inv_a / 255.0f));
+    const Normal fg_percent = Normal_clamp(1.0f - bg_percent);
+    result->r = (uint8_t)(src->r * fg_percent) + (uint8_t)(dst->r * bg_percent);
+    result->g = (uint8_t)(src->g * fg_percent) + (uint8_t)(dst->g * bg_percent);
+    result->b = (uint8_t)(src->b * fg_percent) + (uint8_t)(dst->b * bg_percent);
+    result->a = (uint8_t)(src->a * fg_percent) + (uint8_t)(dst->a * bg_percent);
+}
+
+/*
+ * Optimized rectangle compositors (straight alpha over)
+ * This function is bugged. BUG
+ */
+void blit_composite_rgba_over_rgba2(uint8_t * __restrict__ dst,
+                                   const vec2u dst_dim,
+                                   const vec4u dst_quad,
+                                   const uint8_t * __restrict__ src,
+                                   const vec2u src_dim,
+                                   const vec4u src_quad) {
+    if (!dst || !src) {
+        debug("null src or dst pointers in composite region");
+	return;
+    }
+    const int32_t dst_ux = dst_quad.x;
+    const int32_t dst_uy = dst_quad.y;
+    const int32_t dst_lx = dst_quad.z;
+    const int32_t dst_ly = dst_quad.w;
+
+    const int32_t src_ux = src_quad.x;
+    const int32_t src_uy = src_quad.y;
+    const int32_t src_lx = src_quad.z;
+    const int32_t src_ly = src_quad.w;
+
+    if (dst_ly > dst_dim.y || dst_lx > dst_dim.x || src_ly > src_dim.y || src_lx > src_dim.x) {
+        debug("degenerate composite region");
+	return;
+    }
+
+
+    const int32_t dheight = dst_ly - dst_uy;
+    const int32_t dwidth = dst_lx - dst_ux;
+    const int32_t sheight = src_ly - src_uy;
+    const int32_t swidth = src_lx - src_ux;
+
+    const int32_t width = MIN(dwidth, swidth);
+    const int32_t height = MIN(dheight, sheight);
+    printf("blit dwidth: %u, dheight: %u, swidth: %u, sheight: %u\n", dwidth, dheight, swidth, sheight);
+
+    for (int y = 0; y < height; y++) {
+        // d and s are typed to RGBA pointers, so no pointer arithmetic needed for 4-byte pixels
+        RGBA *d = (RGBA *)dst + ((dst_uy +y) * dst_dim.x) + dst_quad.x;
+        RGBA *s = (RGBA *)src + ((src_uy +y) * src_dim.x) + src_quad.x;
+        for (int x = 0; x < width; x++) {
+            d[x] = s[x];
+            //d[x+1] = s[x+1];
+            //d[x+2] = s[x+2];
+            //d[x+3] = s[x+3];
+            //composite_rgba(&d[x], &s[x], &d[x]);
+        }
+    }
+}
+
+/**
+ * @param dst the target buffer
+ * @param dst_dim target buffer dimensions in pixels
+ * @param dst_quad target buffer crop location in pixels
+ * @param src the source buffer
+ * @param src_dim source image dimenstions
+ * @param src_quad source buffer quad - this can be any dimension as
+ * long as src image provides enough image to cover the dst_quad.
+ * @TODO: check that src coveres the dst quad
+ *
+ */
+void blit_composite_rgba_over_rgba(uint8_t * __restrict__ dst,
+                                   const vec2u dst_dim,
+                                   const vec4u dst_quad,
+                                   const uint8_t * __restrict__ src,
+                                   const vec2u src_dim,
+                                   const vec4u src_quad) {
+    if (!dst || !src) {
+        debug("null src or dst pointers in composite region");
+        return;
+    }
+
+    const int32_t dst_ux = dst_quad.x;
+    const int32_t dst_uy = dst_quad.y;
+    const int32_t dst_lx = dst_quad.z;
+    const int32_t dst_ly = dst_quad.w;
+
+    const int32_t src_ux = src_quad.x;
+    const int32_t src_uy = src_quad.y;
+    const int32_t src_lx = src_quad.z;
+    const int32_t src_ly = src_quad.w;
+
+    // basic sanity checks
+    if (dst_ux < 0 || dst_uy < 0 || src_ux < 0 || src_uy < 0) {
+        debug("negative coords in composite region");
+        return;
+    }
+
+    if (dst_ly > (int32_t)dst_dim.y || dst_lx > (int32_t)dst_dim.x ||
+        src_ly > (int32_t)src_dim.y || src_lx > (int32_t)src_dim.x) {
+        debug("degenerate composite region");
+        return;
+    }
+
+    const int32_t dheight = dst_ly - dst_uy;
+    const int32_t dwidth  = dst_lx - dst_ux;
+    const int32_t sheight = src_ly - src_uy;
+    const int32_t swidth  = src_lx - src_ux;
+
+    if (dwidth <= 0 || dheight <= 0 || swidth <= 0 || sheight <= 0) {
+        debug("non-positive composite dimensions");
+        return;
+    }
+
+    // @TODO: if you want to require src to fully cover dst, you can enforce:
+    // if (swidth < dwidth || sheight < dheight) { debug("src quad too small"); return; }
+
+    const int32_t width  = MIN(dwidth,  swidth);
+    const int32_t height = MIN(dheight, sheight);
+
+    printf("blit dwidth: %d, dheight: %d, swidth: %d, sheight: %d, dst: (%dx%d) src (%dx%d)\n",
+           width, height, swidth, sheight, dst_ux, dst_uy, src_ux, src_uy);
+
+    for (int32_t y = 0; y < height; y++) {
+        const int32_t dy = dst_uy + y;
+        const int32_t sy = src_uy + y;
+
+        const uint32_t d_offset = (dy * dst_dim.x) + dst_ux;
+        RGBA *d = (RGBA *)dst + (d_offset);
+        const uint32_t s_offset = (sy * (src_dim.x)) + src_ux;
+        const RGBA *s = (const RGBA *)src + (s_offset);
+
+        for (int32_t x = 0; x < width; x++) {
+            d[x] = s[x];
+            // composite_rgba(&d[x], &s[x], &d[x]);
+        }
+    }
+}
+
+
+/**
+ * @param dst the target buffer
+ * @param dst_dim target buffer dimensions in pixels
+ * @param dst_quad target buffer crop location in pixels
+ * @param src the source buffer
+ * @param src_dim source image dimenstions
+ * @param src_quad source buffer quad - this can be any dimension as
+ * long as src image provides enough image to cover the dst_quad.
+ * @TODO: check that src coveres the dst quad
+ *
+ */
+void blit_composite_rgba_over_rgba3(uint8_t * __restrict__ dst,
+                                   const vec2u dst_dim,
+                                   const vec4u dst_quad,
+                                   const uint8_t * __restrict__ src,
+                                   const vec2u src_dim,
+                                   const vec4u src_quad) {
+    if (!dst || !src) {
+        debug("null src or dst pointers in composite region");
+        return;
+    }
+
+    const int32_t dst_ux = dst_quad.x;
+    const int32_t dst_uy = dst_quad.y;
+    const int32_t dst_lx = dst_quad.z;
+    const int32_t dst_ly = dst_quad.w;
+
+    const int32_t src_ux = src_quad.x;
+    const int32_t src_uy = src_quad.y;
+    const int32_t src_lx = src_quad.z;
+    const int32_t src_ly = src_quad.w;
+
+    // basic sanity checks
+    if (dst_ux < 0 || dst_uy < 0 || src_ux < 0 || src_uy < 0) {
+        debug("negative coords in composite region");
+        return;
+    }
+
+    if (dst_ly > (int32_t)dst_dim.y || dst_lx > (int32_t)dst_dim.x ||
+        src_ly > (int32_t)src_dim.y || src_lx > (int32_t)src_dim.x) {
+        debug("degenerate composite region");
+        return;
+    }
+
+    const int32_t dheight = dst_ly - dst_uy;
+    const int32_t dwidth  = dst_lx - dst_ux;
+    const int32_t sheight = src_ly - src_uy;
+    const int32_t swidth  = src_lx - src_ux;
+
+    if (dwidth <= 0 || dheight <= 0 || swidth <= 0 || sheight <= 0) {
+        debug("non-positive composite dimensions");
+        return;
+    }
+
+    //const int32_t width  = MIN(dwidth,  swidth);
+    //const int32_t height = MIN(dheight, sheight);
+
+    printf("blit dwidth: %d, dheight: %d, swidth: %d, sheight: %d\n",
+           dwidth, dheight, swidth, sheight);
+
+    for (int32_t y = dst_uy; y < dst_ly; y++) {
+        int32_t off = (y * (int32_t)dst_dim.x);
+        RGBA *d = (RGBA *)dst + off + dst_ux;
+        const RGBA *s = (const RGBA *)src + ((src_uy + y) * (int32_t)src_dim.x) + src_ux;
+
+        for (int32_t x = 0; x < (dst_lx - dst_ux); x++) {
+            d[x] = s[x];
+            //composite_rgba(&d[x], &s[x], &d[x]);
+        }
+    }
+}
+
+
+
+__attribute__((hot))
+void blit_composite_rgb_over_rgb(uint8_t * __restrict__ dst, int dst_stride,
+                                 const uint8_t * __restrict__ src, int src_stride,
+                                 int width, int height, uint8_t global_alpha) {
+    if (!dst || !src || width <= 0 || height <= 0) return;
+    const int w3 = width * 3;
+    const uint16_t a = global_alpha;
+    const uint16_t inv = 255u - a;
+    for (int y = 0; y < height; ++y) {
+        uint8_t * __restrict__ d = dst + (size_t)y * (size_t)dst_stride;
+        const uint8_t * __restrict__ s = src + (size_t)y * (size_t)src_stride;
+        for (int x = 0; x < w3; x += 3) {
+            const uint8_t sR = s[x + 0];
+            const uint8_t sG = s[x + 1];
+            const uint8_t sB = s[x + 2];
+
+            const uint8_t dR = d[x + 0];
+            const uint8_t dG = d[x + 1];
+            const uint8_t dB = d[x + 2];
+
+            // need an intermediate to avoid vompiler warning about sign conversion
+            const uint32_t r =
+                (uint32_t)sR * (uint32_t)a +
+                (uint32_t)dR * (uint32_t)inv +
+                127u;
+
+            const uint32_t g =
+                (uint32_t)sG * (uint32_t)a +
+                (uint32_t)dG * (uint32_t)inv +
+                127u;
+
+            const uint32_t b =
+                (uint32_t)sB * (uint32_t)a +
+                (uint32_t)dB * (uint32_t)inv +
+                127u;
+
+            d[x + 0] = (uint8_t)(r / 255u);
+            d[x + 1] = (uint8_t)(g / 255u);
+            d[x + 2] = (uint8_t)(b / 255u);
+        }
+    }
+}
 
 
 /**
@@ -1560,3 +1834,93 @@ void hub_line_aa(hub75_display_t *scene, const uint16_t x0, const uint16_t y0, c
     }
 }
 
+/**
+ * @brief sample a grayscale texture with bilinear filtering
+ * @return the value at the floating point coordinate as a uint8_t value
+ */
+__attribute__((hot, always_inline))
+inline uint8_t sample_gray8_bilinear_buf(const uint8_t *__restrict__ pixels,
+                                             int width, int height,
+                                             float fx, float fy) {
+    // Fast path bilinear filtering for 8-bit grayscale buffers.
+    // - Uses Q8 fixed-point weights to reduce FP math pressure on ARM cores
+    // - Branchless edge handling for x1/y1
+    // - Assumes tightly-packed rows with stride == width bytes
+    if (!pixels | (width <= 0) | (height <= 0)) return 0;
+
+    // Map to texel space (pixel centers at integer coords)
+    float tx = fx - 0.5f;
+    float ty = fy - 0.5f;
+
+    // Clamp to valid texel range
+    const float maxx = (float)(width - 1);
+    const float maxy = (float)(height - 1);
+    if (tx < 0.0f) tx = 0.0f; else if (tx > maxx) tx = maxx;
+    if (ty < 0.0f) ty = 0.0f; else if (ty > maxy) ty = maxy;
+
+    int x0 = (int)tx;
+    int y0 = (int)ty;
+
+    // Fractional parts in Q8 with rounding
+    int wx = (int)((tx - (float)x0) * 256.0f + 0.5f); // 0..256
+    int wy = (int)((ty - (float)y0) * 256.0f + 0.5f);
+    if (wx > 256) wx = 256;
+    if (wy > 256) wy = 256;
+    int invx = 256 - wx;
+    int invy = 256 - wy;
+
+    // Neighbor indices with branchless clamp
+    int x1 = x0 + (x0 != (width  - 1));
+    int y1 = y0 + (y0 != (height - 1));
+
+    const uint8_t *row0 = pixels + (size_t)y0 * (size_t)width;
+    const uint8_t *row1 = pixels + (size_t)y1 * (size_t)width;
+    int p00 = row0[x0];
+    int p10 = row0[x1];
+    int p01 = row1[x0];
+    int p11 = row1[x1];
+
+    // Horizontal lerp (Q8)
+    int l0 = (p00 * invx + p10 * wx + 128) >> 8;
+    int l1 = (p01 * invx + p11 * wx + 128) >> 8;
+    // Vertical lerp (Q8)
+    int v  = (l0 * invy + l1 * wy + 128) >> 8;
+    return (uint8_t)v;
+}
+
+// Public wrapper for external linkage (used by unit tests and other TUs)
+uint8_t sdf_sample_gray8_bilinear_buf(const uint8_t *pixels, int width, int height, float fx, float fy) {
+    return sample_gray8_bilinear_buf(pixels, width, height, fx, fy);
+}
+
+// DEBUG
+// Stride-aware variant: identical math but uses provided row stride in bytes
+uint8_t sdf_sample_gray8_bilinear_stride(const uint8_t *pixels, int width, int height, int stride, float fx, float fy) {
+    if (!pixels | (width <= 0) | (height <= 0) | (stride <= 0)) return 0;
+    float tx = fx - 0.5f;
+    float ty = fy - 0.5f;
+    const float maxx = (float)(width - 1);
+    const float maxy = (float)(height - 1);
+    if (tx < 0.0f) tx = 0.0f; else if (tx > maxx) tx = maxx;
+    if (ty < 0.0f) ty = 0.0f; else if (ty > maxy) ty = maxy;
+    int x0 = (int)tx;
+    int y0 = (int)ty;
+    int wx = (int)((tx - (float)x0) * 256.0f + 0.5f);
+    int wy = (int)((ty - (float)y0) * 256.0f + 0.5f);
+    if (wx > 256) wx = 256;
+    if (wy > 256) wy = 256;
+    int invx = 256 - wx;
+    int invy = 256 - wy;
+    int x1 = x0 + (x0 != (width  - 1));
+    int y1 = y0 + (y0 != (height - 1));
+    const uint8_t *row0 = pixels + (size_t)y0 * (size_t)stride;
+    const uint8_t *row1 = pixels + (size_t)y1 * (size_t)stride;
+    int p00 = row0[x0];
+    int p10 = row0[x1];
+    int p01 = row1[x0];
+    int p11 = row1[x1];
+    int l0 = (p00 * invx + p10 * wx + 128) >> 8;
+    int l1 = (p01 * invx + p11 * wx + 128) >> 8;
+    int v  = (l0 * invy + l1 * wy + 128) >> 8;
+    return (uint8_t)v;
+}

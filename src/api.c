@@ -314,13 +314,19 @@ static void shadowmap_rasterize_triangle(ShadowMap *SM, vec3 v0w, vec3 v1w, vec3
 
     /* Compute bounding box */
     int minx = sx0, maxx = sx0, miny = sy0, maxy = sy0;
-    if (sx1 < minx) minx = sx1; if (sx1 > maxx) maxx = sx1;
-    if (sx2 < minx) minx = sx2; if (sx2 > maxx) maxx = sx2;
-    if (sy1 < miny) miny = sy1; if (sy1 > maxy) maxy = sy1;
-    if (sy2 < miny) miny = sy2; if (sy2 > maxy) maxy = sy2;
+    if (sx1 < minx) minx = sx1;
+    if (sx1 > maxx) maxx = sx1;
+    if (sx2 < minx) minx = sx2;
+    if (sx2 > maxx) maxx = sx2;
+    if (sy1 < miny) miny = sy1;
+    if (sy1 > maxy) maxy = sy1;
+    if (sy2 < miny) miny = sy2;
+    if (sy2 > maxy) maxy = sy2;
     if (maxx < 0 || maxy < 0 || minx >= SM->w || miny >= SM->h) return;
-    if (minx < 0) minx = 0; if (miny < 0) miny = 0;
-    if (maxx >= SM->w) maxx = SM->w - 1; if (maxy >= SM->h) maxy = SM->h - 1;
+    if (minx < 0) minx = 0;
+    if (miny < 0) miny = 0;
+    if (maxx >= SM->w) maxx = SM->w - 1;
+    if (maxy >= SM->h) maxy = SM->h - 1;
 
     /* Use light NDC depth (post-projection z/w) so depth test and bias are well-defined */
     float z0 = c0.z * iw0;
@@ -885,7 +891,7 @@ static inline void fill_span_rgb(hub75_display_t *scene, int y, int x0, int x1, 
     x1 = clamp_int(x1, 0, scene->width - 1);
 
     uint8_t *row = scene->image + (y * scene->width * scene->stride);
-    size_t off = (size_t)x0 * 3u;                 /* RGB888 write */
+    size_t off = (size_t)x0 * scene->stride;                 /* RGB888 write */
     for (int x = x0; x <= x1; ++x) {
         row[off + 0] = c.r;
         row[off + 1] = c.g;
@@ -893,6 +899,26 @@ static inline void fill_span_rgb(hub75_display_t *scene, int y, int x0, int x1, 
         off += scene->stride;
     }
 }
+
+static inline void fill_span_rgba(hub75_display_t *scene, int y, int x0, int x1, RGBA c) {
+    if ((unsigned)y >= (unsigned)scene->height) return;
+    if (x0 > x1) { int t = x0; x0 = x1; x1 = t; }
+    if (x1 < 0 || x0 >= scene->width) return;
+
+    x0 = clamp_int(x0, 0, scene->width - 1);
+    x1 = clamp_int(x1, 0, scene->width - 1);
+
+    uint8_t *row = scene->image + (y * scene->width * scene->stride);
+    size_t off = (size_t)x0 * scene->stride;                 /* RGB888 write */
+    for (int x = x0; x <= x1; ++x) {
+        row[off + 0] = c.r;
+        row[off + 1] = c.g;
+        row[off + 2] = c.b;
+        row[off + 3] = c.a;
+        off += scene->stride;
+    }
+}
+
 
 /**
  * @brief Draw a filled polygon with specified colors based on winding order
@@ -912,29 +938,12 @@ static inline void fill_span_rgb(hub75_display_t *scene, int y, int x0, int x1, 
  * 3. For each scanline, find edge intersections
  * 4. Fill between intersection pairs
  */
-void draw_polygon_fill(hub75_display_t *scene, Polygonf_t *poly, RGB color)
+void draw_polygon_fill(hub75_display_t *scene, Polygonf_t *poly, RGBA color)
 {
     if (!scene || !scene->image || !poly || poly->num_points < 3) {
         debug("draw_polygon: bad args\n");
         return;
     }
-
-    /* Debug: verify coordinates look normalized (0..1). If they don't, log once per call. */
-    /*
-    {
-        float minx =  1e9f, maxx = -1e9f, miny =  1e9f, maxy = -1e9f;
-        for (size_t i = 0; i < poly->num_points; ++i) {
-            if (poly->points[i].x < minx) minx = poly->points[i].x;
-            if (poly->points[i].x > maxx) maxx = poly->points[i].x;
-            if (poly->points[i].y < miny) miny = poly->points[i].y;
-            if (poly->points[i].y > maxy) maxy = poly->points[i].y;
-        }
-        if (minx < -0.01f || maxx > 1.01f || miny < -0.01f || maxy > 1.01f) {
-            printf("[draw_polygon_fill] Warning: coordinates not normalized. min(%.3f,%.3f) max(%.3f,%.3f)\n",
-                   (double)minx, (double)miny, (double)maxx, (double)maxy);
-        }
-    }
-    */
 
     size_t n = poly->num_points;
     if (n > MAX_POLY_POINTS) n = MAX_POLY_POINTS;   /* truncate safely */
@@ -999,7 +1008,7 @@ void draw_polygon_fill(hub75_display_t *scene, Polygonf_t *poly, RGB color)
         for (size_t i = 0; i + 1 < cnt; i += 2) {
             int x_start = xints[i];
             int x_end   = xints[i + 1] - 1;   /* half-open to avoid overdraw at vertical edges */
-            fill_span_rgb(scene, y, x_start, x_end, color);
+            fill_span_rgba(scene, y, x_start, x_end, color);
         }
     }
 }
@@ -1023,7 +1032,8 @@ static inline void draw_triangle_gouraud(hub75_display_t *scene,
     if (!use_z) {
         if (vcolor[0].r == vcolor[1].r && vcolor[0].g == vcolor[1].g && vcolor[0].b == vcolor[1].b &&
             vcolor[0].r == vcolor[2].r && vcolor[0].g == vcolor[2].g && vcolor[0].b == vcolor[2].b) {
-            draw_polygon_fill(scene, (Polygonf_t*)poly, vcolor[0]);
+                const RGBA tcolor = { vcolor[0].r, vcolor[0].g, vcolor[0].b, 255 };
+            draw_polygon_fill(scene, (Polygonf_t*)poly, tcolor);
             return;
         }
     }
@@ -1129,8 +1139,8 @@ static inline void draw_triangle_gouraud(hub75_display_t *scene,
     int g_row = (int)lrintf((w0_row_f*g0 + w1_row_f*g1 + w2_row_f*g2) * (float)ONE);
     int b_row = (int)lrintf((w0_row_f*b0 + w1_row_f*b1 + w2_row_f*b2) * (float)ONE);
 
-    size_t row_stride = (size_t)scene->width * (size_t)scene->stride;
-    const int fb_width = scene->width;
+    size_t row_stride  = (size_t)scene->width * (size_t)scene->stride;
+    // const int fb_width = scene->width;
 
     /* Per-pixel shadow inputs using camera w for perspective-correct interpolation */
     const bool do_px_shadow = (tri_in->per_pixel_shadow && tls_shadow_maps && tri_in->sm_light_index < tls_shadow_count);
@@ -1278,7 +1288,7 @@ poly_winding_t polygon_winding(const Polygonf_t *poly)
     }
 
     /* treat tiny areas as degenerate to avoid jitter on almost-collinear input */
-    const float eps = 1e-10;
+    const float eps = 1e-10f;
     if (a > eps)  return POLY_CCW;
     if (a < -eps) return POLY_CW;
     return POLY_DEGENERATE;
@@ -1329,7 +1339,7 @@ void api_fill_gradient(int y, int x0, int x1,
  * This is a wrapper around draw_polygon_fill() that uses the thread-local scene.
  * Checks that a scene is set before attempting to draw.
  */
-void api_poly(Polygonf_t *poly, RGB color1) {
+void api_poly(Polygonf_t *poly, RGBA color1) {
     if (tls_scene == NULL) {
         debug("no scene set\n");
         return;
@@ -1885,9 +1895,12 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
                                     float r = invs * (float)p[0] + s * lr;
                                     float g = invs * (float)p[1] + s * lg;
                                     float b = invs * (float)p[2] + s * lb;
-                                    if (r < 0) r = 0; if (r > 255) r = 255;
-                                    if (g < 0) g = 0; if (g > 255) g = 255;
-                                    if (b < 0) b = 0; if (b > 255) b = 255;
+                                    if (r < 0) r = 0;
+                                    if (r > 255) r = 255;
+                                    if (g < 0) g = 0;
+                                    if (g > 255) g = 255;
+                                    if (b < 0) b = 0;
+                                    if (b > 255) b = 255;
                                     p[0] = (uint8_t)r; p[1] = (uint8_t)g; p[2] = (uint8_t)b;
                                 }
                             }
@@ -2066,9 +2079,12 @@ static void api_render_scene3d(const camera_t *cam, const scene3d_t *os, const s
         vec3 bb_max = { -1e9f, -1e9f, -1e9f };
         for (int ci = 0; ci < 8; ++ci) {
             vec3 wp = frustum_ws[ci];
-            if (wp.x < bb_min.x) bb_min.x = wp.x; if (wp.x > bb_max.x) bb_max.x = wp.x;
-            if (wp.y < bb_min.y) bb_min.y = wp.y; if (wp.y > bb_max.y) bb_max.y = wp.y;
-            if (wp.z < bb_min.z) bb_min.z = wp.z; if (wp.z > bb_max.z) bb_max.z = wp.z;
+            if (wp.x < bb_min.x) bb_min.x = wp.x;
+            if (wp.x > bb_max.x) bb_max.x = wp.x;
+            if (wp.y < bb_min.y) bb_min.y = wp.y;
+            if (wp.y > bb_max.y) bb_max.y = wp.y;
+            if (wp.z < bb_min.z) bb_min.z = wp.z;
+            if (wp.z > bb_max.z) bb_max.z = wp.z;
         }
         vec3 bb_center = { (bb_min.x+bb_max.x)*0.5f, (bb_min.y+bb_max.y)*0.5f, (bb_min.z+bb_max.z)*0.5f };
         vec3 bb_extent = { (bb_max.x-bb_min.x)*0.5f, (bb_max.y-bb_min.y)*0.5f, (bb_max.z-bb_min.z)*0.5f };
@@ -2140,15 +2156,24 @@ static void api_render_scene3d(const camera_t *cam, const scene3d_t *os, const s
                         vec3 l1 = cm_m4_mul_point3(V, v1w);
                         vec3 l2 = cm_m4_mul_point3(V, v2w);
                         /* expand bounds */
-                        if (l0.x < lxmin) lxmin = l0.x; if (l0.x > lxmax) lxmax = l0.x;
-                        if (l0.y < lymin) lymin = l0.y; if (l0.y > lymax) lymax = l0.y;
-                        if (l0.z < lzmin) lzmin = l0.z; if (l0.z > lzmax) lzmax = l0.z;
-                        if (l1.x < lxmin) lxmin = l1.x; if (l1.x > lxmax) lxmax = l1.x;
-                        if (l1.y < lymin) lymin = l1.y; if (l1.y > lymax) lymax = l1.y;
-                        if (l1.z < lzmin) lzmin = l1.z; if (l1.z > lzmax) lzmax = l1.z;
-                        if (l2.x < lxmin) lxmin = l2.x; if (l2.x > lxmax) lxmax = l2.x;
-                        if (l2.y < lymin) lymin = l2.y; if (l2.y > lymax) lymax = l2.y;
-                        if (l2.z < lzmin) lzmin = l2.z; if (l2.z > lzmax) lzmax = l2.z;
+                        if (l0.x < lxmin) lxmin = l0.x;
+                        if (l0.x > lxmax) lxmax = l0.x;
+                        if (l0.y < lymin) lymin = l0.y;
+                        if (l0.y > lymax) lymax = l0.y;
+                        if (l0.z < lzmin) lzmin = l0.z;
+                        if (l0.z > lzmax) lzmax = l0.z;
+                        if (l1.x < lxmin) lxmin = l1.x;
+                        if (l1.x > lxmax) lxmax = l1.x;
+                        if (l1.y < lymin) lymin = l1.y;
+                        if (l1.y > lymax) lymax = l1.y;
+                        if (l1.z < lzmin) lzmin = l1.z;
+                        if (l1.z > lzmax) lzmax = l1.z;
+                        if (l2.x < lxmin) lxmin = l2.x;
+                        if (l2.x > lxmax) lxmax = l2.x;
+                        if (l2.y < lymin) lymin = l2.y;
+                        if (l2.y > lymax) lymax = l2.y;
+                        if (l2.z < lzmin) lzmin = l2.z;
+                        if (l2.z > lzmax) lzmax = l2.z;
                         have_bounds = true;
                     }
                 }
@@ -2271,9 +2296,12 @@ static void api_render_scene3d(const camera_t *cam, const scene3d_t *os, const s
                     r = invs * r + s * cr;
                     g = invs * g + s * cg;
                     b = invs * b + s * cb;
-                    if (r < 0.f) r = 0.f; if (r > 255.f) r = 255.f;
-                    if (g < 0.f) g = 0.f; if (g > 255.f) g = 255.f;
-                    if (b < 0.f) b = 0.f; if (b > 255.f) b = 255.f;
+                    if (r < 0.f) r = 0.f;
+                    if (r > 255.f) r = 255.f;
+                    if (g < 0.f) g = 0.f;
+                    if (g > 255.f) g = 255.f;
+                    if (b < 0.f) b = 0.f;
+                    if (b > 255.f) b = 255.f;
                     p[0] = (uint8_t)r; p[1] = (uint8_t)g; p[2] = (uint8_t)b;
                 }
             }

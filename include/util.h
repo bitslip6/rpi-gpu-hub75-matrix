@@ -205,6 +205,13 @@ bool file_exists(const char *filename);
 
 void write_png_file(string_t *filename, hub75_display_t *d);
 
+int write_png_image(const char *path,
+                    const uint8_t *pixels,
+                    int width,
+                    int height,
+                    int stride);
+
+
 /* Generic PNG helpers (libpng) */
 /* Read an image as 8-bit grayscale (tightly packed, stride=w). Returns 0 on success. */
 int png_read_gray8(const char *path, uint8_t **out_pixels, int *out_w, int *out_h, int *out_stride);
