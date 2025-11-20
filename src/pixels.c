@@ -1846,7 +1846,7 @@ inline uint8_t sample_gray8_bilinear_buf(const uint8_t *__restrict__ pixels,
     // - Uses Q8 fixed-point weights to reduce FP math pressure on ARM cores
     // - Branchless edge handling for x1/y1
     // - Assumes tightly-packed rows with stride == width bytes
-    if (!pixels | (width <= 0) | (height <= 0)) return 0;
+    if (!pixels || (width <= 0) || (height <= 0)) return 0;
 
     // Map to texel space (pixel centers at integer coords)
     float tx = fx - 0.5f;
