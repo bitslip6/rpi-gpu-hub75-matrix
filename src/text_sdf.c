@@ -919,6 +919,8 @@ void sdf_text_render(sdf_text_t *t, uint8_t *dst, int w, int h, int stride,
     _sdf_text_update_shape(t);
   }
 
+  const float baseline_y = t->y;
+
   // Main render loop over all glyphs
   for (size_t i = 0; i < t->_glyph_count; ++i) {
     // get glyph for character
@@ -930,16 +932,18 @@ void sdf_text_render(sdf_text_t *t, uint8_t *dst, int w, int h, int stride,
       continue;
     }
 
-    // Top-left of glyph in canvas (floating), baseline origin is (t->x, t->y)
+    // Top-left of glyph in canvas (floating), baseline origin is (t->x, baseline_y)
     const float gx0f = t->x + (float)t->_ofs_x[i];
-    const float gy0f = t->y + (float)t->_ofs_y[i];
+    const float gy0f = baseline_y + (float)t->_ofs_y[i];
 
-    // Compute clipped integer bounds on canvas, expand by glow/outline radius
-    // if present
-    int x0 = MAX(0, (int)floorf(gx0f - t->effects.glow_radius));
-    int y0 = MAX(0, (int)floorf(gy0f - t->effects.glow_radius));
-    int x1 = MIN(w, (int)ceilf(gx0f + (float)g->width + t->effects.glow_radius));
-    int y1 = MIN(h, (int)ceilf(gy0f + (float)g->height + t->effects.glow_radius));
+    // Compute clipped integer bounds on canvas, expand by glow/outline/weight
+    float effect_pad = t->effects.glow_radius;
+    if (t->effects.outline_width > effect_pad) effect_pad = t->effects.outline_width;
+    effect_pad += 1.0f;
+    int x0 = MAX(0, (int)floorf(gx0f - effect_pad));
+    int y0 = MAX(0, (int)floorf(gy0f - (effect_pad)));
+    int x1 = MIN(w, (int)ceilf(gx0f + (float)g->width + effect_pad));
+    int y1 = MIN(h, (int)ceilf(gy0f + (float)g->height + effect_pad));
 
     // skip degenerate glyphs
     if (x0 >= x1 || y0 >= y1) {
@@ -956,7 +960,6 @@ void sdf_text_render(sdf_text_t *t, uint8_t *dst, int w, int h, int stride,
     RGBA stroke = t->effects.outline_color;
     RGBA glow = t->effects.glow_color;
 
-    //printf("sdf render y0: %dx%d\n", y0, y1);
     for (int iy = y0; iy < y1; ++iy) {
       uint8_t *p = dst + (iy * w * stride) + (x0 * stride);
       for (int ix = x0; ix < x1; ++ix) {
