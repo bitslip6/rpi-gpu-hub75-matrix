@@ -73,6 +73,7 @@ static inline uint8_t u8_mul_div255(uint16_t x) {
 
 // composite: out = src OVER dst, both straight RGBA in, straight RGBA out
 // internally premultiplies, does Porter-Duff over, then un-premultiplies.
+/*
 static inline void composite_rgba_over(RGBA *out, const RGBA *src, const RGBA *dst) {
     const uint8_t as = src->a;
     const uint8_t ad = dst->a;
@@ -107,7 +108,13 @@ static inline void composite_rgba_over(RGBA *out, const RGBA *src, const RGBA *d
     }
     out->a = out_a;
 }
+*/
 
+
+void composite_rgba_over_rgba(image_buffer_t       *dst,
+                               const image_buffer_t *src,
+                               const vec4                  dst_quad,
+                               const vec4                  src_quad);
 
 /* Optimized rectangle compositors (straight alpha over) */
 void blit_composite_rgba_over_rgba(uint8_t * __restrict__ dst,
@@ -290,6 +297,11 @@ void copy_tone_mapperF(const RGBF *__restrict__ in, RGBF *__restrict__ out, cons
  */
 uint8_t sdf_sample_gray8_bilinear_buf(const uint8_t *pixels, int width, int height, float fx, float fy);
 
+/* bilinear sample at float (sx, sy) in src image space */
+void sample_rgba_bilinear(RGBA *out,
+                                        const image_buffer_t *src,
+                                        float sx,
+                                        float sy);
 
 /**
  * @brief create a lookup table for the pwm values for each pixel value

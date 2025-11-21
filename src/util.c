@@ -277,6 +277,18 @@ int parse_panel_offsets(const char *arg,
 }
 
 
+image_buffer_t *image_buffer_new(int32_t width, int32_t height) {
+    image_buffer_t *buffer;
+    size_t buf_size = sizeof(image_buffer_t) + (width * height * 4);
+    buffer = calloc(buf_size, 1);
+    buffer->dimensions.x = (int32_t)width;
+    buffer->dimensions.y = (int32_t)height;
+    buffer->row_stride = width * 4;
+    buffer->data = (RGBA*)(buffer + 1);
+    return buffer;
+}
+
+
 /**
  * @brief creae a new scene with default values
  */

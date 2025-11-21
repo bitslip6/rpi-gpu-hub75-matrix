@@ -667,7 +667,7 @@ static void _normalize_dir(float *dx, float *dy) {
 /* Public: recompute internal caches after attribute changes (kerning, tracking,
  * size, etc.). Ensures per-text scaling is applied and shaping arrays are
  * refreshed. */
-void sdf_text_update(sdf_text_t *t) {
+void sdf_text_update(sdf_text_t *t, int32_t display_width) {
   if (!t)
     return;
   /* Apply size scaling from base_font if needed */
@@ -686,9 +686,16 @@ void sdf_text_update(sdf_text_t *t) {
       if (t->effects.glow_radius > expand)   expand = t->effects.glow_radius;
       if (t->effects.outline_width > expand) expand = t->effects.outline_width;
     }
-    t->dimensions.x = sz.x+ (int)ceilf(expand);// + (uint8_t)(4 * expand);
-    t->dimensions.y = sz.y + (int)ceilf(expand);// + (uint8_t)(4 * expand);
+    t->dimensions.x = sz.x+ (int)ceilf(expand);
+    t->dimensions.y = sz.y + (int)ceilf(expand);
+
+    // compute the text wrap time if the shape changes
+    if (t->wrap) {
+        int32_t maxlen = MAX(t->dimensions.x, t->dimensions.y);
+        t->wrap_mod = ((float)maxlen / t->speed) + 1.0f;
+    }
   }
+  t->x0 = (float)display_width;
 }
 
 sdf_text_t *sdf_text_create(sdf_font_t *font, const char *text) {
@@ -792,6 +799,7 @@ void sdf_text_set_speed(sdf_text_t *t, float speed) {
   if (!t)
     return;
   t->speed = speed;
+  t->shape_dirty = true;
 }
 
 void sdf_text_set_size_px(sdf_text_t *t, float size_px) {
@@ -938,7 +946,9 @@ void sdf_text_render(sdf_text_t *t, uint8_t *dst, int w, int h, int stride,
 
     // Compute clipped integer bounds on canvas, expand by glow/outline/weight
     float effect_pad = t->effects.glow_radius;
-    if (t->effects.outline_width > effect_pad) effect_pad = t->effects.outline_width;
+    if (t->effects.outline_width > effect_pad) {
+        effect_pad = t->effects.outline_width;
+    }
     effect_pad += 1.0f;
     int x0 = MAX(0, (int)floorf(gx0f - effect_pad));
     int y0 = MAX(0, (int)floorf(gy0f - (effect_pad)));
@@ -1236,6 +1246,8 @@ static void _sdf_text_update_shape(sdf_text_t *t) {
       pen_x += (int)advs[i];
     }
 
+    
+
   } else { /* SDF_ORIENT_VERTICAL */
     /* Vertical stack: advance along Y; horizontal placement uses bearing_x
      * baseline. Valign is ignored here (future: introduce a horizontal
@@ -1249,6 +1261,10 @@ static void _sdf_text_update_shape(sdf_text_t *t) {
       dxs[i] = bx;
       dys[i] = pen_y - by;
       pen_y += (int)advs[i];
+    }
+
+    if (t->wrap) {
+        t->wrap_mod = ((float)t->dimensions.y / t->speed) + 1.0f;
     }
   }
 
@@ -1267,7 +1283,7 @@ static void _sdf_text_update_shape(sdf_text_t *t) {
   t->_ofs_y = dys;
   t->_glyph_count = n;
   t->shape_dirty = false;
-  printf(" [!] updated shape: glyphs=%zu\n", n);
+  printf(" [!] updated text shape: glyphs=%zu\n", n);
 }
 
 
@@ -1276,13 +1292,13 @@ static void _sdf_text_update_shape(sdf_text_t *t) {
  * this has the effect of updating t->x and t->y by dir * speed * tmp_sec
  *  
  */
-void sdf_text_animate(sdf_text_t *t, float time_sec) {
+void sdf_text_animate(sdf_text_t *t, const float time_sec) {
   if (!t)
     return;
   /* Absolute time-based position: pos(t) = (x0,y0) + dir*speed*time */
   float tmp_sec = time_sec;
-  if (tmp_sec > 6.0f) {
-    tmp_sec = fmodf(tmp_sec, 6.0f);
+  if (tmp_sec > t->wrap_mod) {
+    tmp_sec = fmodf(tmp_sec, t->wrap_mod);
   }
   t->x = t->x0 + t->dir_x * t->speed * tmp_sec;
   t->y = t->y0 + t->dir_y * t->speed * tmp_sec;

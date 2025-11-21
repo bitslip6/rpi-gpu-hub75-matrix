@@ -4,7 +4,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 
-#include "spsc.h"
+ #include "spsc.h"
 
 #ifndef __HUB75GPU_H__
 #define __HUB75GPU_H__
@@ -43,13 +43,13 @@ typedef float NormalSigned;
 #define NormalSignedSAT 1.0f;
 #define NormalSignedNEGSAT -1.0f;
 
-static inline Normal Normal_clamp(float x) {
+inline Normal Normal_clamp(float x) {
     if (x < 0.0f) return 0.0f;
     if (x > 1.0f) return 1.0f;
     return (Normal)x;
 }
 
-static inline NormalSigned NormalSigned_clamp(float x) {
+inline NormalSigned NormalSigned_clamp(float x) {
     if (x < -1.0f) return -1.0f;
     if (x > 1.0f) return 1.0f;
     return (NormalSigned)x;
@@ -99,6 +99,28 @@ typedef struct {
     Normal l; 
 } HSLF;
 
+// int32 vec2
+typedef struct { int32_t x, y; } vec2u;
+// int32 vec3
+typedef struct { int32_t x, y, z; } vec3u;
+// int32 vec4
+typedef struct { int32_t x, y, z, w; } vec4u;
+
+// float vec2
+typedef struct { float x, y; } vec2;
+// float vec3
+typedef struct { float x, y, z; } vec3;
+// float vec4
+typedef struct { float x, y, z, w; } vec4;
+typedef struct { float m[16]; }   mat4;  // column-major, m[col*4 + row]
+
+typedef struct {
+    vec3 position;     // world position 
+    vec3 rotation;     // Euler angles in radians, x=pitch, y=yaw, z=roll 
+    vec3 scale;        // per-axis scale 
+} transform_t;
+
+
 
 typedef struct
 {
@@ -116,7 +138,6 @@ typedef struct
 
 typedef enum { POLY_DEGENERATE = 0, POLY_CW = 1, POLY_CCW = 2 } poly_winding_t;
 
-
 typedef struct panel_rgb_scale {
     uint8_t red_q8;
     uint8_t green_q8;
@@ -128,6 +149,13 @@ typedef struct panel_rgb_offset {
     int8_t green_q8;
     int8_t blue_q8;
 } panel_rgb_offset;
+
+typedef struct image_buffer_t {
+    vec2u dimensions;
+    uint32_t row_stride;
+    RGBA *data;
+} image_buffer_t;
+
 
 /**
  * @brief Gradient direction for simple gradients
@@ -408,6 +436,13 @@ hub75_display_t *hub75_display_parse_args(int argc, char **argv);
 hub75_display_t *hub75_display_new();
 
 /**
+ * @brief allocate memory for a new image_buffer_t of requested dimensions
+ * heap allocation the caller must free
+ *
+ */
+image_buffer_t *image_buffer_new(int32_t width, int32_t height);
+
+/**
  * check the scene and start the rendering threads if everying is ok
  */
 void hub75_display_start(hub75_display_t *scene);
@@ -464,20 +499,6 @@ typedef struct hub75_api {
 
 // poly_winding_t polygon_winding(const Polygonf_t *poly);
 
-typedef struct { int32_t x, y; } vec2u;
-typedef struct { int32_t x, y, z; } vec3u;
-typedef struct { int32_t x, y, z, w; } vec4u;
-
-typedef struct { float x, y; } vec2;
-typedef struct { float x, y, z; } vec3;
-typedef struct { float x, y, z, w; } vec4;
-typedef struct { float m[16]; }   mat4;  // column-major, m[col*4 + row]
-
-typedef struct {
-    vec3 position;     // world position 
-    vec3 rotation;     // Euler angles in radians, x=pitch, y=yaw, z=roll 
-    vec3 scale;        // per-axis scale 
-} transform_t;
 
 
 /* --------------------------------------------------------------

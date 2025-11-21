@@ -166,6 +166,7 @@ typedef struct sdf_text_t {
     float x0, y0;         /* base position at t=0 for absolute-time animation */
     float dir_x, dir_y;   /* normalized direction vector for scrolling */
     float speed;          /* pixels per second (applied along dir) */
+    float wrap_mod;       /* time in seconds to wrap the text */
     float angle;          /* radians, rotation about (x,y) (optional v1) */
     float size_px;        /* desired line height in pixels; 0 => use current font size */
 
@@ -226,7 +227,7 @@ void sdf_text_set_orientation(sdf_text_t *t, sdf_orientation_t orient);
 /* Force a layout/metrics refresh after batching attribute changes.
  * This recomputes any internal cached data (font scaling, shaping arrays)
  * so the text object is consistent and ready to render. */
-void sdf_text_update(sdf_text_t *t);
+void sdf_text_update(sdf_text_t *t, const int32_t display_width);
 
 /* Render entry point. time_sec is an ABSOLUTE timestamp (seconds since animation start)
  * used to position scrolling text deterministically: pos(t) = (x0,y0) + dir*speed*t. */
@@ -261,7 +262,7 @@ float sdf_text_baseline_center(float canvas_top_y, float canvas_height, sdf_line
 
 /* Scrolling and wrap helpers (3.5) */
 /* Set position for absolute time: pos(t) = (x0,y0) + dir*speed*time_sec. */
-void sdf_text_animate(sdf_text_t *t, float time_sec);
+void sdf_text_animate(sdf_text_t *t, const float time_sec);
 
 /* Horizontal wrap helpers using total text advance width. */
 void _sdf_text_wrap_left_to_right(sdf_text_t *t, float left_x, float right_x);

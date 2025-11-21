@@ -5,6 +5,9 @@
 #include <smmintrin.h>
 #endif
 
+#include <math.h>
+#include "hub75gpu.h"
+
 extern int32_t __builtin_arm_qadd (int32_t, int32_t);  // ARM intrinsic for saturated addition
 
 
@@ -57,7 +60,7 @@ static inline float mixf(const float x, const float y, const Normal a) {
  * @return float 
  */
 __attribute__((pure))
-static inline float clampf(const float x, const float lower, const float upper) {
+inline float clampf(const float x, const float lower, const float upper) {
 	return fmaxf(lower, fminf(x, upper));
 }
 
@@ -112,6 +115,16 @@ static inline int32_t saturating_add(int32_t a, int32_t b) {
     }
     return result;
 #endif
+}
+
+/**
+ * helper: lerp between two uint8 channels 
+ */
+inline uint8_t lerp_u8(uint8_t a, uint8_t b, Normal t) {
+    float v = (1.0f - t) * (float)a + t * (float)b;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 255.0f) v = 255.0f;
+    return (uint8_t)(v + 0.5f);
 }
 
 #define bit_count(x) __builtin_popcount(x)  // GCC/Clang built-in for counting set bits
