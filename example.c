@@ -74,7 +74,7 @@ static void *render_text_sdf(void *arg) {
     printf("[TEXT] SDF text scroller demo (Ctrl+C to exit)\n");
 
     // Configure font: load and scale to 64px line height 
-    sdf_font_t *font = sdf_font_load_scaled("assets/robots", 64.0f);
+    sdf_font_t *font = sdf_font_load_scaled("assets/roboto", 64.0f);
     if (!font) {
         fprintf(stderr, "[TEXT] Failed to load SDF font from 'assets/robots' (expect metrics.csv + PNGs).\n");
         scene->do_render = false;
@@ -83,32 +83,31 @@ static void *render_text_sdf(void *arg) {
 
     // Create text object
     const char msg[] = "Hello, HUB75 SDF Scroller!  ";
-    sdf_text_t *txt = sdf_text_create(font, msg, scene->width, scene->height);
-    txt->size_px = 128.0f;
-    txt->color = (RGBA){0, 255, 128, 255};
+    sdf_text_t *txt = sdf_text_create(font, msg);
+    txt->size_px = 148.0f;
+    txt->color = (RGBA){128, 255, 128, 255};
     txt->alpha = 200;
     txt->y = 90.0f;
-    txt->x = 100.0f;
+    txt->x = 180.0f;
     txt->dir_x = -1.0f;
     txt->dir_y = 0.0f;
-    txt->speed = 255.0f;
+    txt->speed = 128.0f;
     txt->softness = 0.08f;
     txt->effects.weight         = 1.2f;
     txt->effects.glow_color     = (RGBA){192, 232, 245, 255};
-    txt->effects.glow_radius    = Normal_clamp(1.0f);
+    // txt->effects.glow_radius    = Normal_clamp(1.0f);
     txt->effects.outline_width  = Normal_clamp(0.1f); // set >0 to enable outline
     txt->effects.outline_color  = (RGBA){0, 64, 128, 255};
     txt->effects.outline_smooth = Normal_clamp(0.1f);
+    txt->valign = SDF_VALIGN_BOTTOM;
+         
     
-    sdf_text_update(txt);
+    sdf_text_update(txt, scene->width);
 
+    printf("scene stride: %d\n", scene->stride);
 
-    
     /* Render loop */
     hub75gpu_t api = hub75_api(scene);
-    //const bool rgba = (scene->stride == 4);
-    //const int row_stride = (int)scene->width * (int)scene->stride;
-    //float dt = 0.0f;
     const bool dump_once = true;//(dump_env && *dump_env && dump_env[0] != '0');
     string_t *dump_path = string_new("text_debug.png", 128);
     uint32_t frame = 0;
@@ -135,17 +134,26 @@ static void *render_text_sdf(void *arg) {
 
     // Triangle base color
     // RGB color = { 255, 160, 32 };
-    RGBA color1 = { 32, 255, 160, 255 };
+    RGBA color1 = { 0, 255, 160, 254 };
  
-    size_t text_mem = (size_t)(ceilf(txt->dimensions.x) * ceilf(txt->dimensions.y));
+    printf ("text size: [%dx%d]\n", txt->dimensions.x, txt->dimensions.y);
+    image_buffer_t *text_image = image_buffer_new(txt->dimensions.x, txt->dimensions.y);
 
-    printf("Allocating text memory: %zu bytes\n", text_mem);
-    uint8_t *tmem = (uint8_t*)calloc(text_mem, sizeof(RGBA));
+    this_time = 0.0f;
 
-    this_time = 1.0f;
-    printf("text rendered to: [%dx%d]", txt->dimensions.x, txt->dimensions.y);
+    sdf_text_render(txt, (uint8_t*)text_image->data, txt->dimensions.x, txt->dimensions.y, text_image->row_stride, 0.9529411f);
+    png_write_buffer("text_buffer2.png", text_image);
 
-    sdf_text_render(txt, tmem, (int)scene->width, (int)scene->height, scene->stride, this_time);
+    image_buffer_t panel;
+    panel.data = scene->frame_buffer.data;
+    panel.dimensions.x = scene->frame_buffer.dimensions.x;
+    panel.dimensions.y = scene->frame_buffer.dimensions.y;
+    panel.row_stride = scene->frame_buffer.row_stride;
+
+
+
+
+    txt->y = 0;
     while (scene->do_render) {
         frame++;
         api.frame_begin();
@@ -166,25 +174,32 @@ static void *render_text_sdf(void *arg) {
 
 
         api.poly(&tri, color1);
+        //vec2u ddim = {scene->width, scene->height};
 
-	    //composite_rgba((RGBA*)scene->image, (RGBA*)tmem, (RGBA*)scene->image);
-        //blit_composite_rgba_over_rgba((uint8_t*)scene->image, scene->stride * scene->width,
-        //blit_composite_rgba_over_rgba((uint8_t*)scene->image, (uint8_t*)tmem, scene->stride * (int)ceilf(txt->dimensions.x), (RGBA){255,255,255,255});
 
-        vec2u ddim = {scene->width, scene->height};
-        vec4u dspec = {0, 10, scene->width, 138};
-        vec4u sspec = {0, 0, MIN(txt->dimensions.x, scene->width), txt->dimensions.y};
+        float wrap_time = this_time;
+        if (this_time > txt->wrap_mod) {
+            wrap_time = fmodf(this_time,  txt->wrap_mod);
+        }
 
-    //sdf_text_render(txt, scene->image, (int)scene->width, (int)scene->height, scene->stride, this_time);
-    // compositer does not seem to handle alpha blending correctly, RGB vs RGBA
-        blit_composite_rgba_over_rgba(
-            scene->image, ddim,
+        float xpos = (txt->x0 + ((float)txt->dir_x* (float)txt->speed * wrap_time));
+        vec4 dspec = {MAX(0, xpos), 16, scene->width, (float)MIN(scene->height, txt->dimensions.y) };
+        float spos = (xpos < 0) ? fabsf(xpos) : 0;
+        vec4 sspec = {MIN((float)txt->dimensions.x, spos), 0, MIN((spos + scene->width),(float)txt->dimensions.x), (float)txt->dimensions.y};
+
+
+        //uint8_t *ptr = (uint8_t*)scene->frame_buffer.data + (scene->frame_buffer.dimensions.x * 30 * 4);
+        //sdf_text_render(txt, ptr, (int)scene->width, (int)scene->height, scene->stride, this_time);
+
+        // if we have at least 1 pixel to render, do the composite
+        composite_rgba_over_rgba(&scene->frame_buffer,
+            text_image, 
             dspec,
-            (uint8_t*)tmem, txt->dimensions, (vec4u){0, 0, (int)ceilf(txt->dimensions.x), (int)ceilf(txt->dimensions.y)});
- 
+            sspec);
 
-        if (dump_once && frame == 60) {
-            write_png_file(dump_path, scene);
+
+        if (dump_once && frame == 120) {
+            png_write_display(dump_path, scene);
             fprintf(stderr, "[TEXT] Wrote debug frame to %s\n", dump_path->str);
         }
 
@@ -208,7 +223,7 @@ int main(int argc, char **argv) {
     // Parse command line into a new scene. Use -h to see available options.
     hub75_display_t *scene = hub75_display_parse_args(argc, argv);
 
-    //scene->stride = 4;
+    scene->stride = 4;
     // Validate configuration, allocate internal buffers, etc.
     hub75_display_start(scene);
 
@@ -229,6 +244,7 @@ int main(int argc, char **argv) {
     //  * No -s : run CPU demo
     //  * -s path/to/file.glsl : GPU shader
     //  * -s path/to/file.(mp4|mov|...) : Video playback
+    /*
     if (scene->shader_file == NULL) {
         pthread_create(&scene->render_thread, NULL, render_cpu, scene);
     } else if (access(scene->shader_file, R_OK) == 0) {
@@ -255,4 +271,5 @@ int main(int argc, char **argv) {
     // wait on threads...
     hub75_display_wait(scene);
     return 0; // not reached
+   */
 }
