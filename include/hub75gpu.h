@@ -264,7 +264,12 @@ typedef struct hub75_display {
     spsc_semring_t *ring_buf_renderer;
     spsc_semring_t *ring_buf_mapper;
 
-    /** @brief pointer to a single frame for CPU drawing functions */
+    /** @brief frame buffer for CPU drawing functions (new unified structure) */
+    image_buffer_t frame_buffer;
+
+    /** @brief pointer to a single frame for CPU drawing functions
+     *  @deprecated Use frame_buffer.data instead. Kept for compatibility during migration.
+     */
     uint8_t *image;
 
 

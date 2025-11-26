@@ -279,11 +279,11 @@ int parse_panel_offsets(const char *arg,
 
 image_buffer_t *image_buffer_new(int32_t width, int32_t height) {
     image_buffer_t *buffer;
-    size_t buf_size = sizeof(image_buffer_t) + (width * height * 4);
+    size_t buf_size = sizeof(image_buffer_t) + (size_t)(width * height * 4);
     buffer = calloc(buf_size, 1);
     buffer->dimensions.x = (int32_t)width;
     buffer->dimensions.y = (int32_t)height;
-    buffer->row_stride = width * 4;
+    buffer->row_stride = (uint32_t)width * 4;
     buffer->data = (RGBA*)(buffer + 1);
     return buffer;
 }
@@ -875,12 +875,11 @@ int64_t ts_diff_us(const struct timespec *a, const struct timespec *b) {
          + (int64_t)(a->tv_nsec - b->tv_nsec) / 1000LL;
 }
 
-int write_png_image(const char *path,
-                    const uint8_t *pixels,
-                    int width,
-                    int height,
-                    int stride) {
-    if (!path || !pixels || width <= 0 || height <= 0 || (stride != 3 && stride != 4)) return -1;
+/**
+ * @brief write an image_buffer_t to a PNG file
+ */
+int png_write_buffer(const char *path, const image_buffer_t *buffer) {
+    if (!path || !buffer)  return -1;
     FILE *fp = fopen(path, "wb");
     if (!fp) return -1;
 
@@ -896,12 +895,12 @@ int write_png_image(const char *path,
 
     png_init_io(png_ptr, fp);
 
-    uint8_t color_type = (stride == 4) ? PNG_COLOR_TYPE_RGBA : PNG_COLOR_TYPE_RGB;
-    uint8_t out_bpp = (color_type == PNG_COLOR_TYPE_RGBA) ? 4 : 3;
+    uint8_t color_type = PNG_COLOR_TYPE_RGBA;
+    uint8_t out_bpp = 4;
 
     png_set_IHDR(png_ptr, info_ptr,
-                 (png_uint_32)width,
-                 (png_uint_32)height,
+                 (png_uint_32)buffer->dimensions.x,
+                 (png_uint_32)buffer->dimensions.y,
                  8,
                  color_type,
                  PNG_INTERLACE_NONE,
@@ -910,31 +909,9 @@ int write_png_image(const char *path,
 
     png_write_info(png_ptr, info_ptr);
 
-    if (stride == out_bpp) {
-        for (int y = 0; y < height; ++y) {
-            const png_bytep row = (const png_bytep)(pixels + (size_t)y * (size_t)width * (size_t)stride);
-            png_write_row(png_ptr, row);
-        }
-    } else {
-        png_bytep rowbuf = (png_bytep)malloc((size_t)width * (size_t)out_bpp);
-        if (!rowbuf) {
-            png_destroy_write_struct(&png_ptr, &info_ptr);
-            fclose(fp);
-            return -1;
-        }
-        for (int y = 0; y < height; ++y) {
-            const uint8_t *src = pixels + (size_t)y * (size_t)width * (size_t)stride;
-            for (int x = 0; x < width; ++x) {
-                rowbuf[(size_t)x*out_bpp + 0] = src[(size_t)x*stride + 0];
-                rowbuf[(size_t)x*out_bpp + 1] = src[(size_t)x*stride + 1];
-                rowbuf[(size_t)x*out_bpp + 2] = src[(size_t)x*stride + 2];
-                if (out_bpp == 4) {
-                    rowbuf[(size_t)x*4 + 3] = (stride >= 4) ? src[(size_t)x*stride + 3] : 255;
-                }
-            }
-            png_write_row(png_ptr, rowbuf);
-        }
-        free(rowbuf);
+    for (int y = 0; y < buffer->dimensions.y; ++y) {
+        const png_bytep row = (const png_bytep)((uint8_t*)buffer->data + y * buffer->row_stride);
+        png_write_row(png_ptr, row);
     }
 
     png_write_end(png_ptr, NULL);
@@ -943,9 +920,8 @@ int write_png_image(const char *path,
     return 0;
 }
 
-void write_png_file(string_t *filename, hub75_display_t *d) {
-    if (!filename || !filename->str || !d || !d->image) return;
-    (void)write_png_image(filename->str, d->image, (int)d->width, (int)d->height, (int)d->stride);
+void png_write_display(const string_t *filename, const hub75_display_t *d) {
+    png_write_buffer(filename->str, &d->frame_buffer);
 }
 
 /* ---- Generic PNG helpers ---- */

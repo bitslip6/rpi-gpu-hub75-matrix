@@ -230,7 +230,13 @@ void sdf_text_set_orientation(sdf_text_t *t, sdf_orientation_t orient);
 void sdf_text_update(sdf_text_t *t, const int32_t display_width);
 
 /* Render entry point. time_sec is an ABSOLUTE timestamp (seconds since animation start)
- * used to position scrolling text deterministically: pos(t) = (x0,y0) + dir*speed*t. */
+ * used to position scrolling text deterministically: pos(t) = (x0,y0) + dir*speed*t.
+ * @param t - text object to render
+ * @param dst - destination buffer (RGBA format expected)
+ * @param w - destination width in pixels
+ * @param h - destination height in pixels
+ * @param stride - row stride in bytes (bytes per row, typically width * 4 for RGBA)
+ * @param time_sec - animation time in seconds */
 void sdf_text_render(sdf_text_t *t, uint8_t *dst, int w, int h, int stride, float time_sec);
 
 /* Layout helpers */

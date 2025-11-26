@@ -203,13 +203,12 @@ void* receive_udp_data(void *arg);
  */
 bool file_exists(const char *filename);
 
-void write_png_file(string_t *filename, hub75_display_t *d);
+void png_write_display(const string_t *filename, const hub75_display_t *d);
 
-int write_png_image(const char *path,
-                    const uint8_t *pixels,
-                    int width,
-                    int height,
-                    int stride);
+/**
+ * @brief write the buffer to a RGBA png at file *path
+ */
+int png_write_buffer(const char *path, const image_buffer_t *buffer);
 
 
 /* Generic PNG helpers (libpng) */

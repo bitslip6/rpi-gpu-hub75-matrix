@@ -108,36 +108,31 @@ static float calculate_gradient_factor(int x, int y, int minx, int miny, int max
  * Fills pixels from x0 to x1 (inclusive) on row y with gradient colors.
  * Uses the simple gradient system with two colors, direction, and easing.
  */
-void gradient_fill(hub75_display_t *scene, int y, int x0, int x1, 
-                                             const SimpleGradient *gradient, 
+void gradient_fill(hub75_display_t *scene, int y, int x0, int x1,
+                                             const SimpleGradient *gradient,
                                              int minx, int miny, int maxx, int maxy) {
-    if ((unsigned)y >= (unsigned)scene->height) return;
+    const int32_t w = scene->frame_buffer.dimensions.x;
+    const int32_t h = scene->frame_buffer.dimensions.y;
+    if ((unsigned)y >= (unsigned)h) return;
     if (x0 > x1) { int t = x0; x0 = x1; x1 = t; }
-    if (x1 < 0 || x0 >= scene->width) return;
+    if (x1 < 0 || x0 >= w) return;
 
-    x0 = clamp_int(x0, 0, scene->width - 1);
-    x1 = clamp_int(x1, 0, scene->width - 1);
+    x0 = clamp_int(x0, 0, w - 1);
+    x1 = clamp_int(x1, 0, w - 1);
 
-    uint8_t *row = scene->image + (y * scene->width * scene->stride);
-    size_t off = (size_t)x0 * 3u; /* RGB888 write */
-    
+    RGBA *row = scene->frame_buffer.data + (y * w);
+
     for (int x = x0; x <= x1; ++x) {
         // Calculate gradient factor for this pixel
         float grad_factor = calculate_gradient_factor(x, y, minx, miny, maxx, maxy, gradient->direction);
-        
+
         // Apply easing function
         float eased_factor = apply_easing(grad_factor, gradient->easing);
-        
+
         // Interpolate between start and end colors
-        RGB color;
-        color.r = (uint8_t)(gradient->start_color.r + (gradient->end_color.r - gradient->start_color.r) * eased_factor);
-        color.g = (uint8_t)(gradient->start_color.g + (gradient->end_color.g - gradient->start_color.g) * eased_factor);
-        color.b = (uint8_t)(gradient->start_color.b + (gradient->end_color.b - gradient->start_color.b) * eased_factor);
-        
-        row[off + 0] = color.r;
-        row[off + 1] = color.g;
-        row[off + 2] = color.b;
-        off += scene->stride;
+        row[x].r = (uint8_t)(gradient->start_color.r + (gradient->end_color.r - gradient->start_color.r) * eased_factor);
+        row[x].g = (uint8_t)(gradient->start_color.g + (gradient->end_color.g - gradient->start_color.g) * eased_factor);
+        row[x].b = (uint8_t)(gradient->start_color.b + (gradient->end_color.b - gradient->start_color.b) * eased_factor);
     }
 }
 
@@ -159,7 +154,7 @@ void gradient_fill(hub75_display_t *scene, int y, int x0, int x1,
  */
 void gradient_polygon(hub75_display_t *scene, Polygonf_t *poly, SimpleGradient gradient)
 {
-    if (!scene || !scene->image || !poly || poly->num_points < 3) {
+    if (!scene || !scene->frame_buffer.data || !poly || poly->num_points < 3) {
         debug("gradient_polygon: bad args\n");
         return;
     }

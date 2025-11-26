@@ -885,11 +885,11 @@ void sdf_text_set_orientation(sdf_text_t *t, sdf_orientation_t orient) {
 }
 
 /**
- * @param stride - pixel size in bytes (e.g., 3 for RGB, 4 for RGBA)
+ * @param stride - row stride in bytes (bytes per row, e.g., width * 4 for RGBA)
  * @param w - dst width in pixels
  * @param h - dst height in pixels
  */
-void sdf_text_render(sdf_text_t *t, uint8_t *dst, int w, int h, int stride,
+void sdf_text_render(sdf_text_t *t, uint8_t *dst, int w, int h, int row_stride,
                      float time_sec) {
   // sanity guards
   if (!t) {
@@ -908,7 +908,7 @@ void sdf_text_render(sdf_text_t *t, uint8_t *dst, int w, int h, int stride,
     debug("no destination buffer\n");
     return;
   }
-  if (w < 0 || h < 0 || stride < 0) {
+  if (w < 0 || h < 0 || row_stride < 0) {
     debug("invalid destination buffer dimensions\n");
     return;
   }
@@ -929,6 +929,8 @@ void sdf_text_render(sdf_text_t *t, uint8_t *dst, int w, int h, int stride,
 
   const float baseline_y = t->y;
 
+  int max_y = 0;
+  int max_x = 0;
   // Main render loop over all glyphs
   for (size_t i = 0; i < t->_glyph_count; ++i) {
     // get glyph for character
@@ -955,6 +957,7 @@ void sdf_text_render(sdf_text_t *t, uint8_t *dst, int w, int h, int stride,
     int x1 = MIN(w, (int)ceilf(gx0f + (float)g->width + effect_pad));
     int y1 = MIN(h, (int)ceilf(gy0f + (float)g->height + effect_pad));
 
+
     // skip degenerate glyphs
     if (x0 >= x1 || y0 >= y1) {
       // debug("clipped glyph for char code %u is outside canvas, skipping\n",
@@ -970,8 +973,11 @@ void sdf_text_render(sdf_text_t *t, uint8_t *dst, int w, int h, int stride,
     RGBA stroke = t->effects.outline_color;
     RGBA glow = t->effects.glow_color;
 
+    if (y1 > max_y) { max_y = y1; }
+    if (x1 > max_x) { max_x = x1; }
+
     for (int iy = y0; iy < y1; ++iy) {
-      uint8_t *p = dst + (iy * w * stride) + (x0 * stride);
+      uint8_t *p = dst + (iy * row_stride) + (x0 * 4);
       for (int ix = x0; ix < x1; ++ix) {
         // Local coords inside glyph (continuous), pixel center at +0.5
         const float fx = ((float)ix - gx0f) + 0.5f;
@@ -984,18 +990,22 @@ void sdf_text_render(sdf_text_t *t, uint8_t *dst, int w, int h, int stride,
 	    Normal g = step_difference(a3, MAX(a, a2));
 
         fill.a = (uint8_t)(t->color.a * a);
+        // printf("fill: %d, color.a:%d, = %f\n", fill.a, t->color.a, (double)a);
         stroke.a = (uint8_t)(t->effects.outline_color.a * a2);
         glow.a = (uint8_t)(t->effects.glow_color.a * g);
         
         composite_rgba((RGBA*)p, &glow,   (RGBA*)p);
         composite_rgba((RGBA*)p, &fill,   (RGBA*)p);
         composite_rgba((RGBA*)p, &stroke, (RGBA*)p);
-				
-        p += stride;
+
+        p += 4;
       }
     }
-    
   }
+
+  t->dimensions.y = max_y;
+  t->dimensions.x = max_x;
+  printf("MAX_Y: %dx%d\n", max_x, max_y);
 }
 
 /* Apply per-text font scaling to match t->size_px (interpreted as desired line

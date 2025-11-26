@@ -194,14 +194,23 @@ void hub75_display_start(hub75_display_t *scene) {
     // make sure the buffers are freed on re-start
     SAFE_FREE(scene->ring_buf_renderer);
     SAFE_FREE(scene->ring_buf_mapper);
-    SAFE_FREE(scene->image);
+    SAFE_FREE(scene->frame_buffer.data);
+    scene->image = NULL;
     SAFE_FREE(scene->accum);
     SAFE_FREE(scene->quant_errors_lut);
 
-    // force the buffers to be 16 byte aligned to improve auto vectorization
+    // Initialize frame_buffer structure
     size_t image_alloc = (size_t)((scene->width * scene->height) * 4);
-    scene->image = aligned_alloc(16, image_alloc);
-    memset(scene->image, 0, image_alloc);
+    scene->frame_buffer.dimensions.x = scene->width;
+    scene->frame_buffer.dimensions.y = scene->height;
+    scene->frame_buffer.row_stride = scene->width * 4;
+
+    // Allocate aligned memory for frame buffer (16 byte aligned for vectorization)
+    scene->frame_buffer.data = (RGBA*)aligned_alloc(16, image_alloc);
+    memset(scene->frame_buffer.data, 0, image_alloc);
+
+    // Compatibility shim - point legacy image pointer to frame_buffer data
+    scene->image = (uint8_t*)scene->frame_buffer.data;
 
     /* Z-buffer is managed by scene3d_t now (allocated lazily per frame) */
 

@@ -85,9 +85,9 @@ void composite_rgb(RGB* result, const RGBA* src, const RGBA* dst) {
     const uint8_t inv_a = 255 - src->a;
     const Normal bg_percent = Normal_clamp((float)((float)inv_a / 255.0f));
     const Normal fg_percent = Normal_clamp(1.0f - bg_percent);
-    result->r = (uint8_t)(src->r * fg_percent) + (uint8_t)(dst->r * bg_percent);
-    result->g = (uint8_t)(src->g * fg_percent) + (uint8_t)(dst->g * bg_percent);
-    result->b = (uint8_t)(src->b * fg_percent) + (uint8_t)(dst->b * bg_percent);
+    result->r = (uint8_t)(src->r * fg_percent + dst->r * bg_percent);
+    result->g = (uint8_t)(src->g * fg_percent + dst->g * bg_percent);
+    result->b = (uint8_t)(src->b * fg_percent + dst->b * bg_percent);
 }
 
 
@@ -97,10 +97,10 @@ inline void composite_rgba(RGBA* result, const RGBA* src, const RGBA* dst) {
     const uint8_t inv_a = 255 - src->a;
     const Normal bg_percent = Normal_clamp((float)((float)inv_a / 255.0f));
     const Normal fg_percent = Normal_clamp(1.0f - bg_percent);
-    result->r = (uint8_t)(src->r * fg_percent) + (uint8_t)(dst->r * bg_percent);
-    result->g = (uint8_t)(src->g * fg_percent) + (uint8_t)(dst->g * bg_percent);
-    result->b = (uint8_t)(src->b * fg_percent) + (uint8_t)(dst->b * bg_percent);
-    result->a = (uint8_t)((float)src->a + (float)dst->a * (1 - bg_percent));
+    result->r = (uint8_t)(src->r * fg_percent + dst->r * bg_percent);
+    result->g = (uint8_t)(src->g * fg_percent + dst->g * bg_percent);
+    result->b = (uint8_t)(src->b * fg_percent + dst->b * bg_percent);
+    result->a = (uint8_t)((float)src->a + (float)dst->a * bg_percent);
 }
 
 
@@ -117,12 +117,10 @@ void composite_rgba_over_rgba(image_buffer_t       *dst,
                                const image_buffer_t *src,
                                const vec4                  dst_quad,
                                const vec4                  src_quad) {
-    /*
     if (!dst || !src || !dst->data || !src->data) {
         printf("no data!\n");
         return;
     }
-    */
 
     /* compute integer dst bounds from float quad, preserving coverage */
     int32_t dst_x0 = (int32_t)floorf(dst_quad.x);
@@ -140,7 +138,6 @@ void composite_rgba_over_rgba(image_buffer_t       *dst,
     const int32_t dst_h = dst_y1 - dst_y0;
 
     if (dst_w <= 0 || dst_h <= 0) {
-        printf("%dx%d\n", dst_y1, dst_y0);
         return;
     }
 
@@ -174,7 +171,6 @@ void composite_rgba_over_rgba(image_buffer_t       *dst,
     const float src_h_over_dst = src_h;
 
     /* iterate over integer dst pixels in the clipped rectangle */
-    printf(" (%d-%d) x (%dx%d)\n", dst_y0, dst_y1, dst_x0, dst_x1);
     for (int32_t dy = dst_y0; dy < dst_y1; ++dy) {
         RGBA *dst_row = buffer_get_px(dst, dst_x0, dy);
 
@@ -1430,7 +1426,7 @@ static inline void apply_panel_brightness_q8(uint8_t * pixels, uint8_t *mapped_p
  * if scene->tone_mapper is updated, new bcm bit masks will be created.
  * 
  * @param scene the scene information
- * @param image the image to map to the scene bcm data. if NULL scene->image will be used
+ * @param image the image to map to the scene bcm data. if NULL scene->frame_buffer.data will be used
  */
 __attribute__((hot))
 void hub75_display_map_image_to_bcm(const hub75_display_t *scene, uint8_t *image) {
@@ -1456,14 +1452,14 @@ void hub75_display_map_image_to_bcm(const hub75_display_t *scene, uint8_t *image
         }
         if (bits != NULL) { // don't leak memory!
             SAFE_FREE(bits);
-        }   
+        }
         bits = (uint64_t*)tone_map_rgb_bits(scene, scene->bit_depth, scene->quant_errors_lut);
         build_port_luts(); // once
         debug(" [*] tone mapped bits created\n");
     }
 
-    // select our image source
-    uint8_t *image_ptr = (image == NULL) ? scene->image : image;
+    // select our image source (use frame_buffer.data as the primary source)
+    uint8_t *image_ptr = (image == NULL) ? (uint8_t*)scene->frame_buffer.data : image;
 
     if (image_ptr == NULL) {
         debug("not mapping null image");
@@ -1545,76 +1541,79 @@ float gradient_quad(uint16_t p1, uint16_t p2, uint16_t p3, uint16_t p4 __attribu
 */
 
 void hub_clear(hub75_display_t *scene) {
-    if (scene->image) {
-        size_t img_size = (size_t)(scene->width * scene->height * scene->stride);
-        memset(scene->image, 0, img_size); // always clear in case image is RGBA
+    if (scene->frame_buffer.data) {
+        size_t img_size = (size_t)(scene->frame_buffer.dimensions.x * scene->frame_buffer.dimensions.y * 4);
+        memset(scene->frame_buffer.data, 0, img_size);
     }
 }
 
 /**
- * @brief helper method to set a pixel in a 24 bpp RGB image buffer
- * 
+ * @brief helper method to set a pixel in the frame buffer
+ *
  * @param scene the scene to draw the pixel at
  * @param x horizontal position (starting at 0) clamped to scene->width
  * @param y vertical position (starting at 0) clamped to scene->height
  * @param pixel RGB value to set at pixel x,y
  */
 inline void hub_pixel(hub75_display_t *scene, const int x, const int y, const RGB pixel) {
-    const uint16_t fx = (uint16_t)MIN(x, scene->width-1);
-    const uint16_t fy = (uint16_t)MIN(y, scene->height-1);
-    const int offset = (fy * scene->width + fx) * scene->stride;
-    ASSERT(offset < scene->width * scene->height * scene->stride);
+    const int32_t w = scene->frame_buffer.dimensions.x;
+    const int32_t h = scene->frame_buffer.dimensions.y;
+    const int32_t fx = MIN(x, w - 1);
+    const int32_t fy = MIN(y, h - 1);
+    const int32_t idx = fy * w + fx;
 
-    scene->image[offset] = (uint8_t)(pixel.r);
-    scene->image[offset + 1] = (uint8_t)(pixel.g);
-    scene->image[offset + 2] = (uint8_t)(pixel.b);
+    scene->frame_buffer.data[idx].r = pixel.r;
+    scene->frame_buffer.data[idx].g = pixel.g;
+    scene->frame_buffer.data[idx].b = pixel.b;
 }
 
 /**
- * @brief helper method to set a pixel in a 24 bpp RGB image buffer, each
+ * @brief helper method to set a pixel in the frame buffer, each
  * rgb channel is scaled by factor. if scaling exceeds byte storage (255)
- * the value will wrap. saturated artithmetic is still not portable....
- * 
+ * the value will wrap. saturated arithmetic is still not portable....
+ *
  * @param scene the scene to draw the pixel at
  * @param x horizontal position (starting at 0)
  * @param y vertical position (starting at 0)
  * @param pixel RGB value to set at pixel x,y
+ * @param factor scale factor for RGB channels
  */
 inline void hub_pixel_factor(hub75_display_t *scene, const int x, const int y, const RGB pixel, const float factor) {
-    const uint16_t fx = (uint8_t)MIN(x, scene->width-1);
-    const uint16_t fy = (uint8_t)MIN(y, scene->height-1);
-    const int offset = (fy * scene->width + fx) * scene->stride;
-    ASSERT(offset < scene->width * scene->height * scene->stride);
+    const int32_t w = scene->frame_buffer.dimensions.x;
+    const int32_t h = scene->frame_buffer.dimensions.y;
+    const int32_t fx = MIN(x, w - 1);
+    const int32_t fy = MIN(y, h - 1);
+    const int32_t idx = fy * w + fx;
 
-    scene->image[offset] = (uint8_t)(pixel.r * factor);
-    scene->image[offset + 1] = (uint8_t)(pixel.g * factor);
-    scene->image[offset + 2] = (uint8_t)(pixel.b * factor);
+    scene->frame_buffer.data[idx].r = (uint8_t)(pixel.r * factor);
+    scene->frame_buffer.data[idx].g = (uint8_t)(pixel.g * factor);
+    scene->frame_buffer.data[idx].b = (uint8_t)(pixel.b * factor);
 }
 
 
 
 /**
- * @brief helper method to set a pixel in a 32 bit RGBA image buffer
+ * @brief helper method to set a pixel in the frame buffer with alpha blending
  * NOTE: You probably want hub_pixel_factor for most cases
- * 
+ *
  * @param scene the scene to draw the pixel at
  * @param x horizontal position (starting at 0)
  * @param y vertical position (starting at 0)
- * @param pixel RGB value to set at pixel x,y
+ * @param pixel RGBA value to set at pixel x,y
  */
 inline void hub_pixel_alpha(hub75_display_t *scene, const int x, const int y, const RGBA pixel) {
-    const uint16_t fx = (uint16_t)MIN(x, scene->width-1);
-    const uint16_t fy = (uint16_t)MIN(y, scene->height-1);
-    const int offset = (fy * scene->width + fx) * scene->stride;
-    ASSERT(scene->stride == 4);
-    ASSERT(offset < scene->width * scene->height * scene->stride);
+    const int32_t w = scene->frame_buffer.dimensions.x;
+    const int32_t h = scene->frame_buffer.dimensions.y;
+    const int32_t fx = MIN(x, w - 1);
+    const int32_t fy = MIN(y, h - 1);
+    const int32_t idx = fy * w + fx;
 
     Normal alpha = normalize_8(pixel.a);
 
-    scene->image[offset] += (uint8_t)(pixel.r * alpha);
-    scene->image[offset + 1] += (uint8_t)(pixel.g * alpha);
-    scene->image[offset + 2] += (uint8_t)(pixel.b * alpha);
-    scene->image[offset + 3] = pixel.a;
+    scene->frame_buffer.data[idx].r += (uint8_t)(pixel.r * alpha);
+    scene->frame_buffer.data[idx].g += (uint8_t)(pixel.g * alpha);
+    scene->frame_buffer.data[idx].b += (uint8_t)(pixel.b * alpha);
+    scene->frame_buffer.data[idx].a = pixel.a;
 }
 
 

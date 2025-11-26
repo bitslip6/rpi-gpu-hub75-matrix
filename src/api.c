@@ -747,7 +747,11 @@ static void api_clear() {
         debug("no scene set\n");
         return;
     }
-    memset(tls_scene->image, 0, (size_t)(tls_scene->width * tls_scene->height * tls_scene->stride));
+    if (tls_scene->frame_buffer.data) {
+        size_t img_size = (size_t)(tls_scene->frame_buffer.dimensions.x *
+                                   tls_scene->frame_buffer.dimensions.y * 4);
+        memset(tls_scene->frame_buffer.data, 0, img_size);
+    }
 }
 
 /**
@@ -816,7 +820,7 @@ static void api_line_aa(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB 
  * This must be called before any drawing operations and paired with api_frame_end().
  * Waits up to 10ms for a buffer to become available.
  * 
- * Sets tls_scene->frame_ready to false and updates tls_scene->image pointer.
+ * Sets tls_scene->frame_ready to false and updates tls_scene->frame_buffer.data pointer.
  */
 static void api_frame_begin() {
     if (tls_scene == NULL) {
@@ -838,8 +842,10 @@ static void api_frame_begin() {
         return;
     }
     tls_scene->frame_ready = false;
-    
-    tls_scene->image = image;
+
+    // Update frame_buffer.data (primary) and legacy image pointer (compatibility shim)
+    tls_scene->frame_buffer.data = (RGBA*)image;
+    tls_scene->image = image;  // TODO: remove once migration complete
 }
 
 /**
@@ -883,39 +889,36 @@ static void api_frame_end() {
  * Uses RGB888 format (3 bytes per pixel).
  */
 static inline void fill_span_rgb(hub75_display_t *scene, int y, int x0, int x1, RGB c) {
-    if ((unsigned)y >= (unsigned)scene->height) return;
+    const int32_t w = scene->frame_buffer.dimensions.x;
+    const int32_t h = scene->frame_buffer.dimensions.y;
+    if ((unsigned)y >= (unsigned)h) return;
     if (x0 > x1) { int t = x0; x0 = x1; x1 = t; }
-    if (x1 < 0 || x0 >= scene->width) return;
+    if (x1 < 0 || x0 >= w) return;
 
-    x0 = clamp_int(x0, 0, scene->width - 1);
-    x1 = clamp_int(x1, 0, scene->width - 1);
+    x0 = clamp_int(x0, 0, w - 1);
+    x1 = clamp_int(x1, 0, w - 1);
 
-    uint8_t *row = scene->image + (y * scene->width * scene->stride);
-    size_t off = (size_t)x0 * scene->stride;                 /* RGB888 write */
+    RGBA *row = scene->frame_buffer.data + (y * w);
     for (int x = x0; x <= x1; ++x) {
-        row[off + 0] = c.r;
-        row[off + 1] = c.g;
-        row[off + 2] = c.b;
-        off += scene->stride;
+        row[x].r = c.r;
+        row[x].g = c.g;
+        row[x].b = c.b;
     }
 }
 
 static inline void fill_span_rgba(hub75_display_t *scene, int y, int x0, int x1, RGBA c) {
-    if ((unsigned)y >= (unsigned)scene->height) return;
+    const int32_t w = scene->frame_buffer.dimensions.x;
+    const int32_t h = scene->frame_buffer.dimensions.y;
+    if ((unsigned)y >= (unsigned)h) return;
     if (x0 > x1) { int t = x0; x0 = x1; x1 = t; }
-    if (x1 < 0 || x0 >= scene->width) return;
+    if (x1 < 0 || x0 >= w) return;
 
-    x0 = clamp_int(x0, 0, scene->width - 1);
-    x1 = clamp_int(x1, 0, scene->width - 1);
+    x0 = clamp_int(x0, 0, w - 1);
+    x1 = clamp_int(x1, 0, w - 1);
 
-    uint8_t *row = scene->image + (y * scene->width * scene->stride);
-    size_t off = (size_t)x0 * scene->stride;                 /* RGB888 write */
+    RGBA *row = scene->frame_buffer.data + (y * w);
     for (int x = x0; x <= x1; ++x) {
-        row[off + 0] = c.r;
-        row[off + 1] = c.g;
-        row[off + 2] = c.b;
-        row[off + 3] = c.a;
-        off += scene->stride;
+        row[x] = c;
     }
 }
 
@@ -940,7 +943,7 @@ static inline void fill_span_rgba(hub75_display_t *scene, int y, int x0, int x1,
  */
 void draw_polygon_fill(hub75_display_t *scene, Polygonf_t *poly, RGBA color)
 {
-    if (!scene || !scene->image || !poly || poly->num_points < 3) {
+    if (!scene || !scene->frame_buffer.data || !poly || poly->num_points < 3) {
         debug("draw_polygon: bad args\n");
         return;
     }
@@ -1021,7 +1024,7 @@ static inline void draw_triangle_gouraud(hub75_display_t *scene,
                                          const _TriFill *tri_in,
                                          uint16_t *zbuf,
                                          int zbuf_width) {
-    if (!scene || !scene->image || !tri_in) return;
+    if (!scene || !scene->frame_buffer.data || !tri_in) return;
     const Polygonf_t *poly = &tri_in->poly;
     if (poly->num_points != 3) return;
     const RGB *vcolor = tri_in->vcolor;
@@ -1139,8 +1142,7 @@ static inline void draw_triangle_gouraud(hub75_display_t *scene,
     int g_row = (int)lrintf((w0_row_f*g0 + w1_row_f*g1 + w2_row_f*g2) * (float)ONE);
     int b_row = (int)lrintf((w0_row_f*b0 + w1_row_f*b1 + w2_row_f*b2) * (float)ONE);
 
-    size_t row_stride  = (size_t)scene->width * (size_t)scene->stride;
-    // const int fb_width = scene->width;
+    const int32_t fb_width = scene->frame_buffer.dimensions.x;
 
     /* Per-pixel shadow inputs using camera w for perspective-correct interpolation */
     const bool do_px_shadow = (tri_in->per_pixel_shadow && tls_shadow_maps && tri_in->sm_light_index < tls_shadow_count);
@@ -1189,8 +1191,8 @@ static inline void draw_triangle_gouraud(hub75_display_t *scene,
         z_row = (int)lrintf(w0_row_f*z0 + w1_row_f*z1 + w2_row_f*z2);
     }
     for (int py = miny; py <= maxy; ++py) {
-        uint8_t *p = scene->image + (size_t)py * row_stride + (size_t)minx * (size_t)scene->stride;
-    uint16_t *pz = use_z ? (zbuf + (size_t)py * (size_t)zbuf_width + (size_t)minx) : NULL;
+        RGBA *p = scene->frame_buffer.data + py * fb_width + minx;
+        uint16_t *pz = use_z ? (zbuf + (size_t)py * (size_t)zbuf_width + (size_t)minx) : NULL;
         int E0 = E0_row, E1 = E1_row, E2 = E2_row;
         int rfp = r_row, gfp = g_row, bfp = b_row;
         int zfp = z_row;
@@ -1221,7 +1223,7 @@ static inline void draw_triangle_gouraud(hub75_display_t *scene,
                                 b8 = (int)lrintf(vis * (float)b8);
                             }
                         }
-                        p[0] = (uint8_t)r8; p[1] = (uint8_t)g8; p[2] = (uint8_t)b8;
+                        p->r = (uint8_t)r8; p->g = (uint8_t)g8; p->b = (uint8_t)b8;
                         *pz = (uint16_t)zcl;
                     }
                 } else {
@@ -1244,14 +1246,14 @@ static inline void draw_triangle_gouraud(hub75_display_t *scene,
                             b8 = (int)lrintf(vis * (float)b8);
                         }
                     }
-                    p[0] = (uint8_t)r8; p[1] = (uint8_t)g8; p[2] = (uint8_t)b8;
+                    p->r = (uint8_t)r8; p->g = (uint8_t)g8; p->b = (uint8_t)b8;
                 }
             }
             E0 += dE0dx; E1 += dE1dx; E2 += dE2dx;
             rfp += drdx; gfp += dgdx; bfp += dbdx;
             if (use_z) { zfp += dzdx; pz++; }
             if (do_px_shadow && SM) { tx_row += dtxdx; ty_row += dtydx; tz_row += dtzdx; tw_row += dtwdx; iwc_row += diwcdx; }
-            p += scene->stride;
+            p++;
         }
         E0_row += dE0dy; E1_row += dE1dy; E2_row += dE2dy;
         r_row += drdy; g_row += dgdy; b_row += dbdy;
@@ -1871,9 +1873,9 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
                     float dzdy = dw0dy * z0 + dw1dy * z1f + w2dy * z2f;
                     float z_row = w0_row * z0 + w1_row * z1f + w2_row * z2f;
 
-                    size_t row_stride = (size_t)tls_scene->width * (size_t)tls_scene->stride;
+                    const int32_t fb_w = tls_scene->frame_buffer.dimensions.x;
                     for (int py = miny; py <= maxy; ++py) {
-                        uint8_t *p = tls_scene->image + (size_t)py * row_stride + (size_t)minx * (size_t)tls_scene->stride;
+                        RGBA *p = tls_scene->frame_buffer.data + py * fb_w + minx;
                         uint16_t *pz = (zptr ? zptr + (size_t)py * (size_t)zw + (size_t)minx : NULL);
                         int E0 = E0_row, E1 = E1_row, E2 = E2_row;
                         float vis_fp = vis_row;
@@ -1892,22 +1894,22 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
                                     float lg = (float)shd.g + v * ((float)lit.g - (float)shd.g);
                                     float lb = (float)shd.b + v * ((float)lit.b - (float)shd.b);
                                     float s = strength, invs = 1.0f - s;
-                                    float r = invs * (float)p[0] + s * lr;
-                                    float g = invs * (float)p[1] + s * lg;
-                                    float b = invs * (float)p[2] + s * lb;
+                                    float r = invs * (float)p->r + s * lr;
+                                    float g = invs * (float)p->g + s * lg;
+                                    float b = invs * (float)p->b + s * lb;
                                     if (r < 0) r = 0;
                                     if (r > 255) r = 255;
                                     if (g < 0) g = 0;
                                     if (g > 255) g = 255;
                                     if (b < 0) b = 0;
                                     if (b > 255) b = 255;
-                                    p[0] = (uint8_t)r; p[1] = (uint8_t)g; p[2] = (uint8_t)b;
+                                    p->r = (uint8_t)r; p->g = (uint8_t)g; p->b = (uint8_t)b;
                                 }
                             }
                             E0 += dE0dx; E1 += dE1dx; E2 += dE2dx;
                             vis_fp += (dw0dx * v0 + dw1dx * v1f + w2dx * v2f);
                             zfp += dzdx;
-                            p += tls_scene->stride; if (pz) ++pz;
+                            p++; if (pz) ++pz;
                         }
                         E0_row += dE0dy; E1_row += dE1dy; E2_row += dE2dy;
                         vis_row += (dw0dy * v0 + dw1dy * v1f + w2dy * v2f);
@@ -2273,10 +2275,9 @@ static void api_render_scene3d(const camera_t *cam, const scene3d_t *os, const s
     }
 
     /* Debug overlay: screen-space checker drawn after rendering */
-    if (tls_scene && os->debug.overlay_checker && tls_scene->image) {
-        const int W = tls_scene->width;
-        const int H = tls_scene->height;
-        const int stride = tls_scene->stride;
+    if (tls_scene && os->debug.overlay_checker && tls_scene->frame_buffer.data) {
+        const int W = tls_scene->frame_buffer.dimensions.x;
+        const int H = tls_scene->frame_buffer.dimensions.y;
         const int tile = os->debug.checker_size > 0 ? os->debug.checker_size : 8;
         const float s = os->debug.checker_strength;
         const float invs = 1.0f - s;
@@ -2284,15 +2285,15 @@ static void api_render_scene3d(const camera_t *cam, const scene3d_t *os, const s
         const float cg = (float)os->debug.checker_color.g;
         const float cb = (float)os->debug.checker_color.b;
         for (int y = 0; y < H; ++y) {
-            uint8_t *row = tls_scene->image + (size_t)y * (size_t)W * (size_t)stride;
+            RGBA *row = tls_scene->frame_buffer.data + y * W;
             int ty = (y / tile);
             for (int x = 0; x < W; ++x) {
                 int tx = (x / tile);
                 if (((tx + ty) & 1) == 0) {
-                    uint8_t *p = row + (size_t)x * (size_t)stride;
-                    float r = (float)p[0];
-                    float g = (float)p[1];
-                    float b = (float)p[2];
+                    RGBA *p = &row[x];
+                    float r = (float)p->r;
+                    float g = (float)p->g;
+                    float b = (float)p->b;
                     r = invs * r + s * cr;
                     g = invs * g + s * cg;
                     b = invs * b + s * cb;
@@ -2302,7 +2303,7 @@ static void api_render_scene3d(const camera_t *cam, const scene3d_t *os, const s
                     if (g > 255.f) g = 255.f;
                     if (b < 0.f) b = 0.f;
                     if (b > 255.f) b = 255.f;
-                    p[0] = (uint8_t)r; p[1] = (uint8_t)g; p[2] = (uint8_t)b;
+                    p->r = (uint8_t)r; p->g = (uint8_t)g; p->b = (uint8_t)b;
                 }
             }
         }
