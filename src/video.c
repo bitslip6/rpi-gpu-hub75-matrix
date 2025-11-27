@@ -39,7 +39,7 @@ void* render_video_fn(void *arg) {
 bool hub_render_video(scene_info *scene, const char *filename) {
     AVFormatContext *format_ctx = NULL;
     AVCodecContext  *codec_ctx  = NULL;
-    AVCodec   *codec      = NULL;
+    const AVCodec   *codec      = NULL;
     AVFrame *frame = NULL, *frame_rgb = NULL;
     AVPacket *packet = NULL;
     struct SwsContext *sws_ctx = NULL;
