@@ -36,6 +36,7 @@
 #include "pixels.h"
 #include "spsc.h"
 #include "text_sdf.h"
+#include "compositor.h"
 
 #define HAVE_LIBPNG 1
 #ifdef HAVE_LIBPNG
@@ -729,7 +730,7 @@ static image_buffer_t *text_render_sdf(char *sdf_path, char *msg, float size_px,
  * @param arg A pointer to a hub75_display_t structure containing rendering parameters such as shader file,
  *          dimensions, and FPS settings.
  */
-void *render_shader(void *arg)
+void *main_render_shader(void *arg)
 {
     hub75_display_t *scene = (hub75_display_t *)arg;
     debug(" ~~ render shader 2: %s\n", scene->shader_file);
@@ -796,7 +797,6 @@ void *render_shader(void *arg)
     image_buffer_t *image = text_render_sdf("assets/roboto", "You are pretty good at this   ", 128.0f, white, 1.0f, 0.1f, black);
 
     // main loop
-    vec2u ddim = {scene->width, scene->height};
     while (scene->do_render)
     {
         // update the time uniforms
@@ -843,13 +843,20 @@ void *render_shader(void *arg)
         {
             glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, dst);
 
-            vec4u dspec = {MAX(0, xpos), 16, scene->width, 168};
+            // Create image_buffer_t wrapper for destination
+            image_buffer_t dst_buffer = {
+                .dimensions = {scene->width, scene->height},
+                .row_stride = scene->width * 4,
+                .data = (RGBA*)dst
+            };
+
+            // Calculate rectangles for compositing
+            vec4 dst_rect = {(float)MAX(0, xpos), 16.0f, (float)scene->width, 168.0f};
             int32_t spos = (xpos < 0) ? abs(xpos) : 0;
-            vec4u sspec = {MIN(image->dimensions.x, spos), 0, image->dimensions.x, image->dimensions.y};
-            blit_composite_rgba_over_rgba(
-                (uint8_t*)dst, ddim,
-                dspec,
-                (uint8_t*)image->data, image->dimensions, sspec);
+            vec4 src_rect = {(float)MIN(image->dimensions.x, spos), 0.0f, 
+                             (float)image->dimensions.x, (float)image->dimensions.y};
+            
+            composite_rgba_over_rgba(&dst_buffer, image, dst_rect, src_rect);
             spsc_push_ptr_commit(scene->ring_buf_mapper);
         }
         else

@@ -1,5 +1,4 @@
 // Clean includes (repaired)
-#include "text_sdf.h"
 
 #include "functions.h"
 #include "pixels.h"
@@ -11,6 +10,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+
+#include "text_sdf.h"
+#include "compositor.h"
 
 /* Forward declaration for bilinear sampler used in font scaling and rendering
  */

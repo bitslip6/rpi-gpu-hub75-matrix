@@ -24,16 +24,9 @@
 #include "pixels.h"
 #include "mymath.h"
 #include "spsc.h"
+#include "compositor.h"
 
-/**
- * @brief Entry point for the mapper thread. Continuously monitors the filled ring buffer,
- *              maps the rendered GPU image to the display system, and signals frame updates.
- * 
- * @param arg: Pointer to a mapper_ctx_t structure containing context for the mapper thread, including
- *          ring buffers and scene information.
- * Returns: Pointer indicating thread termination (unused in this context).
- */
-void *mapper_thread_main(void *arg)
+void *main_thread_mapper(void *arg)
 {
     debug(" [+] BCM mapper thread starting\n");
 
@@ -56,274 +49,16 @@ void *mapper_thread_main(void *arg)
     return NULL;
 }
 
-
 /**
  * helper to get a pixel from a buffer. compiler will inline
  */
-static inline RGBA *buffer_get_px(const image_buffer_t *buffer, int32_t x, int32_t y) {
+__attribute__((hot))
+RGBA *buffer_get_px(const image_buffer_t *buffer, int32_t x, int32_t y) {
     const uint32_t stride_px = buffer->row_stride / sizeof(RGBA);
     return buffer->data + (uint32_t)y * stride_px + (uint32_t)x;
 }
 
 
-/**
- * @brief interpolate between two colors
- * 
- */
-__attribute__((hot))
-void interpolate_rgb(RGB* result, const RGB* start, const RGB* end, const Normal ratio) {
-    result->r = (uint8_t)(start->r + (end->r - start->r) * ratio);
-    result->g = (uint8_t)(start->g + (end->g - start->g) * ratio);
-    result->b = (uint8_t)(start->b + (end->b - start->b) * ratio);
-}
-
-
-
-__attribute__((hot))
-void composite_rgb(RGB* result, const RGBA* src, const RGBA* dst) {
-    // Standard straight-alpha "over": out = src*alpha + dst*(1 - alpha)
-    const uint8_t inv_a = 255 - src->a;
-    const Normal bg_percent = Normal_clamp((float)((float)inv_a / 255.0f));
-    const Normal fg_percent = Normal_clamp(1.0f - bg_percent);
-    result->r = (uint8_t)(src->r * fg_percent + dst->r * bg_percent);
-    result->g = (uint8_t)(src->g * fg_percent + dst->g * bg_percent);
-    result->b = (uint8_t)(src->b * fg_percent + dst->b * bg_percent);
-}
-
-
-__attribute__((hot))
-inline void composite_rgba(RGBA* result, const RGBA* src, const RGBA* dst) {
-    // Standard straight-alpha "over": out = src*alpha + dst*(1 - alpha)
-    const uint8_t inv_a = 255 - src->a;
-    const Normal bg_percent = Normal_clamp((float)((float)inv_a / 255.0f));
-    const Normal fg_percent = Normal_clamp(1.0f - bg_percent);
-    result->r = (uint8_t)(src->r * fg_percent + dst->r * bg_percent);
-    result->g = (uint8_t)(src->g * fg_percent + dst->g * bg_percent);
-    result->b = (uint8_t)(src->b * fg_percent + dst->b * bg_percent);
-    result->a = (uint8_t)((float)src->a + (float)dst->a * bg_percent);
-}
-
-
-/**
- * Composite src onto dst with sub pixel sampling and scaling.
- *
- * src_quad and dst_quad are in float image space, [x0, y0, x1, y1).
- * The area src_quad is mapped onto dst_quad.
- *
- * Example: to scale a src rect 100x50 into a dst rect 200x100,
- * pass src_quad = {0,0,100,50}, dst_quad = {dx,dy,dx+200,dy+100}.
- */
-void composite_rgba_over_rgba(image_buffer_t       *dst,
-                               const image_buffer_t *src,
-                               const vec4                  dst_quad,
-                               const vec4                  src_quad) {
-    if (!dst || !src || !dst->data || !src->data) {
-        printf("no data!\n");
-        return;
-    }
-
-    /* compute integer dst bounds from float quad, preserving coverage */
-    int32_t dst_x0 = (int32_t)floorf(dst_quad.x);
-    int32_t dst_y0 = (int32_t)floorf(dst_quad.y);
-    int32_t dst_x1 = (int32_t)ceilf(dst_quad.z);
-    int32_t dst_y1 = (int32_t)ceilf(dst_quad.w);
-
-    /* clamp dst rect to dst image bounds */
-    dst_x0 = clamp_int(dst_x0, 0, dst->dimensions.x);
-    dst_y0 = clamp_int(dst_y0, 0, dst->dimensions.y);
-    dst_x1 = clamp_int(dst_x1, 0, dst->dimensions.x);
-    dst_y1 = clamp_int(dst_y1, 0, dst->dimensions.y);
-
-    const int32_t dst_w = dst_x1 - dst_x0;
-    const int32_t dst_h = dst_y1 - dst_y0;
-
-    if (dst_w <= 0 || dst_h <= 0) {
-        return;
-    }
-
-    /* precompute src extents and sizes in float space */
-    const float src_x0 = src_quad.x;
-    const float src_y0 = src_quad.y;
-    const float src_x1 = src_quad.z;
-    const float src_y1 = src_quad.w;
-
-    const float src_w  = src_x1 - src_x0;
-    const float src_h  = src_y1 - src_y0;
-
-    if (src_w <= 0.0f || src_h <= 0.0f) {
-        printf("src hw < 0\n");
-        return;
-    }
-
-    const float dst_quad_w = dst_quad.z - dst_quad.x;
-    const float dst_quad_h = dst_quad.w - dst_quad.y;
-
-    if (dst_quad_w <= 0.0f || dst_quad_h <= 0.0f) {
-        printf("dquad < 0\n");
-        return;
-    }
-
-    /* ratios: how dst float positions map into src float positions */
-    const float inv_dst_quad_w = 1.0f / dst_quad_w;
-    const float inv_dst_quad_h = 1.0f / dst_quad_h;
-
-    const float src_w_over_dst = src_w;
-    const float src_h_over_dst = src_h;
-
-    /* iterate over integer dst pixels in the clipped rectangle */
-    for (int32_t dy = dst_y0; dy < dst_y1; ++dy) {
-        RGBA *dst_row = buffer_get_px(dst, dst_x0, dy);
-
-        for (int32_t dx = dst_x0; dx < dst_x1; ++dx) {
-            /* compute normalized position of this dst pixel center inside dst_quad */
-            const float dst_fx = (float)dx + 0.5f;
-            const float dst_fy = (float)dy + 0.5f;
-
-            const float u = clampf((dst_fx - dst_quad.x) * inv_dst_quad_w, 0.0f, 1.0f);
-            const float v = clampf((dst_fy - dst_quad.y) * inv_dst_quad_h, 0.0f, 1.0f);
-
-            /* map normalized coords into src_quad space (sub pixel) */
-            const float sx = src_x0 + u * src_w_over_dst;
-            const float sy = src_y0 + v * src_h_over_dst;
-
-            RGBA src_sample;
-            sample_rgba_bilinear(&src_sample, src, sx, sy);
-            src_sample.b = 128;
-
-            RGBA *dst_px = dst_row + (dx - dst_x0);
-            composite_rgba(dst_px, &src_sample, dst_px);
-        }
-    }
-}
-
-
-
-/**
- * @param dst      the target buffer (RGBA, tightly packed, 4 bytes per pixel)
- * @param dst_dim  target buffer dimensions in pixels (width, height)
- * @param dst_quad target region in dst, in pixels, [x0, y0, x1, y1)
- * @param src      the source buffer (RGBA, tightly packed, 4 bytes per pixel)
- * @param src_dim  source buffer dimensions in pixels (width, height)
- * @param src_quad source region in src, in pixels, [x0, y0, x1, y1)
- *
- * Both quads are interpreted as half open: x in [x0, x1), y in [y0, y1).
- */
-void blit_composite_rgba_over_rgba(uint8_t * __restrict__ dst,
-                                   const vec2u dst_dim,
-                                   const vec4u dst_quad,
-                                   const uint8_t * __restrict__ src,
-                                   const vec2u src_dim,
-                                   const vec4u src_quad) {
-    if (!dst || !src) {
-        debug("null src or dst pointers in composite region\n");
-        return;
-    }
-
-    /* unpack coordinates */
-    const int32_t dst_x0 = (int32_t)dst_quad.x;
-    const int32_t dst_y0 = (int32_t)dst_quad.y;
-    const int32_t dst_x1 = (int32_t)dst_quad.z;
-    const int32_t dst_y1 = (int32_t)dst_quad.w;
-
-    const int32_t src_x0 = (int32_t)src_quad.x;
-    const int32_t src_y0 = (int32_t)src_quad.y;
-    const int32_t src_x1 = (int32_t)src_quad.z;
-    const int32_t src_y1 = (int32_t)src_quad.w;
-
-    /* basic sanity checks */
-    if (dst_x0 < 0 || dst_y0 < 0 || src_x0 < 0 || src_y0 < 0) {
-        debug("negative coords in composite region\n");
-        return;
-    }
-
-    if (dst_x1 > (int32_t)dst_dim.x || dst_y1 > (int32_t)dst_dim.y ||
-        src_x1 > (int32_t)src_dim.x || src_y1 > (int32_t)src_dim.y) {
-        debug("composite quad outside image bounds\n");
-        return;
-    }
-
-    const int32_t dst_w = dst_x1 - dst_x0;
-    const int32_t dst_h = dst_y1 - dst_y0;
-    const int32_t src_w = src_x1 - src_x0;
-    const int32_t src_h = src_y1 - src_y0;
-
-    if (dst_w <= 0 || dst_h <= 0 || src_w <= 0 || src_h <= 0) {
-        debug("non positive composite dimensions %d, %d, %d, %d\n", dst_w, dst_h, src_w, src_h);
-        return;
-    }
-
-    /* final width and height we will actually draw, clipped to smaller of the two */
-    const int32_t width  = MIN(dst_w, src_w);
-    const int32_t height = MIN(dst_h, src_h);
-
-    /* bytes per pixel, adjust if you support other formats */
-    const size_t bpp = 4;
-
-    const size_t dst_stride_px = (size_t)dst_dim.x;
-    const size_t src_stride_px = (size_t)src_dim.x;
-
-
-    for (int32_t y = 0; y < height; ++y) {
-        const int32_t dy = dst_y0 + y;
-        const int32_t sy = src_y0 + y;
-
-        /* offsets in pixels from start of image */
-        const size_t d_offset_px = (size_t)dy * dst_stride_px + (size_t)dst_x0;
-        const size_t s_offset_px = (size_t)sy * src_stride_px + (size_t)src_x0;
-
-        /* convert to byte offsets */
-        RGBA *d = (RGBA *)(dst + d_offset_px * bpp);
-        const RGBA *s = (const RGBA *)(src + s_offset_px * bpp);
-
-        for (int32_t x = 0; x < width; ++x) {
-            composite_rgba(&d[x], &s[x], &d[x]);
-        }
-    }
-}
-
-
-__attribute__((hot))
-void blit_composite_rgb_over_rgb(uint8_t * __restrict__ dst, int dst_stride,
-                                 const uint8_t * __restrict__ src, int src_stride,
-                                 int width, int height, uint8_t global_alpha) {
-    if (!dst || !src || width <= 0 || height <= 0) return;
-    const int w3 = width * 3;
-    const uint16_t a = global_alpha;
-    const uint16_t inv = 255u - a;
-    for (int y = 0; y < height; ++y) {
-        uint8_t * __restrict__ d = dst + (size_t)y * (size_t)dst_stride;
-        const uint8_t * __restrict__ s = src + (size_t)y * (size_t)src_stride;
-        for (int x = 0; x < w3; x += 3) {
-            const uint8_t sR = s[x + 0];
-            const uint8_t sG = s[x + 1];
-            const uint8_t sB = s[x + 2];
-
-            const uint8_t dR = d[x + 0];
-            const uint8_t dG = d[x + 1];
-            const uint8_t dB = d[x + 2];
-
-            // need an intermediate to avoid vompiler warning about sign conversion
-            const uint32_t r =
-                (uint32_t)sR * (uint32_t)a +
-                (uint32_t)dR * (uint32_t)inv +
-                127u;
-
-            const uint32_t g =
-                (uint32_t)sG * (uint32_t)a +
-                (uint32_t)dG * (uint32_t)inv +
-                127u;
-
-            const uint32_t b =
-                (uint32_t)sB * (uint32_t)a +
-                (uint32_t)dB * (uint32_t)inv +
-                127u;
-
-            d[x + 0] = (uint8_t)(r / 255u);
-            d[x + 1] = (uint8_t)(g / 255u);
-            d[x + 2] = (uint8_t)(b / 255u);
-        }
-    }
-}
 
 
 /**
@@ -1420,16 +1155,8 @@ static inline void apply_panel_brightness_q8(uint8_t * pixels, uint8_t *mapped_p
 
 
 
-/**
- * @brief this function takes the image data and maps it to the bcm signal.
- * 
- * if scene->tone_mapper is updated, new bcm bit masks will be created.
- * 
- * @param scene the scene information
- * @param image the image to map to the scene bcm data. if NULL scene->frame_buffer.data will be used
- */
 __attribute__((hot))
-void hub75_display_map_image_to_bcm(const hub75_display_t *scene, uint8_t *image) {
+hub75_error_t hub75_display_map_image_to_bcm(const hub75_display_t *scene, uint8_t *image) {
 
     // tone map the bits for the current scene, update if the lookup table if scene tone mapping changes....
     // TODO: create per panel tone mapping tables if panels have different characteristics
@@ -1450,7 +1177,7 @@ void hub75_display_map_image_to_bcm(const hub75_display_t *scene, uint8_t *image
         if (mapped_image2 == NULL) {
             mapped_image2 = (uint8_t*)calloc(image_sz, sizeof(uint8_t));
         }
-        if (bits != NULL) { // don't leak memory!
+        if (bits != NULL) {
             SAFE_FREE(bits);
         }
         bits = (uint64_t*)tone_map_rgb_bits(scene, scene->bit_depth, scene->quant_errors_lut);
@@ -1462,8 +1189,8 @@ void hub75_display_map_image_to_bcm(const hub75_display_t *scene, uint8_t *image
     uint8_t *image_ptr = (image == NULL) ? (uint8_t*)scene->frame_buffer.data : image;
 
     if (image_ptr == NULL) {
-        debug("not mapping null image");
-        return;
+        debug(" [!!] not mapping null image");
+        return HUB75_ERR_NULL_PARAM;
     }
 
     // map the image to handle weird panel chain configurations
@@ -1492,8 +1219,8 @@ void hub75_display_map_image_to_bcm(const hub75_display_t *scene, uint8_t *image
     uint32_t *bcm_signal = (uint32_t *) spsc_push_ptr_begin(scene->ring_buf_renderer, 200);
     if (!bcm_signal) {
         // we are dropping a frame, just return
-        debug("dropping mapp frame\n");
-        return;
+        debug("dropping map frame, bcm ring buffer is full\n");
+        return HUB75_ERR_RING_BUFFER_FULL;
     }
 
     // convenience variables
@@ -1516,6 +1243,7 @@ void hub75_display_map_image_to_bcm(const hub75_display_t *scene, uint8_t *image
     }
 
     spsc_push_ptr_commit(scene->ring_buf_renderer);
+    return HUB75_OK;
 }
 
 
@@ -1555,65 +1283,60 @@ void hub_clear(hub75_display_t *scene) {
  * @param y vertical position (starting at 0) clamped to scene->height
  * @param pixel RGB value to set at pixel x,y
  */
-inline void hub_pixel(hub75_display_t *scene, const int x, const int y, const RGB pixel) {
+inline void draw_pixel(hub75_display_t *scene, const int x, const int y, const RGBA pixel) {
     const int32_t w = scene->frame_buffer.dimensions.x;
     const int32_t h = scene->frame_buffer.dimensions.y;
     const int32_t fx = MIN(x, w - 1);
     const int32_t fy = MIN(y, h - 1);
     const int32_t idx = fy * w + fx;
 
-    scene->frame_buffer.data[idx].r = pixel.r;
-    scene->frame_buffer.data[idx].g = pixel.g;
-    scene->frame_buffer.data[idx].b = pixel.b;
+    if (pixel.a == 255) {
+        scene->frame_buffer.data[idx] = pixel;
+        return;
+    }
+
+    composite_rgba(&scene->frame_buffer.data[idx], &pixel, &scene->frame_buffer.data[idx]);
 }
-
-/**
- * @brief helper method to set a pixel in the frame buffer, each
- * rgb channel is scaled by factor. if scaling exceeds byte storage (255)
- * the value will wrap. saturated arithmetic is still not portable....
- *
- * @param scene the scene to draw the pixel at
- * @param x horizontal position (starting at 0)
- * @param y vertical position (starting at 0)
- * @param pixel RGB value to set at pixel x,y
- * @param factor scale factor for RGB channels
- */
-inline void hub_pixel_factor(hub75_display_t *scene, const int x, const int y, const RGB pixel, const float factor) {
-    const int32_t w = scene->frame_buffer.dimensions.x;
-    const int32_t h = scene->frame_buffer.dimensions.y;
-    const int32_t fx = MIN(x, w - 1);
-    const int32_t fy = MIN(y, h - 1);
-    const int32_t idx = fy * w + fx;
-
-    scene->frame_buffer.data[idx].r = (uint8_t)(pixel.r * factor);
-    scene->frame_buffer.data[idx].g = (uint8_t)(pixel.g * factor);
-    scene->frame_buffer.data[idx].b = (uint8_t)(pixel.b * factor);
-}
-
-
 
 /**
  * @brief helper method to set a pixel in the frame buffer with alpha blending
- * NOTE: You probably want hub_pixel_factor for most cases
+ * NOTE: You probably want draw_pixel_factor for most cases
  *
  * @param scene the scene to draw the pixel at
  * @param x horizontal position (starting at 0)
  * @param y vertical position (starting at 0)
- * @param pixel RGBA value to set at pixel x,y
+ * @param pixel RGBA value to composite at pixel x,y
+ * 
+ * For alpha == 255 (fully opaque), uses fast direct assignment.
+ * For alpha < 255, performs proper alpha blending:
+ *   result = src * alpha + dst * (1 - alpha)
  */
-inline void hub_pixel_alpha(hub75_display_t *scene, const int x, const int y, const RGBA pixel) {
+inline void draw_pixel_alpha(hub75_display_t *scene, const int x, const int y, const RGBA pixel) {
     const int32_t w = scene->frame_buffer.dimensions.x;
     const int32_t h = scene->frame_buffer.dimensions.y;
     const int32_t fx = MIN(x, w - 1);
     const int32_t fy = MIN(y, h - 1);
     const int32_t idx = fy * w + fx;
-
-    Normal alpha = normalize_8(pixel.a);
-
-    scene->frame_buffer.data[idx].r += (uint8_t)(pixel.r * alpha);
-    scene->frame_buffer.data[idx].g += (uint8_t)(pixel.g * alpha);
-    scene->frame_buffer.data[idx].b += (uint8_t)(pixel.b * alpha);
-    scene->frame_buffer.data[idx].a = pixel.a;
+    
+    RGBA *dst = &scene->frame_buffer.data[idx];
+    
+    // Fast path for fully opaque pixels - direct assignment
+    if (pixel.a == 255) {
+        *dst = pixel;
+        return;
+    }
+    
+    // Alpha compositing for semi-transparent pixels
+    if (pixel.a > 0) {
+        const uint32_t alpha = pixel.a;
+        const uint32_t inv_alpha = 255 - alpha;
+        
+        dst->r = (uint8_t)((pixel.r * alpha + dst->r * inv_alpha) / 255);
+        dst->g = (uint8_t)((pixel.g * alpha + dst->g * inv_alpha) / 255);
+        dst->b = (uint8_t)((pixel.b * alpha + dst->b * inv_alpha) / 255);
+        dst->a = (uint8_t)(alpha + (dst->a * inv_alpha) / 255);
+    }
+    // alpha == 0: no-op, pixel is fully transparent
 }
 
 
@@ -1643,9 +1366,10 @@ void hub_fill(hub75_display_t *scene, const uint16_t x1, const uint16_t y1, cons
         fy1 = fy2;
         fy2 = temp;
     }
+    RGBA pixel = {color.r, color.g, color.b, 255};
     for (int y = fy1; y <= fy2; y++) {
         for (int x = fx1; x <= fx2; x++) {
-            hub_pixel(scene, x, y, color);
+            draw_pixel(scene, x, y, pixel);
         }
     }
 }
@@ -1658,17 +1382,18 @@ void hub_circle(hub75_display_t *scene, const uint16_t centerX, const uint16_t c
     int y = 0;
     int decisionOver2 = 1 - x; // Decision variable
 
+    RGBA pixel = {color.r, color.g, color.b, 255};
 
     while (x >= y) {
-        hub_pixel(scene, centerX + x, centerY + y, color);
-        hub_pixel(scene, centerX + y, centerY + x, color);
-        hub_pixel(scene, centerX - y, centerY + x, color);
-        hub_pixel(scene, centerX - x, centerY + y, color);
+        draw_pixel(scene, centerX + x, centerY + y, pixel);
+        draw_pixel(scene, centerX + y, centerY + x, pixel);
+        draw_pixel(scene, centerX - y, centerY + x, pixel);
+        draw_pixel(scene, centerX - x, centerY + y, pixel);
 
-        hub_pixel(scene, centerX - x, centerY - y, color);
-        hub_pixel(scene, centerX - y, centerY - x, color);
-        hub_pixel(scene, centerX + y, centerY - x, color);
-        hub_pixel(scene, centerX + x, centerY - y, color);
+        draw_pixel(scene, centerX - x, centerY - y, pixel);
+        draw_pixel(scene, centerX - y, centerY - x, pixel);
+        draw_pixel(scene, centerX + y, centerY - x, pixel);
+        draw_pixel(scene, centerX + x, centerY - y, pixel);
         
         y++;
 
@@ -1693,7 +1418,7 @@ void hub_circle(hub75_display_t *scene, const uint16_t centerX, const uint16_t c
  * @param y1 end pixel y
  * @param color color to draw the line
  */
-void hub_line(hub75_display_t *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, RGB color) {
+void draw_line(hub75_display_t *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, RGBA color) {
     int dx = abs(x1 - x0);
     int dy = abs(y1 - y0);
     int sx = (x0 < x1) ? 1 : -1; // Step in the x direction
@@ -1703,7 +1428,7 @@ void hub_line(hub75_display_t *scene, const uint16_t x0, const uint16_t y0, cons
     int mx = x0, my = y0;
 
     while (1) {
-        hub_pixel(scene, mx, my, color); // Set pixel
+        draw_pixel(scene, mx, my, color); // Set pixel
 
         // Check if we've reached the end point
         if (mx == x1 && my == y1) break;
@@ -1731,7 +1456,7 @@ void hub_line(hub75_display_t *scene, const uint16_t x0, const uint16_t y0, cons
  * @param y1 end pixel y
  * @param color color to draw the line
  */
-void hub_line_aa(hub75_display_t *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, const RGB color) {
+void draw_line_aa(hub75_display_t *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, const RGBA color) {
 
 
     float fx0 = clampf((float)x0, 0, scene->width-1);
@@ -1739,10 +1464,12 @@ void hub_line_aa(hub75_display_t *scene, const uint16_t x0, const uint16_t y0, c
     float fy0 = clampf((float)y0, 0, scene->width-1);
     float fy1 = clampf((float)y1, 0, scene->width-1);
 
+    // Convert RGBA to RGB for draw_pixel_factor calls
+    RGBA rgb_color = {color.r, color.g, color.b, 255};
 
     /* handle the trivial point */
     if ((int)fx0 == (int)fx1 && (int)fy0 == (int)fy1) {
-        hub_pixel(scene, (int)fx0, (int)fy0, color);
+        draw_pixel(scene, (int)fx0, (int)fy0, color);
         return;
     }
 
@@ -1779,11 +1506,15 @@ void hub_line_aa(hub75_display_t *scene, const uint16_t x0, const uint16_t y0, c
     int xpxl1 = (int)xend;
     int ypxl1 = ipart(yend);
     if (steep) {
-        hub_pixel_factor(scene, ypxl1, xpxl1, color, rfpart(yend) * xgap);
-        hub_pixel_factor(scene, ypxl1 + 1, xpxl1, color, fpart(yend) * xgap);
+        rgb_color.a = (uint8_t)(rfpart(yend) * xgap * 255);
+        draw_pixel(scene, ypxl1, xpxl1, rgb_color);
+        rgb_color.a = (uint8_t)(fpart(yend) * xgap * 255);
+        draw_pixel(scene, ypxl1 + 1, xpxl1, rgb_color);
     } else {
-        hub_pixel_factor(scene, xpxl1, ypxl1, color, rfpart(yend) * xgap);
-        hub_pixel_factor(scene, xpxl1, ypxl1 + 1, color, fpart(yend) * xgap);
+        rgb_color.a = (uint8_t)(rfpart(yend) * xgap * 255);
+        draw_pixel(scene, xpxl1, ypxl1, rgb_color);
+        rgb_color.a = (uint8_t)(fpart(yend) * xgap * 255);
+        draw_pixel(scene, xpxl1, ypxl1 + 1, rgb_color);
     }
     float intery = yend + gradient;  // First y-intersection for the main loop
 
@@ -1794,24 +1525,32 @@ void hub_line_aa(hub75_display_t *scene, const uint16_t x0, const uint16_t y0, c
     int xpxl2 = (int)xend;
     int ypxl2 = ipart(yend);
     if (steep) {
-        hub_pixel_factor(scene, ypxl2, xpxl2, color, rfpart(yend) * xgap);
-        hub_pixel_factor(scene, ypxl2 + 1, xpxl2, color, fpart(yend) * xgap);
+        rgb_color.a = (uint8_t)(rfpart(yend) * xgap * 255);
+        draw_pixel(scene, ypxl2, xpxl2, rgb_color);
+        rgb_color.a = (uint8_t)(fpart(yend) * xgap * 255);
+        draw_pixel(scene, ypxl2 + 1, xpxl2, rgb_color);
     } else {
-        hub_pixel_factor(scene, xpxl2, ypxl2, color, rfpart(yend) * xgap);
-        hub_pixel_factor(scene, xpxl2, ypxl2 + 1, color, fpart(yend) * xgap);
+        rgb_color.a = (uint8_t)(rfpart(yend) * xgap * 255);
+        draw_pixel(scene, xpxl2, ypxl2, rgb_color);
+        rgb_color.a = (uint8_t)(fpart(yend) * xgap * 255);
+        draw_pixel(scene, xpxl2, ypxl2 + 1, rgb_color);
     }
 
     // Main loop
     if (steep) {
         for (int x = xpxl1 + 1; x < xpxl2; x++) {
-            hub_pixel_factor(scene, ipart(intery), x, color, rfpart(intery));
-            hub_pixel_factor(scene, ipart(intery) + 1, x, color, fpart(intery));
+            rgb_color.a = (uint8_t)(rfpart(intery) * 255);
+            draw_pixel(scene, ipart(intery), x, rgb_color);
+            rgb_color.a = (uint8_t)(fpart(intery) * 255);
+            draw_pixel(scene, ipart(intery) + 1, x, rgb_color);
             intery += gradient;
         }
     } else {
         for (int x = xpxl1 + 1; x < xpxl2; x++) {
-            hub_pixel_factor(scene, x, ipart(intery), color, rfpart(intery));
-            hub_pixel_factor(scene, x, ipart(intery) + 1, color, fpart(intery));
+            rgb_color.a = (uint8_t)(rfpart(intery) * 255);
+            draw_pixel(scene, x, ipart(intery), rgb_color);
+            rgb_color.a = (uint8_t)(fpart(intery) * 255);
+            draw_pixel(scene, x, ipart(intery) + 1, rgb_color);
             intery += gradient;
         }
     }

@@ -153,7 +153,7 @@ extern hub75_display_t *g_scene;
  * will die() if invalid configuration is found
  * @param scene 
  */
-void hub75_display_start(hub75_display_t *scene) {
+void hub75_display_bind_scene(hub75_display_t *scene) {
     debug("ports: %d, chains: %d, width: %d, height: %d, stride: %d, bit_depth: %d\n", 
         scene->num_ports, scene->num_chains, scene->width, scene->height, scene->stride, scene->bit_depth);
 
@@ -235,7 +235,7 @@ void hub75_display_start(hub75_display_t *scene) {
     scene->quant_errors_lut = (uint16_t*)calloc(768*4, sizeof(uint16_t));
 
     // create RGB -> BCM mapper thread
-    if (pthread_create(&scene->mapper_thread, NULL, mapper_thread_main, scene) != 0) {
+    if (pthread_create(&scene->mapper_thread, NULL, main_thread_mapper, scene) != 0) {
         debug("failed to create mapper thread! (this is a show stopper)\n");
         scene->do_render = false;
     }
@@ -370,14 +370,6 @@ static inline void io_store_barrier(void) {
 #endif
 }
 
-
-
-/**
- * @brief you can cause render_forever to exit by updating the value of do_render pointer
- * EG:
- * scene->do_render = false; // will cause render_forever to exit from another thread
- * 
- */
 void* hub75_display_run(const hub75_display_t *scene) {
 
     int cpu_model = cpu_get_pi_model();

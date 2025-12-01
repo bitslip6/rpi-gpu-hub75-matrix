@@ -14,7 +14,7 @@
  * Applies the specified easing function to smooth gradient transitions.
  * Input and output values should be in the range [0.0, 1.0].
  */
-float apply_easing(float t, easing_function_t easing) {
+float easing_apply(float t, easing_function_t easing) {
     // Clamp input to valid range
     if (t <= 0.0f) return 0.0f;
     if (t >= 1.0f) return 1.0f;
@@ -127,7 +127,7 @@ void gradient_fill(hub75_display_t *scene, int y, int x0, int x1,
         float grad_factor = calculate_gradient_factor(x, y, minx, miny, maxx, maxy, gradient->direction);
 
         // Apply easing function
-        float eased_factor = apply_easing(grad_factor, gradient->easing);
+        float eased_factor = easing_apply(grad_factor, gradient->easing);
 
         // Interpolate between start and end colors
         row[x].r = (uint8_t)(gradient->start_color.r + (gradient->end_color.r - gradient->start_color.r) * eased_factor);
@@ -152,10 +152,10 @@ void gradient_fill(hub75_display_t *scene, int y, int x0, int x1,
  * 3. For each scanline, find edge intersections
  * 4. Fill between intersection pairs using gradient colors
  */
-void gradient_polygon(hub75_display_t *scene, Polygonf_t *poly, SimpleGradient gradient)
+void polygon_gradient(hub75_display_t *scene, Polygonf_t *poly, SimpleGradient gradient)
 {
     if (!scene || !scene->frame_buffer.data || !poly || poly->num_points < 3) {
-        debug("gradient_polygon: bad args\n");
+        debug("polygon_gradient: bad args\n");
         return;
     }
 
@@ -180,7 +180,7 @@ void gradient_polygon(hub75_display_t *scene, Polygonf_t *poly, SimpleGradient g
     }
     
     if (miny > maxy || minx > maxx) {
-        debug("gradient_polygon: degenerate polygon\n");
+        debug("polygon_gradient: degenerate polygon\n");
         return;
     }
 

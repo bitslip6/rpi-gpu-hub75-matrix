@@ -268,7 +268,7 @@ void hable_inplace(RGB *in);
 void adjust_contrast_saturation(RGBF *__restrict__ in, const float contrast, const float saturation);
 
 
-void *render_shader(void *arg);
+void *main_render_shader(void *arg);
 void dither_image(uint8_t *image, int width, int height);
 void apply_noise_dithering(uint8_t *image, int width, int height);
 

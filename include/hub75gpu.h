@@ -9,6 +9,10 @@
 #ifndef __HUB75GPU_H__
 #define __HUB75GPU_H__
 
+#define HUB75_API_VERSION_MAJOR 1
+#define HUB75_API_VERSION_MINOR 0
+#define HUB75_API_VERSION ((HUB75_API_VERSION_MAJOR << 16) | HUB75_API_VERSION_MINOR)
+
 #define MAX_BITS 64
 #define MAX_PANEL_TYPES 8
 #define MAX_PANELS     24
@@ -19,8 +23,22 @@
 #define MAX_POLY_POINTS 32
 #endif
 
+/**
+ * @brief Error codes returned by the HUB75 API
+ */
+typedef enum {
+    HUB75_OK = 0,
+    HUB75_ERR_NO_SCENE = -1,
+    HUB75_ERR_NULL_PARAM = -2,
+    HUB75_ERR_OUT_OF_MEMORY = -3,
+    HUB75_ERR_INVALID_COORDS = -4,
+    HUB75_ERR_RING_BUFFER_FULL = -5,
+    HUB75_ERR_INVERTED_COORDS = -6,
+} hub75_error_t;
 
-
+/**
+ * @brief pin out configurations for the different HATS - recommend HZELLER
+ */
 #ifdef ADA_HAT
     #define ADDRESS_TYPE "ADAFRUIT_HAT"
 #else
@@ -32,34 +50,45 @@
 #endif
 
 /**
- * @brief just a float, should be normalized to 0-1
+ * @brief just a float, normalized to 0/1
  */
 typedef float Normal;
+/**
+ * @brief just a float, normalized to -1/+1
+ */
 typedef float NormalSigned;
 
+/**
+ * some constants for Normal and NormalSigned types
+ */
 #define NormalSAT 1.0f;
 #define NormalZERO 0.0f;
 #define NormalSignedZERO 0.0f;
 #define NormalSignedSAT 1.0f;
 #define NormalSignedNEGSAT -1.0f;
 
+/**
+ * @brief clamp a float to the Normal (0-1) range
+ */
 inline Normal Normal_clamp(float x) {
     if (x < 0.0f) return 0.0f;
     if (x > 1.0f) return 1.0f;
     return (Normal)x;
 }
 
+/**
+ * @brief clamp a float to the NormalSigned (-1 to +1) range
+ */
 inline NormalSigned NormalSigned_clamp(float x) {
     if (x < -1.0f) return -1.0f;
     if (x > 1.0f) return 1.0f;
     return (NormalSigned)x;
 }
 
-
-
 /**
  * @brief pointer to a single 24bpp RGB pixel (3 bytes)
  * RGB *pixel = (RGB *)(image + offset)
+ * @deprecated Use RGBA struct instead.
  */
 typedef struct {
     uint8_t r;
@@ -77,7 +106,6 @@ typedef struct {
     uint8_t b; 
     uint8_t a; 
 } RGBA;
-
 
 /**
  * @brief pointer to a single 24bpp RGB pixel normalized as floats (0-1)
@@ -112,50 +140,46 @@ typedef struct { float x, y; } vec2;
 typedef struct { float x, y, z; } vec3;
 // float vec4
 typedef struct { float x, y, z, w; } vec4;
-typedef struct { float m[16]; }   mat4;  // column-major, m[col*4 + row]
+// a material matrix 4x4 
+typedef struct { float m[16]; } mat4;  // column-major, m[col*4 + row]
 
+// transformation for 2d or 3d objects
 typedef struct {
     vec3 position;     // world position 
     vec3 rotation;     // Euler angles in radians, x=pitch, y=yaw, z=roll 
     vec3 scale;        // per-axis scale 
 } transform_t;
 
-
-
+// simple polygon
 typedef struct
 {
-    Normal x;
-    Normal y;
-
-} Pointf_t;
-
-typedef struct
-{
-    Pointf_t points[MAX_POLY_POINTS];
+    vec2 points[MAX_POLY_POINTS];
     size_t num_points;
-
 } Polygonf_t;
 
+// forward or backward winding for determing polygon orientation (backface culling)
 typedef enum { POLY_DEGENERATE = 0, POLY_CW = 1, POLY_CCW = 2 } poly_winding_t;
 
+// multiply scaling used to adjust color brightness per panel type
 typedef struct panel_rgb_scale {
     uint8_t red_q8;
     uint8_t green_q8;
     uint8_t blue_q8;
 } panel_rgb_scale;
 
+// offset used to adjust color brightness per panel type
 typedef struct panel_rgb_offset {
     int8_t red_q8;
     int8_t green_q8;
     int8_t blue_q8;
 } panel_rgb_offset;
 
+// simple image buffer structure
 typedef struct image_buffer_t {
     vec2u dimensions;
     uint32_t row_stride;
     RGBA *data;
 } image_buffer_t;
-
 
 /**
  * @brief Gradient direction for simple gradients
@@ -171,7 +195,7 @@ typedef enum {
  * @brief Easing functions for smooth gradient transitions
  */
 typedef enum {
-    EASE_LINEAR,            /**< Linear interpolation */
+    EASE_LINEAR,           /**< Linear interpolation */
     EASE_IN_QUAD,          /**< Quadratic ease-in */
     EASE_OUT_QUAD,         /**< Quadratic ease-out */
     EASE_IN_OUT_QUAD       /**< Quadratic ease-in-out */
@@ -190,23 +214,23 @@ typedef struct {
     easing_function_t easing;       /**< Easing function for transitions */
 } SimpleGradient;
 
-
 // panel order describes which logical color drives panel wires R,G,B respectively
 typedef enum {
     PANEL_RGB = 0, PANEL_RBG, PANEL_GRB, PANEL_GBR, PANEL_BRG, PANEL_BGR
 } panel_order_t;
 
-
 // self referencing function pointers need this defined first
 struct hub75_display;
 
-// void map_byte_image_to_pwm(uint8_t *image, const scene_info *scene, uint8_t fps_sync) {
+/**
+ * @brief function pointer types for tone mapping and image mapping functions
+ */
 typedef void (*func_tone_mapper_t)(const RGBF *in, RGBF *out, const float level);
+
+/**
+ * @brief function pointer type for image mapping functions, flip, mirror, u_mapper, etc
+ */
 typedef uint8_t *(*func_image_mapper_t)(const uint8_t *image_in, uint8_t *image_out, const struct hub75_display *scene);
-typedef uint8_t *(image_mapper_t)(const uint8_t *image_in, uint8_t *image_out, const struct hub75_display *scene);
-
-
-
 
 /**
  * @brief everything to define the scene and panel configuration 
@@ -281,7 +305,6 @@ typedef struct hub75_display {
 
     /** @brief a shader file to render on the GPU */
     char *shader_file;
-
 
 	/** 
      * @brief the tone mapping function to use, if null no tone mapping applied
@@ -363,21 +386,30 @@ typedef struct hub75_display {
  * @param scene the scene information
  * @param image the image to map to the scene bcm data. if NULL scene->image will be used
  */
-void hub75_display_map_image_to_bcm(const hub75_display_t *scene, uint8_t *image);
-
-void *mapper_thread_main(void *arg);
+hub75_error_t hub75_display_map_image_to_bcm(const hub75_display_t *scene, uint8_t *image);
 
 /**
- * must be called on the main thread to start the renderer. it never returns
+ * @brief Entry point for the mapper thread. Continuously monitors the filled ring buffer,
+ *              maps the rendered GPU image to the display system, and signals frame updates.
+ * 
+ * @param arg: Pointer to a mapper_ctx_t structure containing context for the mapper thread, including
+ *          ring buffers and scene information.
+ * Returns: Pointer indicating thread termination (unused in this context).
+ */
+void *main_thread_mapper(void *arg);
+
+/**
+ * @brief this function starts the main rendering loop that send BCM data out to the GPIO port
+ * you can stop this function from another thread by setting scene->do_render = false;
+ * EG:
+ * scene->do_render = false; // will cause render_forever to exit from another thread
  */
 void *hub75_display_run(const hub75_display_t *scene);
 
 /**
  * @brief render the shader arg->shader_file shader on the GPU
  */
-void *render_shader(void *arg);
-void *render_shader_old(void *arg);
-void *render_shader_minimal(void *arg);
+void *main_render_shader(void *arg);
 
 /**
  * @brief pass this function to your pthread_create() call to render a video file
@@ -387,17 +419,17 @@ void *render_shader_minimal(void *arg);
  * @param arg 
  * @return void* 
  */
-void* render_video_fn(void *arg);
+void *main_render_video(void *arg);
 
 /**
- * @brief pass this function to your pthread_create() call to render a video file
- * will render the video file pointed to by scene->shader_file until
- * scene->do_render is false; returns once the video is done rendering
+ * @brief render the video file pointed to by scene->shader_file 
+ * uses ffmpeg to render the to the image pointed to by scene->image
+ * this function will call hub75_display_map_image_to_bcm to push frames into the
  * 
  * @param arg 
  * @return void* 
  */
-bool hub_render_video(hub75_display_t *scene, const char *filename);
+bool render_video(hub75_display_t *scene, const char *filename);
 
 /**
  * @brief count number of times this function is called, 1 every second output
@@ -409,34 +441,56 @@ bool hub_render_video(hub75_display_t *scene, const char *filename);
  */
 float calculate_fps(const uint16_t target_fps, const bool show_fps);
 
-
-// graceful shutdown helpers
+/**
+ * @brief request a graceful shutdown of the rendering system
+ */
 void hub75_display_request_shutdown(struct hub75_display *scene);
+
+/**
+ * @brief wait for the rendering threads to shutdown.
+ * NOTE: don't call these before setting scene->do_render = false;
+ */
 void hub75_display_wait(struct hub75_display *scene);
 
-void draw_polygon_fill(hub75_display_t *scene, Polygonf_t *poly, RGBA color);
-void gradient_polygon(hub75_display_t *scene, Polygonf_t *poly, SimpleGradient gradient);
+/**
+ * @brief fill a polygon with a solid color. if color has alpha < 255
+ * the polygon will be composited over the existing framebuffer content.
+ */
+void polygon_fill(hub75_display_t *scene, Polygonf_t *poly, RGBA color);
 
-/* Easing function implementations */
-float apply_easing(float t, easing_function_t easing);
+/**
+ * @brief fill a polygon with a gradient
+ */
+void polygon_gradient(hub75_display_t *scene, Polygonf_t *poly, SimpleGradient gradient);
 
+/**
+ * @brief apply the specified easing function to the input t value (0-1)
+ */
+float easing_apply(float t, easing_function_t easing);
 
-void hub_line_aa(hub75_display_t *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, const RGB color);
-void hub_line(hub75_display_t *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, RGB color);
+/**
+ * @brief draw an anti-aliased line on the scene framebuffer
+ */
+void draw_line_aa(hub75_display_t *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, const RGBA color);
+
+/**
+ * @brief draw a line on the scene framebuffer
+ */
+void draw_line(hub75_display_t *scene, const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1, RGBA color);
 
 /**
  * @brief parse command line arguments and create a valid scene
  * 
  * @param argc command line argument count
  * @param argv command line arguments
- * @return scene_info* the created scene information
+ * @return hub75_display_t* the created scene information
  */
 hub75_display_t *hub75_display_parse_args(int argc, char **argv);
 
 /**
  * @brief create a default scene
  * 
- * @return scene_info* the created scene information
+ * @return hub75_display_t* the created scene information
  */
 hub75_display_t *hub75_display_new();
 
@@ -450,7 +504,7 @@ image_buffer_t *image_buffer_new(int32_t width, int32_t height);
 /**
  * check the scene and start the rendering threads if everying is ok
  */
-void hub75_display_start(hub75_display_t *scene);
+void hub75_display_bind_scene(hub75_display_t *scene);
 
 /**
  * @brief install signal handlers for graceful shutdown on SIGINT/SIGTERM
@@ -458,57 +512,9 @@ void hub75_display_start(hub75_display_t *scene);
  */
 void signal_handler_install(void);
 
-
-/* --------------------------------------------------------------
- * OPTIONAL: Public function table for FFI (e.g. Python / Rust / Go)
- * --------------------------------------------------------------
- * This lightweight indirection lets foreign language bindings obtain
- * stable pointers to the drawing helpers without relying on parsing
- * multiple headers.  Versioning can be added later by extending the
- * struct (always append new fields) and bumping hub75_api.version.
- */
-/*
-typedef struct hub75_api {
-    uint32_t version;      // struct version for compatibility 
-    scene_info *scene;     // active scene (set via hub75_get_api(scene)) 
-
-    // Scene creation helpers (do NOT use internal scene pointer) 
-    scene_info *(*new_scene)(void);
-    scene_info *(*parse_scene)(int argc, char **argv);
-
-    // Lifecycle operating on api->scene (scene must be set) 
-    void (*start)(void);
-    void (*request_shutdown)(void);
-    void (*wait_shutdown)(void);
-    void (*map_image)(uint8_t *image); // NULL -> use scene->image 
-
-    // Timing (independent of scene except show_fps flag consumed inside) 
-    unsigned long (*fps_calculate)(uint16_t target_fps, bool show_fps);
-
-    // Drawing primitives (use api->scene internally)
-    void (*pixel)(int x, int y, RGB pixel);
-    void (*pixel_factor)(int x, int y, RGB pixel, float factor);
-    void (*pixel_alpha)(int x, int y, RGBA pixel);
-    void (*fill)(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB color);
-    void (*line)(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, RGB color);
-    void (*line_aa)(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, RGB color);
-    void (*triangle)(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB color);
-    void (*triangle_aa)(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB color);
-    void (*circle)(uint16_t cx, uint16_t cy, uint16_t radius, RGB color);
-    int (*fps_get)();
-} hub75_api;
- */
-
-// Obtain & initialize (or re-point) the singleton API to a scene. 
-// const hub75_api *hub75_get_api(scene_info *scene);
-
-// poly_winding_t polygon_winding(const Polygonf_t *poly);
-
-
-
 /* --------------------------------------------------------------
  * Lighting types and scene lighting configuration
- * (definitions appear before scene_info usage)
+ * (definitions appear before hub75_display_t usage)
  * -------------------------------------------------------------- */
 typedef enum {
     LIGHT_DIRECTIONAL = 0,
@@ -516,9 +522,9 @@ typedef enum {
     LIGHT_SPOT        = 2
 } light_type_t;
 
-/* local 3-float vector for lighting (avoid dependency on vec3 defined later) */
-// typedef struct { float x, y, z; } vec3;
-
+/**
+ * @brief structure defining a light source in the 3D scene
+ */
 typedef struct light_t {
     light_type_t type;     /* light category */
 
@@ -544,6 +550,9 @@ typedef struct light_t {
     float shadow_zoom;
 } light_t;
 
+/**
+ * @brief structure defining the lighting configuration for a 3D scene
+ */
 typedef struct scene3d_lighting_t {
     RGBF     ambient;      // ambient light color (0..1 per channel)
     uint16_t num_lights;   // number of active lights
@@ -554,7 +563,9 @@ typedef struct scene3d_lighting_t {
 } scene3d_lighting_t;
 
 
-
+/**
+ * @brief structure defining a camera in the 3D scene
+ */
 typedef struct {
     vec3 position;     // camera position 
     vec3 target;       // look-at target 
@@ -564,37 +575,57 @@ typedef struct {
     float z_near, z_far;
 } camera_t;
 
+/**
+ * @brief 3D object mesh structure
+ */
 typedef struct {
     uint16_t length;
     vec3 *list;
 } vert_list_t;
 
+/**
+ * @brief list of colors to map object lines or faces to particular colors. assumes index order
+ */
 typedef struct {
     uint16_t length;
     RGB *list;
 } color_list_t;
 
+/**
+ * @brief list of edges defined by vertex index pairs
+ */
 typedef struct {
     uint16_t length;
     vec2 *list;
 } edge_list_t;
 
+/**
+ * @brief list of faces defined by vertex index triplets
+ */
 typedef struct {
     uint16_t length;
     vec3 *list;  /* triangle indices: each vec3 contains 3 vertex indices (x,y,z) */
 } face_list_t;
 
+/**
+ * @brief list of normal vectors
+ */
 typedef struct {
     uint16_t length;
     vec3 *list;  /* normal vectors: one per face for flat shading */
 } normal_list_t;
 
-/* Per-object drawing mode */
+/**
+ * @brief Per-object drawing mode
+ **/
 typedef enum {
     DRAW_WIRE = 0,
     DRAW_FILLED = 1,
 } object_draw_mode_t;
 
+/**
+ * @brief 3D object mesh structure
+ */
 typedef struct {
     vert_list_t *verticies;
     edge_list_t *edges;
@@ -618,6 +649,9 @@ typedef struct {
     float specular_shininess;  /* Blinn shininess exponent (e.g., 8..128) */
 } object_t;
 
+/**
+ * @brief Internal structure for filled triangle rasterization
+ */
 typedef struct {
     float depth;      /* average NDC z */
     Polygonf_t poly;  /* 3 points normalized to [0,1] */
@@ -633,16 +667,42 @@ typedef struct {
     float cam_w[3];          /* camera clip w per vertex (for perspective-correct interp) */
 } _TriFill;
 
-
-
+/**
+ * @brief create a new primitive 3D object cube
+ */
 object_t* object_cube(const object_draw_mode_t mode, const bool cull_backface);
+/**
+ * @brief create a new primitive 3D object tetrahedron
+ */
 object_t* object_tetrahedron(const object_draw_mode_t mode, const bool cull_backface);
+/**
+ * @brief create a new primitive 3D object octahedron
+ */
 object_t* object_octahedron(const object_draw_mode_t mode, const bool cull_backface);
+/**
+ * @brief create a new primitive 3D object dodecahedron
+ */
 object_t* object_pyramid(void);
+/**
+ * @brief create a new primitive 3D object icosahedron
+ */
 object_t* object_cylinder(const uint16_t segments, const object_draw_mode_t mode, const bool cull_backface);
+/**
+ * @brief create a new primitive 3D object isohedron
+ */
 object_t* object_sphere(uint16_t subdivisions);
+/**
+ * @brief create a new primitive 3D object torus
+ */
 object_t* object_torus(uint16_t major_segments, uint16_t minor_segments);
+/**
+ * @brief create a new primitive 3D object plane
+ */
 object_t* object_plane(uint16_t width_segments, uint16_t height_segments, bool face_up);
+
+/**
+ * @brief 3D math utilities (camera and transforms)
+ */
 mat4 camera_project(const camera_t *cam, const transform_t *obj_xform);
 void transform_mesh_to_ndc(const vec3 *in_vertices, size_t n, mat4 mvp, vec3 *out_ndc);
 object_t* object_new(uint16_t num_vertices, uint16_t num_edges, uint16_t num_faces);
@@ -716,19 +776,20 @@ typedef struct scene3d_t {
 void object_free(object_t *obj);
 
 typedef struct {
-    void (*clear)();
-    void (*pixel)(const uint16_t x, const uint16_t y, RGB c);
-    void (*pixel_factor)(int x, int y, RGB pixel, float factor);
-    void (*pixel_alpha)(int x, int y, RGBA pixel);
-    void (*line)(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, RGB c);
-    void (*line_aa)(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, RGB c);
-    void (*poly)(Polygonf_t *poly, RGBA color1);
-    void (*poly_gradient)(Polygonf_t *poly, SimpleGradient gradient);
-    void (*fill_gradient)(int y, int x0, int x1, const SimpleGradient *gradient, 
+    uint32_t version;  /* API version: (major << 16) | minor */
+    
+    hub75_error_t (*clear)();
+    hub75_error_t (*pixel)(const uint16_t x, const uint16_t y, RGBA c);
+    hub75_error_t (*line)(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, RGB c);
+    hub75_error_t (*line_aa)(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, RGB c);
+    hub75_error_t (*poly)(Polygonf_t *poly, RGBA color1);
+    hub75_error_t (*poly_gradient)(Polygonf_t *poly, SimpleGradient gradient);
+    hub75_error_t (*fill_gradient)(int y, int x0, int x1, const SimpleGradient *gradient, 
                             int minx, int miny, int maxx, int maxy);
-    void (*shutdown)();
-    void (*frame_begin)();
-    void (*frame_end)();
+    float (*wrap)(float input, float wrap_value);
+    hub75_error_t (*shutdown)();
+    hub75_error_t (*frame_begin)();
+    hub75_error_t (*frame_end)();
 
     mat4 (*geo_project)(camera_t *cam, transform_t *obj_xform);
     void (*render_wire)(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene3d_lighting_t *lighting);
@@ -755,21 +816,42 @@ typedef struct {
     scene3d_t* (*scene3d_new)(uint16_t count);
     void (*scene3d_set_current)(scene3d_t *os);
     void (*scene3d_clear_current)(void);
-    void (*scene3d_set_ambient)(RGBF ambient);
+    hub75_error_t (*scene3d_set_ambient)(RGBF ambient);
     uint16_t (*scene3d_add_directional)(vec3 direction, RGBF color, float intensity, bool casts_shadows);
-    void (*scene3d_set_directional_pose)(uint16_t id, vec3 position, vec3 look_at);
+    hub75_error_t (*scene3d_set_directional_pose)(uint16_t id, vec3 position, vec3 look_at);
     light_t* (*scene3d_get_directional)(uint16_t id);
     uint16_t (*scene3d_add_object)(object_t *obj, transform_t *xform);
     object_t* (*scene3d_get_object)(uint16_t id);
     transform_t* (*scene3d_get_transform)(uint16_t id);
 
     /* Debug helpers */
-    void (*scene3d_set_debug_checker)(bool enabled, uint8_t tile_px, float strength, RGB color);
-    void (*scene3d_set_debug_shadow_vis)(bool enabled, uint8_t light_index, float strength, RGB lit_color, RGB shadow_color);
+    hub75_error_t (*scene3d_set_debug_checker)(bool enabled, uint8_t tile_px, float strength, RGB color);
+    hub75_error_t (*scene3d_set_debug_shadow_vis)(bool enabled, uint8_t light_index, float strength, RGB lit_color, RGB shadow_color);
     /* Debug: dump a light's shadow map to a PNG file for inspection */
-    void (*scene3d_dump_shadowmap_png)(uint16_t light_index, const char *filepath);
+    hub75_error_t (*scene3d_dump_shadowmap_png)(uint16_t light_index, const char *filepath);
     /* Debug/quality: set an explicit zoom on the shadow map fit for a light */
-    void (*scene3d_set_shadowmap_zoom)(uint16_t light_index, float zoom);
+    hub75_error_t (*scene3d_set_shadowmap_zoom)(uint16_t light_index, float zoom);
+
+    /* SDF Text rendering functions */
+    struct sdf_font_t* (*sdf_font_load)(const char *font_dir);
+    struct sdf_font_t* (*sdf_font_load_scaled)(const char *font_dir, float target_line_height_px);
+    void (*sdf_font_free)(struct sdf_font_t *font);
+    
+    struct sdf_text_t* (*sdf_text_create)(struct sdf_font_t *font, const char *text);
+    void (*sdf_text_destroy)(struct sdf_text_t *t);
+    
+    void (*sdf_text_set_position)(struct sdf_text_t *t, float x, float y);
+    void (*sdf_text_set_direction)(struct sdf_text_t *t, float dx, float dy);
+    void (*sdf_text_set_speed)(struct sdf_text_t *t, float speed);
+    void (*sdf_text_set_size_px)(struct sdf_text_t *t, float size_px);
+    void (*sdf_text_set_color)(struct sdf_text_t *t, RGBA color);
+    void (*sdf_text_set_alpha)(struct sdf_text_t *t, uint8_t a);
+    void (*sdf_text_set_tracking)(struct sdf_text_t *t, float tracking);
+    void (*sdf_text_set_text)(struct sdf_text_t *t, const char *text);
+    
+    void (*sdf_text_update)(struct sdf_text_t *t, const int32_t display_width);
+    void (*sdf_text_render)(struct sdf_text_t *t, uint8_t *dst, int w, int h, int stride, float time_sec);
+    vec2u (*sdf_text_measure_px)(struct sdf_text_t *t);
 
 } hub75gpu_t;
 
@@ -802,21 +884,48 @@ void api_object_set_specular_shininess(object_t *obj, float shininess);
 /* Convenience scene3d wrappers (thread-local current scene3d) */
 void api_scene3d_set_current(scene3d_t *os);
 void api_scene3d_clear_current(void);
-void api_scene3d_set_ambient(RGBF ambient);
+hub75_error_t api_scene3d_set_ambient(RGBF ambient);
 uint16_t api_scene3d_add_directional(vec3 direction, RGBF color, float intensity, bool casts_shadows);
 uint16_t api_scene3d_add_object(object_t *obj, transform_t *xform);
 object_t* api_scene3d_get_object(uint16_t id);
 light_t* api_scene3d_get_directional(uint16_t id);
 transform_t* api_scene3d_get_transform(uint16_t id);
-void api_scene3d_set_directional_pose(uint16_t id, vec3 position, vec3 look_at);
+hub75_error_t api_scene3d_set_directional_pose(uint16_t id, vec3 position, vec3 look_at);
 
 /* Debug/diagnostic helpers */
-void api_scene3d_set_debug_checker(bool enabled, uint8_t tile_px, float strength, RGB color);
-void api_scene3d_set_debug_shadow_vis(bool enabled, uint8_t light_index, float strength, RGB lit_color, RGB shadow_color);
+hub75_error_t api_scene3d_set_debug_checker(bool enabled, uint8_t tile_px, float strength, RGB color);
+hub75_error_t api_scene3d_set_debug_shadow_vis(bool enabled, uint8_t light_index, float strength, RGB lit_color, RGB shadow_color);
 /* Debug: request dumping the current frame's shadow map for a light to a PNG file */
-void api_scene3d_dump_shadowmap_png(uint16_t light_index, const char *filepath);
+hub75_error_t api_scene3d_dump_shadowmap_png(uint16_t light_index, const char *filepath);
 /* Debug/quality: control zoom for tight-fit shadow map bounds per light (1=default, <1 zoom in) */
-void api_scene3d_set_shadowmap_zoom(uint16_t light_index, float zoom);
+hub75_error_t api_scene3d_set_shadowmap_zoom(uint16_t light_index, float zoom);
+
+/* Forward declarations for SDF text types (defined in text_sdf.h) */
+struct sdf_font_t;
+struct sdf_text_t;
+
+/* SDF Text API - load/create/destroy */
+struct sdf_font_t* api_sdf_font_load(const char *font_dir);
+struct sdf_font_t* api_sdf_font_load_scaled(const char *font_dir, float target_line_height_px);
+void api_sdf_font_free(struct sdf_font_t *font);
+
+struct sdf_text_t* api_sdf_text_create(struct sdf_font_t *font, const char *text);
+void api_sdf_text_destroy(struct sdf_text_t *t);
+
+/* SDF Text API - property setters */
+void api_sdf_text_set_position(struct sdf_text_t *t, float x, float y);
+void api_sdf_text_set_direction(struct sdf_text_t *t, float dx, float dy);
+void api_sdf_text_set_speed(struct sdf_text_t *t, float speed);
+void api_sdf_text_set_size_px(struct sdf_text_t *t, float size_px);
+void api_sdf_text_set_color(struct sdf_text_t *t, RGBA color);
+void api_sdf_text_set_alpha(struct sdf_text_t *t, uint8_t a);
+void api_sdf_text_set_tracking(struct sdf_text_t *t, float tracking);
+void api_sdf_text_set_text(struct sdf_text_t *t, const char *text);
+
+/* SDF Text API - update and render */
+void api_sdf_text_update(struct sdf_text_t *t, const int32_t display_width);
+void api_sdf_text_render(struct sdf_text_t *t, uint8_t *dst, int w, int h, int stride, float time_sec);
+vec2u api_sdf_text_measure_px(struct sdf_text_t *t);
 
 /* Common web colors (RGBF normalized 0..1) */
 #define COLOR_BLACK        (RGBF){ 0.0f, 0.0f, 0.0f }
@@ -858,5 +967,17 @@ void api_scene3d_set_shadowmap_zoom(uint16_t light_index, float zoom);
 #define COLOR_GRAY         COLOR_GREY
 #define COLOR_LIGHT_GRAY   COLOR_LIGHT_GREY
 #define COLOR_DARK_GRAY    COLOR_DARK_GREY
+
+/* --------------------------------------------------------------
+ * Deprecated type aliases for backward compatibility
+ * These will be removed in a future major version (2.0)
+ * Please migrate to the standardized names:
+ *   - Use hub75_display_t instead of scene_info
+ *   - Use scene3d_t instead of object_scene_t
+ * -------------------------------------------------------------- */
+#ifndef HUB75_NO_DEPRECATED_TYPES
+typedef hub75_display_t scene_info;    /* Deprecated: use hub75_display_t */
+typedef scene3d_t object_scene_t;      /* Deprecated: use scene3d_t */
+#endif
 
 #endif

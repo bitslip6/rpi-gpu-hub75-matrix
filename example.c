@@ -41,6 +41,7 @@
 #include "util.h"
 #include "pixels.h"
 #include "text_sdf.h"
+#include "compositor.h"
 
 
 // --------------- Utility Helpers (example only) -----------------
@@ -73,8 +74,11 @@ static void *render_text_sdf(void *arg) {
     hub75_display_t *scene = (hub75_display_t*)arg;
     printf("[TEXT] SDF text scroller demo (Ctrl+C to exit)\n");
 
+    /* Get API table */
+    hub75gpu_t api = hub75_api(scene);
+
     // Configure font: load and scale to 64px line height 
-    sdf_font_t *font = sdf_font_load_scaled("assets/roboto", 64.0f);
+    sdf_font_t *font = api.sdf_font_load_scaled("assets/roboto", 64.0f);
     if (!font) {
         fprintf(stderr, "[TEXT] Failed to load SDF font from 'assets/robots' (expect metrics.csv + PNGs).\n");
         scene->do_render = false;
@@ -83,14 +87,13 @@ static void *render_text_sdf(void *arg) {
 
     // Create text object
     const char msg[] = "Hello, HUB75 SDF Scroller!  ";
-    sdf_text_t *txt = sdf_text_create(font, msg);
+    sdf_text_t *txt = api.sdf_text_create(font, msg);
     txt->size_px = 148.0f;
     txt->color = (RGBA){128, 255, 128, 255};
     txt->alpha = 200;
-    txt->y = 90.0f;
-    txt->x = 180.0f;
+    txt->x = txt->x0 = 180.0f;
+    txt->y = txt->y0 = 90.0f;
     txt->dir_x = -1.0f;
-    txt->dir_y = 0.0f;
     txt->speed = 128.0f;
     txt->softness = 0.08f;
     txt->effects.weight         = 1.2f;
@@ -100,14 +103,9 @@ static void *render_text_sdf(void *arg) {
     txt->effects.outline_color  = (RGBA){0, 64, 128, 255};
     txt->effects.outline_smooth = Normal_clamp(0.1f);
     txt->valign = SDF_VALIGN_BOTTOM;
-         
-    
-    sdf_text_update(txt, scene->width);
-
-    printf("scene stride: %d\n", scene->stride);
+    api.sdf_text_update(txt, scene->width);
 
     /* Render loop */
-    hub75gpu_t api = hub75_api(scene);
     const bool dump_once = true;//(dump_env && *dump_env && dump_env[0] != '0');
     string_t *dump_path = string_new("text_debug.png", 128);
     uint32_t frame = 0;
@@ -138,10 +136,11 @@ static void *render_text_sdf(void *arg) {
  
     printf ("text size: [%dx%d]\n", txt->dimensions.x, txt->dimensions.y);
     image_buffer_t *text_image = image_buffer_new(txt->dimensions.x, txt->dimensions.y);
+    image_buffer_t *sin_image  = image_buffer_new(txt->dimensions.x, txt->dimensions.y);
 
     this_time = 0.0f;
 
-    sdf_text_render(txt, (uint8_t*)text_image->data, txt->dimensions.x, txt->dimensions.y, text_image->row_stride, 0.9529411f);
+    api.sdf_text_render(txt, (uint8_t*)text_image->data, txt->dimensions.x, txt->dimensions.y, text_image->row_stride, 0.9529411f);
     png_write_buffer("text_buffer2.png", text_image);
 
     image_buffer_t panel;
@@ -151,6 +150,8 @@ static void *render_text_sdf(void *arg) {
     panel.row_stride = scene->frame_buffer.row_stride;
 
 
+    vec4 dst_rect = { 0, 16, scene->width, (float)MIN(scene->height, txt->dimensions.y) };
+    vec4 src_rect = { 0, 0, 0, (float)txt->dimensions.y};
 
 
     txt->y = 0;
@@ -173,29 +174,30 @@ static void *render_text_sdf(void *arg) {
         color1.b = (uint8_t)(128 + 127 * sinf((float)frame * 0.04f));
 
 
+        // render the polygon
         api.poly(&tri, color1);
-        //vec2u ddim = {scene->width, scene->height};
 
+        // the wrapping text time offset (0 -> wrap_mod, 0 -> wrap_mod) ...
+        float wrap_time = api.wrap(this_time, txt->wrap_mod);
 
-        float wrap_time = this_time;
-        if (this_time > txt->wrap_mod) {
-            wrap_time = fmodf(this_time,  txt->wrap_mod);
-        }
-
-        float xpos = (txt->x0 + ((float)txt->dir_x* (float)txt->speed * wrap_time));
-        vec4 dspec = {MAX(0, xpos), 16, scene->width, (float)MIN(scene->height, txt->dimensions.y) };
+        // compute the x position of this frame to render the text
+        float xpos = (txt->x0 + ((float)txt->dir_x * (float)txt->speed) * wrap_time);
         float spos = (xpos < 0) ? fabsf(xpos) : 0;
-        vec4 sspec = {MIN((float)txt->dimensions.x, spos), 0, MIN((spos + scene->width),(float)txt->dimensions.x), (float)txt->dimensions.y};
+        // calculate the start position to render the text into
+        dst_rect.x = MAX(0, xpos);
+        // compute a sliding window of the source text to render FROM
+        // calculate the start X position of the text image to render from
+        src_rect.x = MIN((float)txt->dimensions.x, spos);
+        // the end X position of the text imgae to render from
+        src_rect.z = MIN((spos + scene->width), (float)txt->dimensions.x);
 
-
-        //uint8_t *ptr = (uint8_t*)scene->frame_buffer.data + (scene->frame_buffer.dimensions.x * 30 * 4);
-        //sdf_text_render(txt, ptr, (int)scene->width, (int)scene->height, scene->stride, this_time);
+        apply_sine_wave_vertical(sin_image, text_image, 24.5f, 2, wrap_time);
 
         // if we have at least 1 pixel to render, do the composite
         composite_rgba_over_rgba(&scene->frame_buffer,
-            text_image, 
-            dspec,
-            sspec);
+            sin_image, 
+            dst_rect,
+            src_rect);
 
 
         if (dump_once && frame == 120) {
@@ -209,8 +211,8 @@ static void *render_text_sdf(void *arg) {
 
     /* Cleanup */
     if (dump_path) string_free(dump_path);
-    sdf_text_destroy(txt);
-    sdf_font_free(font);
+    api.sdf_text_destroy(txt);
+    api.sdf_font_free(font);
     return NULL;
 }
 
@@ -225,7 +227,7 @@ int main(int argc, char **argv) {
 
     scene->stride = 4;
     // Validate configuration, allocate internal buffers, etc.
-    hub75_display_start(scene);
+    hub75_display_bind_scene(scene);
 
     signal_handler_install();
 
@@ -251,10 +253,10 @@ int main(int argc, char **argv) {
         if (has_extension(scene->shader_file, "glsl")) {
             printf("[GPU] Shader: %s\n", scene->shader_file);
             // If your shader needs RGBA (alpha), adjust stride if desired:
-            pthread_create(&scene->render_thread, NULL, render_shader, scene);
+            pthread_create(&scene->render_thread, NULL, main_render_shader, scene);
         } else {
             printf("[GPU] Video: %s\n", scene->shader_file);
-            pthread_create(&scene->render_thread, NULL, render_video_fn, scene);
+            pthread_create(&scene->render_thread, NULL, main_render_video, scene);
         }
     } else {
         fprintf(stderr, "[WARN] Unable to open '%s'; falling back to CPU renderer.\n", scene->shader_file);

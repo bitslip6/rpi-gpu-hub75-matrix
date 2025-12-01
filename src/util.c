@@ -331,6 +331,7 @@ hub75_display_t *hub75_display_new() {
     scene->enhanced_debug = false;
     scene->latch_blank_cycles = 2;
     scene->rising_edge = true;
+    scene->frame_ready = true;  // Initialize to true so first frame_begin() succeeds
 
     return scene;
 }

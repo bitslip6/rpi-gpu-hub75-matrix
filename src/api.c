@@ -276,10 +276,11 @@ static bool write_shadowmap_png(const char *filename, const ShadowMap *SM) {
 }
 #endif
 
-void api_scene3d_dump_shadowmap_png(uint16_t light_index, const char *filepath) {
-    if (!filepath) return;
+hub75_error_t api_scene3d_dump_shadowmap_png(uint16_t light_index, const char *filepath) {
+    if (!filepath) return HUB75_ERR_NULL_PARAM;
     tls_dump_sm_index = (int)light_index;
     snprintf(tls_dump_sm_path, sizeof(tls_dump_sm_path), "%s", filepath);
+    return HUB75_OK;
 }
 
 /* Rasterize a world-space triangle into a directional light's shadow map (orthographic).
@@ -742,16 +743,17 @@ static inline bool is_backface_ccw_clip(vec4 c0, vec4 c1, vec4 c2)
  * Sets all pixels in the scene's image buffer to 0 (black). Checks that a scene
  * is set before attempting to clear.
  */
-static void api_clear() {
+static hub75_error_t api_clear() {
     if (tls_scene == NULL) {
         debug("no scene set\n");
-        return;
+        return HUB75_ERR_NO_SCENE;
     }
     if (tls_scene->frame_buffer.data) {
         size_t img_size = (size_t)(tls_scene->frame_buffer.dimensions.x *
                                    tls_scene->frame_buffer.dimensions.y * 4);
         memset(tls_scene->frame_buffer.data, 0, img_size);
     }
+    return HUB75_OK;
 }
 
 /**
@@ -764,12 +766,13 @@ static void api_clear() {
  * Sets a pixel at the given coordinates to the specified color. Checks that
  * a scene is set before attempting to draw.
  */
-static void api_pixel(uint16_t x, uint16_t y, RGB color) {
+static hub75_error_t api_pixel(uint16_t x, uint16_t y, RGBA color) {
     if (tls_scene == NULL) {
         debug("no scene set\n");
-        return;
+        return HUB75_ERR_NO_SCENE;
     }
-    hub_pixel(tls_scene, x, y, color);
+    draw_pixel(tls_scene, x, y, color);
+    return HUB75_OK;
 }
 
 /**
@@ -784,12 +787,14 @@ static void api_pixel(uint16_t x, uint16_t y, RGB color) {
  * Draws a line from (x1,y1) to (x2,y2) using a basic line drawing algorithm.
  * Checks that a scene is set before attempting to draw.
  */
-static void api_line(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB color) {
+static hub75_error_t api_line(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB color) {
     if (tls_scene == NULL) {
         debug("no scene set\n");
-        return;
+        return HUB75_ERR_NO_SCENE;
     }
-    hub_line(tls_scene, x1, y1, x2, y2, color);
+    RGBA pixel = {color.r, color.g, color.b, 255};
+    draw_line(tls_scene, x1, y1, x2, y2, pixel);
+    return HUB75_OK;
 }
 
 /**
@@ -804,12 +809,14 @@ static void api_line(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB col
  * Draws a smooth anti-aliased line from (x1,y1) to (x2,y2) for better visual quality.
  * Checks that a scene is set before attempting to draw.
  */
-static void api_line_aa(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB color) {
+static hub75_error_t api_line_aa(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB color) {
     if (tls_scene == NULL) {
         debug("no scene set\n");
-        return;
+        return HUB75_ERR_NO_SCENE;
     }
-    hub_line_aa(tls_scene, x1, y1, x2, y2, color);
+    RGBA pixel = {color.r, color.g, color.b, 255};
+    draw_line_aa(tls_scene, x1, y1, x2, y2, pixel);
+    return HUB75_OK;
 }
 
 
@@ -822,14 +829,14 @@ static void api_line_aa(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, RGB 
  * 
  * Sets tls_scene->frame_ready to false and updates tls_scene->frame_buffer.data pointer.
  */
-static void api_frame_begin() {
+static hub75_error_t api_frame_begin() {
     if (tls_scene == NULL) {
         debug("no scene set\n");
-        return;
+        return HUB75_ERR_NO_SCENE;
     }
     if (!tls_scene->frame_ready) {
         debug("previous frame not released\n");
-        return;
+        return HUB75_ERR_INVALID_COORDS;  // reusing error code for invalid state
     }
     uint8_t *image = NULL;
     image = spsc_push_ptr_begin(tls_scene->ring_buf_mapper, 200);
@@ -839,13 +846,14 @@ static void api_frame_begin() {
     }
     if (image == NULL) {
         debug("timed out waiting for frame buffer\n");
-        return;
+        return HUB75_ERR_OUT_OF_MEMORY;  // reusing error code for timeout/buffer unavailable
     }
     tls_scene->frame_ready = false;
 
     // Update frame_buffer.data (primary) and legacy image pointer (compatibility shim)
     tls_scene->frame_buffer.data = (RGBA*)image;
     tls_scene->image = image;  // TODO: remove once migration complete
+    return HUB75_OK;
 }
 
 /**
@@ -856,19 +864,20 @@ static void api_frame_begin() {
  * 
  * Sets tls_scene->frame_ready to true and commits the buffer to the mapper.
  */
-static void api_frame_end() {
+static hub75_error_t api_frame_end() {
     if (tls_scene == NULL) {
         debug("no scene set\n");
-        return;
+        return HUB75_ERR_NO_SCENE;
     }
 
     if (tls_scene->frame_ready) {
         debug("begin frame not called\n");
-        return;
+        return HUB75_ERR_INVALID_COORDS;  // reusing error code for invalid state
     }
 
     tls_scene->frame_ready = true;
     spsc_push_ptr_commit(tls_scene->ring_buf_mapper);
+    return HUB75_OK;
 }
 
 
@@ -906,20 +915,46 @@ static inline void fill_span_rgb(hub75_display_t *scene, int y, int x0, int x1, 
     }
 }
 
-static inline void fill_span_rgba(hub75_display_t *scene, int y, int x0, int x1, RGBA c) {
+/**
+ * @brief Fill a horizontal span of pixels with RGBA color and alpha compositing
+ * 
+ * For alpha == 255 (fully opaque), uses fast direct assignment.
+ * For alpha < 255, performs proper alpha compositing per pixel.
+ */
+static hub75_error_t fill_span_rgba(hub75_display_t *scene, int y, int x0, int x1, RGBA c) {
     const int32_t w = scene->frame_buffer.dimensions.x;
     const int32_t h = scene->frame_buffer.dimensions.y;
-    if ((unsigned)y >= (unsigned)h) return;
+    if ((unsigned)y >= (unsigned)h) return HUB75_ERR_INVALID_COORDS;
     if (x0 > x1) { int t = x0; x0 = x1; x1 = t; }
-    if (x1 < 0 || x0 >= w) return;
+    if (x1 < 0 || x0 >= w) return HUB75_ERR_INVERTED_COORDS;
 
     x0 = clamp_int(x0, 0, w - 1);
     x1 = clamp_int(x1, 0, w - 1);
 
     RGBA *row = scene->frame_buffer.data + (y * w);
-    for (int x = x0; x <= x1; ++x) {
-        row[x] = c;
+    
+    // Fast path for fully opaque pixels
+    if (c.a == 255) {
+        for (int x = x0; x <= x1; ++x) {
+            row[x] = c;
+        }
     }
+    // Alpha compositing for semi-transparent pixels
+    else if (c.a > 0) {
+        const uint32_t alpha = c.a;
+        const uint32_t inv_alpha = 255 - alpha;
+        
+        for (int x = x0; x <= x1; ++x) {
+            RGBA *dst = &row[x];
+            dst->r = (uint8_t)((c.r * alpha + dst->r * inv_alpha) / 255);
+            dst->g = (uint8_t)((c.g * alpha + dst->g * inv_alpha) / 255);
+            dst->b = (uint8_t)((c.b * alpha + dst->b * inv_alpha) / 255);
+            dst->a = (uint8_t)(alpha + (dst->a * inv_alpha) / 255);
+        }
+    }
+    // alpha == 0: no-op, fully transparent
+
+    return HUB75_OK;
 }
 
 
@@ -941,7 +976,7 @@ static inline void fill_span_rgba(hub75_display_t *scene, int y, int x0, int x1,
  * 3. For each scanline, find edge intersections
  * 4. Fill between intersection pairs
  */
-void draw_polygon_fill(hub75_display_t *scene, Polygonf_t *poly, RGBA color)
+void polygon_fill(hub75_display_t *scene, Polygonf_t *poly, RGBA color)
 {
     if (!scene || !scene->frame_buffer.data || !poly || poly->num_points < 3) {
         debug("draw_polygon: bad args\n");
@@ -1036,7 +1071,7 @@ static inline void draw_triangle_gouraud(hub75_display_t *scene,
         if (vcolor[0].r == vcolor[1].r && vcolor[0].g == vcolor[1].g && vcolor[0].b == vcolor[1].b &&
             vcolor[0].r == vcolor[2].r && vcolor[0].g == vcolor[2].g && vcolor[0].b == vcolor[2].b) {
                 const RGBA tcolor = { vcolor[0].r, vcolor[0].g, vcolor[0].b, 255 };
-            draw_polygon_fill(scene, (Polygonf_t*)poly, tcolor);
+            polygon_fill(scene, (Polygonf_t*)poly, tcolor);
             return;
         }
     }
@@ -1303,31 +1338,33 @@ poly_winding_t polygon_winding(const Polygonf_t *poly)
  * @param gradient Simple gradient definition
  * 
  * Public API function that draws a gradient polygon using the current thread's scene.
- * This is a wrapper around gradient_polygon() that uses the thread-local scene.
+ * This is a wrapper around polygon_gradient() that uses the thread-local scene.
  * Checks that a scene is set before attempting to draw.
  */
-void api_poly_gradient(Polygonf_t *poly, SimpleGradient gradient) {
+hub75_error_t api_poly_gradient(Polygonf_t *poly, SimpleGradient gradient) {
     if (tls_scene == NULL) {
         debug("no scene set\n");
-        return;
+        return HUB75_ERR_NO_SCENE;
     }
 
-    gradient_polygon(tls_scene, poly, gradient);
+    polygon_gradient(tls_scene, poly, gradient);
+    return HUB75_OK;
 }
 
 
 /**
  * @brief Fill a horizontal span with a simple gradient using the current thread-local scene
  */
-void api_fill_gradient(int y, int x0, int x1, 
+hub75_error_t api_fill_gradient(int y, int x0, int x1, 
                                              const SimpleGradient *gradient, 
                                              int minx, int miny, int maxx, int maxy) {
     if (tls_scene == NULL) {
         debug("no scene set\n");
-        return;
+        return HUB75_ERR_NO_SCENE;
     }
 
     gradient_fill(tls_scene, y, x0, x1, gradient, minx, miny, maxx, maxy);
+    return HUB75_OK;
 }
 
 /**
@@ -1338,35 +1375,29 @@ void api_fill_gradient(int y, int x0, int x1,
  * @param color2 Color for clockwise winding
  * 
  * Public API function that draws a polygon using the current thread's scene.
- * This is a wrapper around draw_polygon_fill() that uses the thread-local scene.
+ * This is a wrapper around polygon_fill() that uses the thread-local scene.
  * Checks that a scene is set before attempting to draw.
  */
-void api_poly(Polygonf_t *poly, RGBA color1) {
+hub75_error_t api_poly(Polygonf_t *poly, RGBA color1) {
     if (tls_scene == NULL) {
         debug("no scene set\n");
-        return;
+        return HUB75_ERR_NO_SCENE;
     }
 
-    draw_polygon_fill(tls_scene, poly, color1);
+    polygon_fill(tls_scene, poly, color1);
+    return HUB75_OK;
 }
 
 /**
  * @brief Request a graceful shutdown of the current scene's rendering
  */
-void api_shutdown() {
+hub75_error_t api_shutdown() {
     if (tls_scene == NULL) {
         debug("no scene set\n");
-        return;
+        return HUB75_ERR_NO_SCENE;
     }
     hub75_display_request_shutdown(tls_scene);
-}
-
-void api_pixel_factor (int x, int y, RGB pixel, float factor) {
-    if (tls_scene == NULL) {
-        debug("no scene set\n");
-        return;
-    }
-    hub_pixel_factor(tls_scene, x, y, pixel, factor);
+    return HUB75_OK;
 }
 
 void api_pixel_alpha (int x, int y, RGBA pixel) {
@@ -1374,7 +1405,7 @@ void api_pixel_alpha (int x, int y, RGBA pixel) {
         debug("no scene set\n");
         return;
     }
-    hub_pixel_alpha(tls_scene, x, y, pixel);
+    draw_pixel_alpha(tls_scene, x, y, pixel);
 }   
 
 /**
@@ -1494,6 +1525,11 @@ void debug_object(object_t *obj) {
 void api_geo_render_wire(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene3d_lighting_t *lighting) {
     (void)lighting; /* allow NULL; lighting not used in wireframe */
 
+    if (!tls_scene || !cam || !obj || !obj_xform) {
+        debug("api_geo_render_wire: invalid parameters\n");
+        return;
+    }
+
     // Debug camera and transform (gated behind enhanced_debug)
     if (tls_scene && tls_scene->enhanced_debug) {
      printf("Camera: pos(%.3f, %.3f, %.3f), target(%.3f, %.3f, %.3f), fov=%.3f, aspect=%.3f, near=%.3f, far=%.3f\n", 
@@ -1605,7 +1641,8 @@ void api_geo_render_wire(const camera_t *cam, object_t *obj, const transform_t *
             printf("line: (%d, %d) to (%d, %d)\n", x1, y1, x2, y2);
         }
         
-        hub_line(tls_scene, (uint16_t)x1, (uint16_t)y1, (uint16_t)x2, (uint16_t)y2, obj->edge_colors->list[i]);
+        RGBA edge_pixel = {obj->edge_colors->list[i].r, obj->edge_colors->list[i].g, obj->edge_colors->list[i].b, 255};
+        draw_line(tls_scene, (uint16_t)x1, (uint16_t)y1, (uint16_t)x2, (uint16_t)y2, edge_pixel);
     }
 
     if (front_face) free(front_face);
@@ -1622,7 +1659,10 @@ static int _cmp_trifill_desc(const void *a, const void *b) {
 }
 
 void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene3d_lighting_t *lighting) {
-    if (!obj || !obj->faces || !obj->verticies) return;
+    if (!tls_scene || !cam || !obj || !obj_xform || !obj->faces || !obj->verticies) {
+        debug("api_geo_render_filled: invalid parameters\n");
+        return;
+    }
     mat4 mvp = camera_project(cam, obj_xform);
 
     /* Transform all vertices to NDC */
@@ -1732,9 +1772,9 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
                 ndc[vi].y = cv[vi].y * iw;
                 ndc[vi].z = cv[vi].z * iw;
             }
-            t.poly.points[0] = (Pointf_t){ 0.5f * (ndc[0].x + 1.0f), 0.5f * (ndc[0].y + 1.0f) };
-            t.poly.points[1] = (Pointf_t){ 0.5f * (ndc[1].x + 1.0f), 0.5f * (ndc[1].y + 1.0f) };
-            t.poly.points[2] = (Pointf_t){ 0.5f * (ndc[2].x + 1.0f), 0.5f * (ndc[2].y + 1.0f) };
+            t.poly.points[0] = (vec2){ 0.5f * (ndc[0].x + 1.0f), 0.5f * (ndc[0].y + 1.0f) };
+            t.poly.points[1] = (vec2){ 0.5f * (ndc[1].x + 1.0f), 0.5f * (ndc[1].y + 1.0f) };
+            t.poly.points[2] = (vec2){ 0.5f * (ndc[2].x + 1.0f), 0.5f * (ndc[2].y + 1.0f) };
             t.vcolor[0] = col[0];
             t.vcolor[1] = col[1];
             t.vcolor[2] = col[2];
@@ -1940,7 +1980,10 @@ static inline vec4 mat4_mul_point_clip_xyw(const mat4 m, const vec3 p) {
 /* Wireframe renderer that culls backfaces using clip-space XYW orientation */
 void api_geo_render_wire_clip_cull(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene3d_lighting_t *lighting) {
     (void)lighting; /* not used for wireframe */
-    if (!obj || !obj->verticies || !obj->edges) return;
+    if (!tls_scene || !cam || !obj || !obj_xform || !obj->verticies || !obj->edges) {
+        debug("api_geo_render_wire_clip_cull: invalid parameters\n");
+        return;
+    }
 
     /* Build MVP and compute both: clip-space XYW (for culling) and NDC (for raster) */
     mat4 mvp = camera_project(cam, obj_xform);
@@ -2044,7 +2087,8 @@ void api_geo_render_wire_clip_cull(const camera_t *cam, object_t *obj, const tra
         if ((size_t)edge.x >= obj->verticies->length || (size_t)edge.y >= obj->verticies->length) {
             continue;
         }
-        hub_line_aa(tls_scene, (uint16_t)x1, (uint16_t)y1, (uint16_t)x2, (uint16_t)y2, edge_col);
+        RGBA edge_pixel = {edge_col.r, edge_col.g, edge_col.b, 255};
+        draw_line_aa(tls_scene, (uint16_t)x1, (uint16_t)y1, (uint16_t)x2, (uint16_t)y2, edge_pixel);
     }
 
     if (front_face) free(front_face);
@@ -2053,7 +2097,10 @@ void api_geo_render_wire_clip_cull(const camera_t *cam, object_t *obj, const tra
 
 /* Render a list of object instances with per-object draw mode */
 static void api_render_scene3d(const camera_t *cam, const scene3d_t *os, const scene3d_lighting_t *lighting) {
-    if (!os || !os->instances || os->count == 0) return;
+    if (!tls_scene || !cam || !os || !os->instances || os->count == 0) {
+        debug("api_render_scene3d: invalid parameters\n");
+        return;
+    }
     /* Prefer explicitly provided lighting; else fall back to scene-owned lighting */
     const scene3d_lighting_t *L = lighting ? lighting : &os->lighting;
     /* Ensure Z-buffer exists and matches current framebuffer size; clear per frame */
@@ -2527,24 +2574,101 @@ void api_object_scene_free(scene3d_t *os) {
 }
 
 
+/**
+ * @param value the value to wrap
+ * @param the wrap "top" value
+ * @return the wrapped value
+ */
+float api_wrap_float(float value, float wrap) {
+    return (value > wrap) ? fmodf(value,  wrap) : value;
+}
+
+
+/* -------- SDF Text API wrappers -------- */
+#include "text_sdf.h"
+
+sdf_font_t* api_sdf_font_load(const char *font_dir) {
+    return sdf_font_load(font_dir);
+}
+
+sdf_font_t* api_sdf_font_load_scaled(const char *font_dir, float target_line_height_px) {
+    return sdf_font_load_scaled(font_dir, target_line_height_px);
+}
+
+void api_sdf_font_free(sdf_font_t *font) {
+    sdf_font_free(font);
+}
+
+sdf_text_t* api_sdf_text_create(sdf_font_t *font, const char *text) {
+    return sdf_text_create(font, text);
+}
+
+void api_sdf_text_destroy(sdf_text_t *t) {
+    sdf_text_destroy(t);
+}
+
+void api_sdf_text_set_position(sdf_text_t *t, float x, float y) {
+    sdf_text_set_position(t, x, y);
+}
+
+void api_sdf_text_set_direction(sdf_text_t *t, float dx, float dy) {
+    sdf_text_set_direction(t, dx, dy);
+}
+
+void api_sdf_text_set_speed(sdf_text_t *t, float speed) {
+    sdf_text_set_speed(t, speed);
+}
+
+void api_sdf_text_set_size_px(sdf_text_t *t, float size_px) {
+    sdf_text_set_size_px(t, size_px);
+}
+
+void api_sdf_text_set_color(sdf_text_t *t, RGBA color) {
+    sdf_text_set_color(t, color);
+}
+
+void api_sdf_text_set_alpha(sdf_text_t *t, uint8_t a) {
+    sdf_text_set_alpha(t, a);
+}
+
+void api_sdf_text_set_tracking(sdf_text_t *t, float tracking) {
+    sdf_text_set_tracking(t, tracking);
+}
+
+void api_sdf_text_set_text(sdf_text_t *t, const char *text) {
+    sdf_text_set_text(t, text);
+}
+
+void api_sdf_text_update(sdf_text_t *t, const int32_t display_width) {
+    sdf_text_update(t, display_width);
+}
+
+void api_sdf_text_render(sdf_text_t *t, uint8_t *dst, int w, int h, int stride, float time_sec) {
+    sdf_text_render(t, dst, w, h, stride, time_sec);
+}
+
+vec2u api_sdf_text_measure_px(sdf_text_t *t) {
+    return sdf_text_measure_px(t);
+}
+
 
 /**
  * @brief Function pointer table containing all drawing API functions
  * 
  * Static constant structure that maps function pointers to the implementation
- * functions. This table is returned by hub75gpu() to provide the drawing API.
+ * functions. This table is returned by hub75_api() to provide the drawing API.
  */
 static const hub75gpu_t api_table = {
+    .version = HUB75_API_VERSION,
     .clear = api_clear,
     .pixel = api_pixel,
-    .pixel_factor = api_pixel_factor,
-    .pixel_alpha = api_pixel_alpha,
     .line = api_line,
     .line_aa = api_line_aa,
     .poly = api_poly,
     .poly_gradient = api_poly_gradient,
     .fill_gradient = api_fill_gradient,
     .frame_begin = api_frame_begin,
+    .wrap = api_wrap_float,
 
     .geo_object = api_new_object,
     .geo_cube = api_new_cube,
@@ -2583,6 +2707,24 @@ static const hub75gpu_t api_table = {
     .scene3d_set_debug_shadow_vis = api_scene3d_set_debug_shadow_vis,
     .scene3d_dump_shadowmap_png = api_scene3d_dump_shadowmap_png,
     .scene3d_set_shadowmap_zoom = api_scene3d_set_shadowmap_zoom,
+
+    /* SDF text functions */
+    .sdf_font_load = api_sdf_font_load,
+    .sdf_font_load_scaled = api_sdf_font_load_scaled,
+    .sdf_font_free = api_sdf_font_free,
+    .sdf_text_create = api_sdf_text_create,
+    .sdf_text_destroy = api_sdf_text_destroy,
+    .sdf_text_set_position = api_sdf_text_set_position,
+    .sdf_text_set_direction = api_sdf_text_set_direction,
+    .sdf_text_set_speed = api_sdf_text_set_speed,
+    .sdf_text_set_size_px = api_sdf_text_set_size_px,
+    .sdf_text_set_color = api_sdf_text_set_color,
+    .sdf_text_set_alpha = api_sdf_text_set_alpha,
+    .sdf_text_set_tracking = api_sdf_text_set_tracking,
+    .sdf_text_set_text = api_sdf_text_set_text,
+    .sdf_text_update = api_sdf_text_update,
+    .sdf_text_render = api_sdf_text_render,
+    .sdf_text_measure_px = api_sdf_text_measure_px,
 };
 
 
@@ -2605,8 +2747,11 @@ hub75gpu_t hub75_api(hub75_display_t *scene) {
 /* -------- Convenience scene wrappers (thread-local current scene3d) -------- */
 void api_scene3d_set_current(scene3d_t *os) { tls_current_os = os; }
 void api_scene3d_clear_current(void) { tls_current_os = NULL; }
-void api_scene3d_set_ambient(RGBF ambient) {
-    if (tls_current_os && tls_current_os->set_ambient) tls_current_os->set_ambient(tls_current_os, ambient);
+hub75_error_t api_scene3d_set_ambient(RGBF ambient) {
+    if (!tls_current_os) return HUB75_ERR_NO_SCENE;
+    if (!tls_current_os->set_ambient) return HUB75_ERR_NULL_PARAM;
+    tls_current_os->set_ambient(tls_current_os, ambient);
+    return HUB75_OK;
 }
 uint16_t api_scene3d_add_directional(vec3 direction, RGBF color, float intensity, bool casts_shadows) {
     if (!tls_current_os || !tls_current_os->add_directional) return UINT16_MAX;
@@ -2630,42 +2775,46 @@ transform_t* api_scene3d_get_transform(uint16_t id) {
     return tls_current_os->get_transform(tls_current_os, id);
 }
 
-void api_scene3d_set_directional_pose(uint16_t id, vec3 position, vec3 look_at) {
-    if (tls_current_os && tls_current_os->set_directional_pose) {
-        tls_current_os->set_directional_pose(tls_current_os, id, position, look_at);
-    }
+hub75_error_t api_scene3d_set_directional_pose(uint16_t id, vec3 position, vec3 look_at) {
+    if (!tls_current_os) return HUB75_ERR_NO_SCENE;
+    if (!tls_current_os->set_directional_pose) return HUB75_ERR_NULL_PARAM;
+    tls_current_os->set_directional_pose(tls_current_os, id, position, look_at);
+    return HUB75_OK;
 }
 
 /* Control shadow map tight-fit zoom for a light (1.0 = default; <1.0 zoom in; >1.0 zoom out) */
-void api_scene3d_set_shadowmap_zoom(uint16_t light_index, float zoom) {
-    if (!tls_current_os) return;
-    if (!tls_current_os->lighting.lights || light_index >= tls_current_os->lighting.num_lights) return;
+hub75_error_t api_scene3d_set_shadowmap_zoom(uint16_t light_index, float zoom) {
+    if (!tls_current_os) return HUB75_ERR_NO_SCENE;
+    if (!tls_current_os->lighting.lights || light_index >= tls_current_os->lighting.num_lights) return HUB75_ERR_INVALID_COORDS;
     if (!(zoom > 0.0f)) zoom = 1.0f; /* ignore non-positive values */
     light_t *L = &tls_current_os->lighting.lights[light_index];
     L->shadow_zoom = zoom;
     /* Force recompute of cached VP/bias next frame */
     L->shadow_vp_valid = false;
+    return HUB75_OK;
 }
 
 /* -------- Debug helpers (thread-local current scene3d) -------- */
-void api_scene3d_set_debug_checker(bool enabled, uint8_t tile_px, float strength, RGB color) {
-    if (!tls_current_os) return;
+hub75_error_t api_scene3d_set_debug_checker(bool enabled, uint8_t tile_px, float strength, RGB color) {
+    if (!tls_current_os) return HUB75_ERR_NO_SCENE;
     tls_current_os->debug.overlay_checker = enabled;
     if (tile_px == 0) tile_px = 8;
     tls_current_os->debug.checker_size = tile_px;
     if (strength < 0.0f) strength = 0.0f; else if (strength > 1.0f) strength = 1.0f;
     tls_current_os->debug.checker_strength = strength;
     tls_current_os->debug.checker_color = color;
+    return HUB75_OK;
 }
 
-void api_scene3d_set_debug_shadow_vis(bool enabled, uint8_t light_index, float strength, RGB lit_color, RGB shadow_color) {
-    if (!tls_current_os) return;
+hub75_error_t api_scene3d_set_debug_shadow_vis(bool enabled, uint8_t light_index, float strength, RGB lit_color, RGB shadow_color) {
+    if (!tls_current_os) return HUB75_ERR_NO_SCENE;
     tls_current_os->debug.overlay_shadow_vis = enabled;
     tls_current_os->debug.shadow_vis_light = light_index;
     if (strength < 0.0f) strength = 0.0f; else if (strength > 1.0f) strength = 1.0f;
     tls_current_os->debug.shadow_vis_strength = strength;
     tls_current_os->debug.shadow_vis_color_lit = lit_color;
     tls_current_os->debug.shadow_vis_color_shadow = shadow_color;
+    return HUB75_OK;
 }
 
 /* -------- Object material helpers -------- */

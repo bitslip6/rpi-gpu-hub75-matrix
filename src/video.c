@@ -25,10 +25,10 @@
  * @return void* 
  */
 
-void* render_video_fn(void *arg) {
+void* main_render_video(void *arg) {
     hub75_display_t *scene = (hub75_display_t*)arg;
     while (scene->do_render) {
-        if (!hub_render_video(scene, scene->shader_file)) {
+        if (!render_video(scene, scene->shader_file)) {
             break;
         }
     }
@@ -40,7 +40,7 @@ void* render_video_fn(void *arg) {
 
 
 
-bool hub_render_video(hub75_display_t *scene, const char *filename) {
+bool render_video(hub75_display_t *scene, const char *filename) {
     AVFormatContext *format_ctx = NULL;
     AVCodecContext  *codec_ctx  = NULL;
     const AVCodec *codec  = NULL;  // const per modern FFmpeg API (av_find_best_stream expects const AVCodec**)
