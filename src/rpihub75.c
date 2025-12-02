@@ -370,6 +370,171 @@ static inline void io_store_barrier(void) {
 #endif
 }
 
+void* hub75_display_run_pi4(const hub75_display_t *scene) {
+
+    int cpu_model = cpu_get_pi_model();
+
+    // map the gpio address to we can control the GPIO pins
+    uint32_t *PERIBase = map_gpio(cpu_model); // for root on pi5 (/dev/mem, offset is 0xD0000)
+    // offset to the RIO registers (required for #define register access. 
+    // TODO: this needs to be improved and #define to RIOBase removed)
+    configure_gpio(PERIBase, cpu_model);
+         
+    // index into the OE jitter mask
+    // pre compute some variables. let the compiler know the alignment for optimizations
+    const uint16_t half_height = (uint16_t)scene->panel_height / 2;
+    const uint16_t width = scene->width;
+    const uint8_t  bit_depth = scene->bit_depth;
+
+    // pointer to the current bcm data to be displayed
+    ASSERT(width % 16 == 0);
+    ASSERT(half_height % 16 == 0);
+    ASSERT(bit_depth % BIT_DEPTH_ALIGNMENT == 0);
+
+    // create the OE jitter mask to control screen brightness
+    // if we are using BCM brightness, then set OE to 0 (0 is display on ironically)
+    uint32_t *jitter_mask = jitter_create(JITTER_SIZE, scene->brightness, scene->jitter_brightness);
+
+    // store the row to address mapping in an array for faster access
+    uint32_t addr_map[half_height];
+    for (int i=0; i<half_height; i++) {
+        addr_map[i] = row_to_address(i, half_height);
+    }
+
+    struct   timeval end_time, start_time;
+    time_t   last_time_s = time(NULL);
+    uint32_t frame_count = 0;
+    uint64_t frame_total = 0;
+    uint32_t last_addr   = 0;
+    uint32_t color_pins  = 0;
+    gettimeofday(&start_time, NULL);
+
+    __attribute__((unused)) uint16_t phase = 1;         // phase is where we start pulling jitter bits from
+    uint16_t jitter_idx = 0;    // jitter_mask has an extra 16K of bits in it, so overrun is ok
+    const uint32_t *bcm_signal; // pointer to the current bcm data to be displayed
+
+    debug(" [.] waiting for first frame acquisition...\n");
+
+    while (scene->do_render) {
+        bcm_signal = spsc_pop_ptr_begin(scene->ring_buf_renderer, 1000);
+        if (bcm_signal != NULL) {
+            break; // success, keep the first frame
+        }
+        debug(" [.] still waiting for first frame acquisition...\n");
+    }
+    if (bcm_signal == NULL) {
+        debug(" [!] unable to locate first rendered frame\n");
+        return NULL;
+    }
+    debug(" [$] first frame acquired\n");
+
+    // lock the memory we just touched (bcm_signal)...
+    bool is_realtime = enable_rt_and_lock_mem();
+
+    // const int max_phase = JITTER_SIZE;
+    uint32_t full_frame = 0;
+    while (scene->do_render) {
+
+        uint32_t offset = 0;
+        for (uint8_t pwm = 0; pwm < bit_depth; pwm++) {
+
+            // check for a new frame, reset jitter phase once we hit the end
+            if ((pwm & 15u) == 0u) {   // true at i = 0,16,32,...
+                // Only swap to a new frame if there is at least one additional item
+                // beyond the one we currently hold. This avoids re-popping the same slot
+                // and releasing it too early while still in use.
+                if (spsc_count(scene->ring_buf_renderer) >= 2) {
+                    // release the current frame
+                    // acquire the next frame (non-blocking)
+                    const uint32_t *tmp = spsc_pop_ptr_begin(scene->ring_buf_renderer, 0);
+                    if (tmp) {
+                        spsc_pop_ptr_commit(scene->ring_buf_renderer);
+                        bcm_signal = tmp;
+                    }
+                }
+            }
+
+
+            frame_count++;
+            
+            for (uint16_t y = 0; y < half_height; y++) {
+                asm volatile ("" : : : "memory");  // Prevents optimization
+
+                PERIBase[7]  = addr_map[y] & ~last_addr;
+                SLOW
+                PERIBase[10] = ~addr_map[y] & last_addr;
+                SLOW
+                last_addr    = addr_map[y];
+
+                for (uint16_t x=0; x<width; x++) {
+                    asm volatile ("" : : : "memory");  // Prevents optimization
+                    uint32_t new_mask = ((bcm_signal[offset]) | jitter_mask[jitter_idx]);
+                    PERIBase[10]      = (~new_mask & color_pins) | PIN_CLK;
+                    SLOW
+                    PERIBase[7]       = (new_mask & ~color_pins);
+                    SLOW
+                    SLOW
+                    SLOW
+                    PERIBase[7]       = (new_mask) | PIN_CLK;
+
+                    SLOW
+                    SLOW
+                    SLOW
+                    color_pins        = new_mask;
+
+                    // advance the global OE jitter mask 1 frame
+                    jitter_idx = (jitter_idx + 1) % JITTER_SIZE;
+
+                    // advance to the next pixel in the bcm signal
+                    offset += bit_depth;// + 1;
+                }
+                PERIBase[7] = PIN_LATCH | PIN_OE;
+                SLOW
+                SLOW
+                PERIBase[10] = PIN_LATCH;
+                SLOW
+                SLOW
+                PERIBase[10] = PIN_OE;
+                SLOW
+           }
+
+            // if using phase, uncomment this code to advance phase each row
+            // phase += 8; if (phase >= JITTER_SIZE - (width + width)) { phase = 0; }
+        }
+        full_frame++;
+
+        if (is_realtime) {
+            if (full_frame & 1) {
+                usleep(500);      // make sure we yield enough for the kernel to service kernel tasks
+                sched_yield();
+            }
+        }
+
+        // only hit the sys call after about 4.6 seconds or so (render speed should be about 3200Hz)
+        if (frame_count > 15000) {
+            time_t current_time_s = time(NULL);  // syscalls are slow, so avoid them when possible...
+            if (UNLIKELY(current_time_s >= last_time_s + 5)) {
+                if (scene->show_fps) {
+                    gettimeofday(&end_time, NULL);
+                    double elapsed = (double)(end_time.tv_sec - start_time.tv_sec) + (double)(end_time.tv_usec - start_time.tv_usec) * 1e-6;
+                    float hz = (float)(frame_count) / (float)(elapsed);
+                    float percent = (float)(hz) / 3220.0f;
+                    debug(" [%2.2f%%] Panel Refresh Rate: %.1fHz\n", (double)(percent * 100.0f), (frame_count / elapsed));
+                    gettimeofday(&start_time, NULL);
+                }
+                frame_total += frame_count;
+                frame_count = 0;
+                last_time_s = current_time_s;
+            }
+        }
+    }
+
+    debug(" [-] display run render loop exiting. [%ld] total frames rendered\n", (frame_total + frame_count));
+
+    return NULL;
+}
+
+
 void* hub75_display_run(const hub75_display_t *scene) {
 
     int cpu_model = cpu_get_pi_model();
@@ -380,11 +545,9 @@ void* hub75_display_run(const hub75_display_t *scene) {
         die(" [!] Unsupported CPU model detected %d\n", cpu_model);
     }
 
-    /*
     if (cpu_model < 5 ) {
-        return render_forever_pi4(scene, cpu_model);
+        return hub75_display_run_pi4(scene);
     }
-    */
 
     // map the gpio address to we can control the GPIO pins
     uint32_t *PERIBase = map_gpio(5); // for root on pi5 (/dev/mem, offset is 0xD0000)

@@ -1289,10 +1289,10 @@ uint32_t* map_gpio(int version) {
     loff_t peri = 0;
     int mem_fd = 0; 
     if (version == 4) {
-	    peri = PERI4_BASE;
+	    peri = PERI4_BASE + GPIO4_OFFSET;
         mem_fd = open("/dev/gpiomem", O_RDWR | O_SYNC);
     } else if (version == 3) {
-	    peri = PERI3_BASE;
+	    peri = PERI3_BASE + GPIO3_OFFSET;
         mem_fd = open("/dev/gpiomem", O_RDWR | O_SYNC);
     } else if (version == 5) {
 	    peri = PERI5_BASE;
