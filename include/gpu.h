@@ -10,4 +10,4 @@
  * 
  * @param arg pointer to the current scene_info object
  */
-void *render_shader(void *arg);
+void *main_render_shader(void *arg);

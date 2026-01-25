@@ -1,6 +1,7 @@
 #include <math.h>
 #include <float.h>
 #include "rpihub75.h"
+#include "util.h"
 
 
 #ifndef BF_EPS

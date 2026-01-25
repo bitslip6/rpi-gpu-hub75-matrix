@@ -1,10 +1,11 @@
 #include <unistd.h>
 #include <stdint.h>
 
-#include "rpihub75.h"
 
-#ifndef _UTIL_H
-#define _UTIL_H 1
+#ifndef __UTIL_H__
+#define __UTIL_H__
+#include "rpihub75.h"
+#include "lists.h"
 
 
 /**
@@ -44,7 +45,39 @@ void die(const char *message, ...);
  * @param format 
  * @param ... 
  */
+#define HAVE_DEBUG_FUNC 1
 void debug(const char *format, ...);
+
+/**
+ * @brief return the difference between two timespecs in microseconds
+ */
+int64_t ts_diff_us(const struct timespec *a, const struct timespec *b);
+
+
+/**
+ * @brief Adds a specified number of milliseconds to a timespec structure, handling the overflow
+ *              of nanoseconds to seconds.
+ **/
+void timespec_add_ms(struct timespec *ts, long ms);
+
+/**
+ * @brief safe free a pointer and set it to NULL
+ * 
+ * @param pp pointer to the pointer to free
+ */
+void safe_free(void **pp);
+
+#ifndef SAFE_FREE
+#define SAFE_FREE(p)                                      \
+    do {                                                  \
+        void **__pp = (void**)&(p);                       \
+        if (__pp && *__pp) {                              \
+            free(*__pp);  /* or mg_free(*__pp); */        \
+            *__pp = NULL;                                 \
+        }                                                 \
+    } while (0)
+#endif
+
 
 
 /**
@@ -55,7 +88,7 @@ void debug(const char *format, ...);
  * @param brightness   larger values produce brighter output, max 255
  * @return uint32_t*   a pointer to the jitter mask. caller must release memory
  */
-uint32_t *create_jitter_mask(const uint16_t jitter_size, const uint8_t brightness);
+uint32_t *jitter_create(const uint16_t jitter_size, const uint8_t brightness, bool jitter_brightness);
 
 /**
  * @brief write data to a file, exit on any failure
@@ -66,7 +99,7 @@ uint32_t *create_jitter_mask(const uint16_t jitter_size, const uint8_t brightnes
  * @return int number of bytes written, -1 on error
  */
 
-int file_put_contents(const char *filename, const void *data, const size_t size);
+size_t file_put_contents(const char *filename, const void *data, const size_t size);
 
 /**
  * @brief read in a file, allocate memory and return the data. caller must free.
@@ -77,7 +110,7 @@ int file_put_contents(const char *filename, const void *data, const size_t size)
  * @param filesize - pointer to the size of the file. will be set after the call. ugly i know
  * @return char* - pointer to read data. NOTE: caller must free
  */
-char *file_get_contents(const char *filename, long *filesize);
+char *file_get_contents(const char *filename, size_t *filesize);
 
 /**
  * @brief print a 32 bit number in binary format to stdout
@@ -105,14 +138,9 @@ void binary64(FILE *fd, const uint64_t number);
 int rnd(unsigned char *buffer, const size_t size);
 
 /**
- * @brief count number of times this function is called, 1 every second output
- * the number of times called and reset the counter. This function can not
- * be called from multiple locations. It is not thread safe.
- * 
- * @param target_fps - target a sleep time to achieve this fps
- * @return long - returns sleep time in microseconds
+ * @brief compute exponential moving average
  */
-long calculate_fps(const uint16_t target_fps, const bool show_fps);
+float math_ema(float new_value, float old_value, float alpha);
 
 /**
  * @brief map the gpio pins to memory
@@ -120,7 +148,7 @@ long calculate_fps(const uint16_t target_fps, const bool show_fps);
  * @param offset 
  * @return uint32_t* 
  */
-uint32_t* map_gpio(uint32_t offset, int version);
+uint32_t* map_gpio(int version);
 
 /**
  * @brief remove whitespace from string
@@ -131,6 +159,8 @@ char *str_trim_spaces(char *s);
 
 int parse_float(const char *s, float *out);
 uint8_t math_norm_q8(float x);
+Normal normalize(float x, float period);
+
 
 /**
  * @brief set the GPIO pins for hub75 operation.  this is based on hzeller's active board pinouts
@@ -148,17 +178,6 @@ void configure_gpio(uint32_t *PERIBase, int version);
  */
 void usage(int argc, char **argv);
 
-/**
- * @brief create a default scene setup using the #DEFINE values
- * parse command line options to override. This is a great way
- * to test your setup easily from command line
- * @see usage() for details
- * 
- * @param argc 
- * @param argv 
- * @return scene_info* 
- */
-scene_info *default_scene(int argc, char **argv);
 
 /**
  * @brief draw various test patterns to the display
@@ -178,13 +197,31 @@ void *calibrate_panels(void *arg);
  */
 void* receive_udp_data(void *arg);
 
+
 /**
- * @brief  test if a file has a specific extension
- * 
- * @param filename 
- * @param extension 
- * @return true|false
+ * @brief test if a file exists
  */
-bool has_extension(const char *filename, const char *extension);
+bool file_exists(const char *filename);
+
+void png_write_display(const string_t *filename, const hub75_display_t *d);
+
+/**
+ * @brief write the buffer to a RGBA png at file *path
+ */
+int png_write_buffer(const char *path, const image_buffer_t *buffer);
+
+
+/* Generic PNG helpers (libpng) */
+/* Read an image as 8-bit grayscale (tightly packed, stride=w). Returns 0 on success. */
+int png_read_gray8(const char *path, uint8_t **out_pixels, int *out_w, int *out_h, int *out_stride);
+
+/* Read an image as 8-bit RGBA (tightly packed, stride=4*w). Returns 0 on success. */
+int png_read_rgba8(const char *path, uint8_t **out_pixels, int *out_w, int *out_h, int *out_stride);
+
+/* Write an 8-bit grayscale image. Returns 0 on success. */
+int png_write_gray8(const char *path, const uint8_t *pixels, int w, int h, int stride);
+
+/* Write an 8-bit RGBA image. Returns 0 on success. */
+int png_write_rgba8(const char *path, const uint8_t *pixels, int w, int h, int stride);
 
 #endif
