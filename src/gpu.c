@@ -38,10 +38,7 @@
 #include "text_sdf.h"
 #include "compositor.h"
 
-#define HAVE_LIBPNG 1
-#ifdef HAVE_LIBPNG
-#include <png.h>
-#endif
+/* Image loading is handled by util.c (image_read_rgba8) which supports PNG and JPEG */
 
 /*
  * Test Shader Source:
@@ -95,64 +92,15 @@ const char *vertex_shader_source =
     "}\n";
 
 /**
- * Load Texture using libpng
+ * Load Texture (supports PNG and JPEG via image_read_rgba8)
  */
-#ifdef HAVE_LIBPNG
 static GLuint load_texture(const char *filePath)
 {
-    FILE *fp = fopen(filePath, "rb");
-    if (!fp) {
-        die("Failed to open texture: %s\n", filePath);
+    uint8_t *image_data = NULL;
+    int width = 0, height = 0, stride = 0;
+    if (image_read_rgba8(filePath, &image_data, &width, &height, &stride) != 0) {
+        die("Failed to load texture: %s\n", filePath);
     }
-
-    png_structp png_ptr = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
-    if (!png_ptr) { fclose(fp); die("png_create_read_struct failed for %s\n", filePath); }
-    png_infop info_ptr = png_create_info_struct(png_ptr);
-    if (!info_ptr) { png_destroy_read_struct(&png_ptr, NULL, NULL); fclose(fp); die("png_create_info_struct failed for %s\n", filePath); }
-    if (setjmp(png_jmpbuf(png_ptr))) {
-        png_destroy_read_struct(&png_ptr, &info_ptr, NULL); fclose(fp); die("png read error for %s\n", filePath);
-    }
-    png_init_io(png_ptr, fp);
-    png_read_info(png_ptr, info_ptr);
-
-    png_uint_32 width, height;
-    int bit_depth, color_type;
-    png_get_IHDR(png_ptr, info_ptr, &width, &height, &bit_depth, &color_type, NULL, NULL, NULL);
-
-    // Normalize to 8-bit RGBA
-    if (bit_depth == 16) png_set_strip_16(png_ptr);
-    if (color_type == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png_ptr);
-    if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8) png_set_expand_gray_1_2_4_to_8(png_ptr);
-    if (png_get_valid(png_ptr, info_ptr, PNG_INFO_tRNS)) png_set_tRNS_to_alpha(png_ptr);
-    if (color_type == PNG_COLOR_TYPE_RGB || color_type == PNG_COLOR_TYPE_GRAY || color_type == PNG_COLOR_TYPE_PALETTE) {
-        png_set_filler(png_ptr, 0xFF, PNG_FILLER_AFTER);
-    }
-    else if (color_type == PNG_COLOR_TYPE_GRAY_ALPHA) {
-        // already GA -> expand gray to RGB
-        png_set_gray_to_rgb(png_ptr);
-    }
-    // Ensure RGB order
-    // png_set_bgr(png_ptr); // not needed generally
-
-    png_read_update_info(png_ptr, info_ptr);
-
-    size_t rowbytes = png_get_rowbytes(png_ptr, info_ptr);
-    png_bytep image_data = (png_bytep)malloc(rowbytes * height);
-    if (!image_data) {
-        png_destroy_read_struct(&png_ptr, &info_ptr, NULL); fclose(fp); die("Out of memory decoding %s\n", filePath);
-    }
-    png_bytep *row_pointers = (png_bytep*)malloc(sizeof(png_bytep) * height);
-    if (!row_pointers) {
-        free(image_data); png_destroy_read_struct(&png_ptr, &info_ptr, NULL); fclose(fp); die("Out of memory (rows) decoding %s\n", filePath);
-    }
-    for (png_uint_32 y = 0; y < height; ++y) {
-        row_pointers[y] = image_data + y * rowbytes;
-    }
-    png_read_image(png_ptr, row_pointers);
-    png_read_end(png_ptr, NULL);
-    png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
-    fclose(fp);
-    free(row_pointers);
 
     // Upload to GL
     GLuint textureID = 0;
@@ -163,14 +111,13 @@ static GLuint load_texture(const char *filePath)
 
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
-    debug("loaded texture %s [%ux%u]\n", filePath, (unsigned)width, (unsigned)height);
+    debug("loaded texture %s [%dx%d]\n", filePath, width, height);
     free(image_data);
     return textureID;
 }
-#endif
 
 /**
  * @brief Compiles a GLSL shader from the provided source code using the specified shader type.
@@ -343,7 +290,6 @@ int open_dri_device()
     return fd;
 }
 
-#ifdef HAVE_LIBPNG
 static void bind_tex(char *shader_file, char *texture_extension, GLuint unit)
 {
     char *chan0 = change_file_extension(shader_file, texture_extension);
@@ -357,29 +303,22 @@ static void bind_tex(char *shader_file, char *texture_extension, GLuint unit)
         glActiveTexture(GL_TEXTURE0 + unit);
         glBindTexture(GL_TEXTURE_2D, texture);
 
-        // force no-mipmap sampling and NPOT-safe wrap
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        // trilinear mipmap filtering for clean downsampling
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
-
-        // Texture is already bound to the correct unit from above
-        // glActiveTexture(GL_TEXTURE0 + unit) was called earlier
-        // glBindTexture(GL_TEXTURE_2D, texture) was called earlier
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
     }
 
     SAFE_FREE(chan0);
 }
-#endif
 
 /**
  * @brief update the time uniforms in the shader. call once per frame
  *
  * @param program
  */
-void update_uniforms(GLuint program)
+void update_uniforms(GLuint program, float time_scale)
 {
 
     static struct timespec end_time, orig_time, last_time;
@@ -398,7 +337,7 @@ void update_uniforms(GLuint program)
         time_loc  = glGetUniformLocation(program, "iTime");
         dtym_loc  = glGetUniformLocation(program, "iTimeDelta");
         frame_loc = glGetUniformLocation(program, "iFrame");
-        printf("set orig time: %d, %d, %d\n", time_loc, dtym_loc, frame_loc);
+
     }
 
     // update time uniforms
@@ -410,8 +349,8 @@ void update_uniforms(GLuint program)
     frame++;
 
     //glUseProgram(program);
-    glUniform1f(time_loc, t);
-    glUniform1f(dtym_loc, dt);
+    glUniform1f(time_loc, t * time_scale);
+    glUniform1f(dtym_loc, dt * time_scale);
     glUniform1i(frame_loc, (GLint)frame);
 }
 
@@ -701,12 +640,8 @@ static image_buffer_t *text_render_sdf(char *sdf_path, char *msg, float size_px,
     txt->valign = SDF_VALIGN_BOTTOM;
          
 
-    image_buffer_t *image = malloc(sizeof(image_buffer_t));
-    
     sdf_text_update(txt, 64);
-    size_t text_mem = (size_t)(txt->dimensions.x * txt->dimensions.y);
-    printf("Allocating text memory: %zu bytes\n", text_mem);
-    image->data = (RGBA*)calloc(text_mem, sizeof(RGBA));
+    image_buffer_t *image = image_buffer_new(txt->dimensions.x, txt->dimensions.y);
 
     sdf_text_render(txt, (uint8_t*)image->data, txt->dimensions.x, txt->dimensions.y, 4, 0.0f);
 
@@ -767,15 +702,13 @@ void *main_render_shader(void *arg)
     // IMPORTANT: ensure tight unpack before any texture uploads
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
-    // Optional textures via libpng
-#ifdef HAVE_LIBPNG
+    // Optional textures (PNG or JPEG)
     bind_tex(scene->shader_file, "channel0", 0);
     bind_tex(scene->shader_file, "channel1", 1);
     GLint c0_loc = glGetUniformLocation(program, "iChannel0");
     GLint c1_loc = glGetUniformLocation(program, "iChannel1");
     glUniform1i(c0_loc, 0);
     glUniform1i(c1_loc, 1);
-#endif
 
     // uniforms
     GLint res_loc = glGetUniformLocation(program, "iResolution");
@@ -800,7 +733,7 @@ void *main_render_shader(void *arg)
     while (scene->do_render)
     {
         // update the time uniforms
-        update_uniforms(program);
+        update_uniforms(program, scene->time_scale);
 
         // ensure we draw/read from our FBO
         glBindFramebuffer(GL_FRAMEBUFFER, gpu_ctx->fbo);

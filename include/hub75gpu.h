@@ -374,7 +374,10 @@ typedef struct hub75_display {
 
     uint16_t latch_blank_cycles;
     bool rising_edge;
-    
+
+    /** @brief multiplier for shader iTime uniform (default 1.0, lower = slower) */
+    float time_scale;
+
 } hub75_display_t;
 
 

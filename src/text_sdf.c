@@ -222,8 +222,8 @@ sdf_font_t *sdf_font_load(const char *font_dir) {
 
     uint8_t *pixels = NULL;
     int w = 0, h = 0, stride = 0;
-    if (png_read_gray8(path, &pixels, &w, &h, &stride) != 0) {
-      fprintf(stderr, "sdf_font_load: failed to read PNG for '%c' (%u): %s\n",
+    if (image_read_gray8(path, &pixels, &w, &h, &stride) != 0) {
+      fprintf(stderr, "sdf_font_load: failed to read image for '%c' (%u): %s\n",
               (char)ch, ch, path);
       continue;
     }

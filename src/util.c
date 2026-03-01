@@ -21,6 +21,11 @@
 #include <netinet/in.h>
 #include <png.h>
 
+#ifdef HAVE_LIBJPEG
+#include <jpeglib.h>
+#include <setjmp.h>
+#endif
+
 #ifndef CLOCK_MONOTONIC
 #define CLOCK_MONOTONIC			1
 #endif
@@ -332,6 +337,7 @@ hub75_display_t *hub75_display_new() {
     scene->latch_blank_cycles = 2;
     scene->rising_edge = true;
     scene->frame_ready = true;  // Initialize to true so first frame_begin() succeeds
+    scene->time_scale = 1.0f;
 
     return scene;
 }
@@ -394,10 +400,13 @@ hub75_display_t *hub75_display_parse_args(int argc, char **argv) {
     // Parse command-line options
     int opt = 0;
     int num_scales = 0;
-    while ((opt = getopt(argc, argv, "O:T:P:o:x:y:X:Y:s:f:p:c:g:d:m:b:a:t:l:i:jrzvqh?")) != -1) {
+    while ((opt = getopt(argc, argv, "S:O:T:P:o:x:y:X:Y:s:f:p:c:g:d:m:b:a:t:l:i:jrzvqh?")) != -1) {
         switch (opt) {
         case 'r':
             scene->rising_edge = false;
+            break;
+        case 'S':
+            scene->time_scale = atoff(optarg);
             break;
         case 's':
             scene->shader_file = optarg;
@@ -1141,6 +1150,190 @@ int png_write_rgba8(const char *path, const uint8_t *pixels, int w, int h, int s
     return 0;
 }
 
+/* ---- JPEG helpers (libjpeg / libjpeg-turbo) ---- */
+
+#ifdef HAVE_LIBJPEG
+
+struct jpeg_error_ctx {
+    struct jpeg_error_mgr pub;
+    jmp_buf jmpbuf;
+};
+
+static void jpeg_error_exit_handler(j_common_ptr cinfo) {
+    struct jpeg_error_ctx *err = (struct jpeg_error_ctx *)cinfo->err;
+    longjmp(err->jmpbuf, 1);
+}
+
+int jpeg_read_rgba8(const char *path, uint8_t **out_pixels, int *out_w, int *out_h, int *out_stride) {
+    if (!path || !out_pixels || !out_w || !out_h || !out_stride) return -1;
+    *out_pixels = NULL; *out_w = *out_h = *out_stride = 0;
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+
+    struct jpeg_decompress_struct cinfo;
+    struct jpeg_error_ctx jerr;
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = jpeg_error_exit_handler;
+    if (setjmp(jerr.jmpbuf)) {
+        jpeg_destroy_decompress(&cinfo);
+        fclose(fp);
+        return -1;
+    }
+
+    jpeg_create_decompress(&cinfo);
+    jpeg_stdio_src(&cinfo, fp);
+    jpeg_read_header(&cinfo, TRUE);
+
+    /* Request RGB output; we'll add alpha manually */
+    cinfo.out_color_space = JCS_RGB;
+    jpeg_start_decompress(&cinfo);
+
+    int width = (int)cinfo.output_width;
+    int height = (int)cinfo.output_height;
+    int row_stride = (int)cinfo.output_width * (int)cinfo.output_components;
+
+    uint8_t *pixels = (uint8_t *)malloc((size_t)width * (size_t)height * 4u);
+    if (!pixels) { jpeg_destroy_decompress(&cinfo); fclose(fp); return -1; }
+
+    uint8_t *scanline = (uint8_t *)malloc((size_t)row_stride);
+    if (!scanline) { free(pixels); jpeg_destroy_decompress(&cinfo); fclose(fp); return -1; }
+
+    int y = 0;
+    while (cinfo.output_scanline < cinfo.output_height) {
+        JSAMPROW row = (JSAMPROW)scanline;
+        jpeg_read_scanlines(&cinfo, &row, 1);
+        uint8_t *dst = pixels + (size_t)y * (size_t)width * 4u;
+        for (int x = 0; x < width; ++x) {
+            dst[x * 4 + 0] = scanline[x * cinfo.output_components + 0];
+            dst[x * 4 + 1] = scanline[x * cinfo.output_components + 1];
+            dst[x * 4 + 2] = scanline[x * cinfo.output_components + 2];
+            dst[x * 4 + 3] = 0xFF;
+        }
+        y++;
+    }
+
+    free(scanline);
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    fclose(fp);
+
+    *out_pixels = pixels; *out_w = width; *out_h = height; *out_stride = width * 4;
+    return 0;
+}
+
+int jpeg_read_gray8(const char *path, uint8_t **out_pixels, int *out_w, int *out_h, int *out_stride) {
+    if (!path || !out_pixels || !out_w || !out_h || !out_stride) return -1;
+    *out_pixels = NULL; *out_w = *out_h = *out_stride = 0;
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+
+    struct jpeg_decompress_struct cinfo;
+    struct jpeg_error_ctx jerr;
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = jpeg_error_exit_handler;
+    if (setjmp(jerr.jmpbuf)) {
+        jpeg_destroy_decompress(&cinfo);
+        fclose(fp);
+        return -1;
+    }
+
+    jpeg_create_decompress(&cinfo);
+    jpeg_stdio_src(&cinfo, fp);
+    jpeg_read_header(&cinfo, TRUE);
+
+    cinfo.out_color_space = JCS_GRAYSCALE;
+    jpeg_start_decompress(&cinfo);
+
+    int width = (int)cinfo.output_width;
+    int height = (int)cinfo.output_height;
+
+    uint8_t *pixels = (uint8_t *)malloc((size_t)width * (size_t)height);
+    if (!pixels) { jpeg_destroy_decompress(&cinfo); fclose(fp); return -1; }
+
+    int y = 0;
+    while (cinfo.output_scanline < cinfo.output_height) {
+        JSAMPROW row = (JSAMPROW)(pixels + (size_t)y * (size_t)width);
+        jpeg_read_scanlines(&cinfo, &row, 1);
+        y++;
+    }
+
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    fclose(fp);
+
+    *out_pixels = pixels; *out_w = width; *out_h = height; *out_stride = width;
+    return 0;
+}
+
+#endif /* HAVE_LIBJPEG */
+
+/* ---- Unified image readers (auto-detect format by magic bytes) ---- */
+
+int image_read_rgba8(const char *path, uint8_t **out_pixels, int *out_w, int *out_h, int *out_stride) {
+    if (!path || !out_pixels || !out_w || !out_h || !out_stride) return -1;
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+    uint8_t magic[8];
+    size_t n = fread(magic, 1, 8, fp);
+    fclose(fp);
+    if (n < 2) return -1;
+
+    /* PNG: signature starts with 0x89 'P' 'N' 'G' */
+    if (n >= 4 && magic[0] == 0x89 && magic[1] == 'P' && magic[2] == 'N' && magic[3] == 'G') {
+        return png_read_rgba8(path, out_pixels, out_w, out_h, out_stride);
+    }
+    /* JPEG: SOI marker 0xFF 0xD8 */
+    if (magic[0] == 0xFF && magic[1] == 0xD8) {
+#ifdef HAVE_LIBJPEG
+        return jpeg_read_rgba8(path, out_pixels, out_w, out_h, out_stride);
+#else
+        fprintf(stderr, "image_read_rgba8: %s appears to be JPEG but libjpeg support not compiled in\n", path);
+        return -1;
+#endif
+    }
+
+    /* Fallback: try PNG then JPEG */
+    if (png_read_rgba8(path, out_pixels, out_w, out_h, out_stride) == 0) return 0;
+#ifdef HAVE_LIBJPEG
+    if (jpeg_read_rgba8(path, out_pixels, out_w, out_h, out_stride) == 0) return 0;
+#endif
+    return -1;
+}
+
+int image_read_gray8(const char *path, uint8_t **out_pixels, int *out_w, int *out_h, int *out_stride) {
+    if (!path || !out_pixels || !out_w || !out_h || !out_stride) return -1;
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+    uint8_t magic[8];
+    size_t n = fread(magic, 1, 8, fp);
+    fclose(fp);
+    if (n < 2) return -1;
+
+    /* PNG */
+    if (n >= 4 && magic[0] == 0x89 && magic[1] == 'P' && magic[2] == 'N' && magic[3] == 'G') {
+        return png_read_gray8(path, out_pixels, out_w, out_h, out_stride);
+    }
+    /* JPEG */
+    if (magic[0] == 0xFF && magic[1] == 0xD8) {
+#ifdef HAVE_LIBJPEG
+        return jpeg_read_gray8(path, out_pixels, out_w, out_h, out_stride);
+#else
+        fprintf(stderr, "image_read_gray8: %s appears to be JPEG but libjpeg support not compiled in\n", path);
+        return -1;
+#endif
+    }
+
+    /* Fallback */
+    if (png_read_gray8(path, out_pixels, out_w, out_h, out_stride) == 0) return 0;
+#ifdef HAVE_LIBJPEG
+    if (jpeg_read_gray8(path, out_pixels, out_w, out_h, out_stride) == 0) return 0;
+#endif
+    return -1;
+}
 
 /**
  * @brief Adds a specified number of milliseconds to a timespec structure, handling the overflow
@@ -1426,6 +1619,7 @@ void usage(__attribute__((unused))int argc, char **argv) {
     die(
         "Usage: %s\n"
         "     -s <file>         GPU fragment shader, or mp4 file to render\n"
+        "     -S <scale>        shader time scale factor  (0.01-1.0) - default 1.0 (lower = slower)\n"
         "     -x <width>        total image width         (16-512)\n"
         "     -y <height>       total image height        (16-512)\n"
         "     -X <width>        panel width               (16/32/64/128) default 64\n"

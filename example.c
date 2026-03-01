@@ -194,10 +194,12 @@ static void *render_text_sdf(void *arg) {
         apply_sine_wave_vertical(sin_image, text_image, 24.5f, 2, wrap_time);
 
         // if we have at least 1 pixel to render, do the composite
-        composite_rgba_over_rgba(&scene->frame_buffer,
-            sin_image, 
-            dst_rect,
-            src_rect);
+        if (src_rect.z > src_rect.x) {
+            composite_rgba_over_rgba(&scene->frame_buffer,
+                sin_image,
+                dst_rect,
+                src_rect);
+        }
 
 
         if (dump_once && frame == 120) {
@@ -233,12 +235,14 @@ int main(int argc, char **argv) {
 
     /* To try the text SDF demo, replace render_3d with render_text_sdf */
     // pthread_create(&scene->render_thread, NULL, render_text_sdf, scene);
+    /*
     pthread_create(&scene->render_thread, NULL, render_text_sdf, scene);
 
     hub75_display_run(scene);
 
     hub75_display_wait(scene);
     return 0;
+    */
 
 
 
@@ -246,9 +250,8 @@ int main(int argc, char **argv) {
     //  * No -s : run CPU demo
     //  * -s path/to/file.glsl : GPU shader
     //  * -s path/to/file.(mp4|mov|...) : Video playback
-    /*
     if (scene->shader_file == NULL) {
-        pthread_create(&scene->render_thread, NULL, render_cpu, scene);
+        pthread_create(&scene->render_thread, NULL, render_text_sdf, scene);
     } else if (access(scene->shader_file, R_OK) == 0) {
         if (has_extension(scene->shader_file, "glsl")) {
             printf("[GPU] Shader: %s\n", scene->shader_file);
@@ -260,8 +263,13 @@ int main(int argc, char **argv) {
         }
     } else {
         fprintf(stderr, "[WARN] Unable to open '%s'; falling back to CPU renderer.\n", scene->shader_file);
-        pthread_create(&scene->render_thread, NULL, render_cpu, scene);
+        pthread_create(&scene->render_thread, NULL, render_text_sdf, scene);
     }
+
+    hub75_display_run(scene);
+
+    hub75_display_wait(scene);
+    return 0;
 
     while(scene->do_render) {
         sleep(1);
@@ -273,5 +281,4 @@ int main(int argc, char **argv) {
     // wait on threads...
     hub75_display_wait(scene);
     return 0; // not reached
-   */
 }

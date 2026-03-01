@@ -56,19 +56,33 @@ PKG_GPU    = glesv2 gbm egl
 # Prefer libpng; fall back to libpng16 if needed
 PNG_PKG    := $(shell $(PKG_CONFIG) --exists libpng   && echo libpng   || \
 						($(PKG_CONFIG) --exists libpng16 && echo libpng16 || echo none))
+# Prefer libjpeg; fall back to libjpeg-turbo if needed
+JPEG_PKG   := $(shell $(PKG_CONFIG) --exists libjpeg  && echo libjpeg  || \
+						($(PKG_CONFIG) --exists libjpeg-turbo && echo libjpeg-turbo || echo none))
 
 PKG_CFLAGS       := $(shell $(PKG_CONFIG) --cflags $(PKG_FFMPEG) $(PKG_GPU) 2>/dev/null)
 PKG_LIBS_FFMPEG  := $(shell $(PKG_CONFIG) --libs $(PKG_FFMPEG) 2>/dev/null)
 PKG_LIBS_GPU     := $(shell $(PKG_CONFIG) --libs $(PKG_GPU) 2>/dev/null)
 PNG_CFLAGS       := $(shell if [ "$(PNG_PKG)" != "none" ]; then $(PKG_CONFIG) --cflags $(PNG_PKG); fi 2>/dev/null)
 PKG_LIBS_PNG     := $(shell if [ "$(PNG_PKG)" != "none" ]; then $(PKG_CONFIG) --libs $(PNG_PKG); fi 2>/dev/null)
+JPEG_CFLAGS      := $(shell if [ "$(JPEG_PKG)" != "none" ]; then $(PKG_CONFIG) --cflags $(JPEG_PKG); fi 2>/dev/null)
+PKG_LIBS_JPEG    := $(shell if [ "$(JPEG_PKG)" != "none" ]; then $(PKG_CONFIG) --libs $(JPEG_PKG); fi 2>/dev/null)
 
-CFLAGS ?= $(STD_FLAGS) $(OPT_FLAGS) $(WARN_FLAGS) $(FEATURE_FLAGS) $(INCLUDE_FLAGS) $(CFLAGS_CPU) $(PKG_CFLAGS) $(PNG_CFLAGS) $(DEBUG_EXTRA) $(EXTRA_CFLAGS)
+CFLAGS ?= $(STD_FLAGS) $(OPT_FLAGS) $(WARN_FLAGS) $(FEATURE_FLAGS) $(INCLUDE_FLAGS) $(CFLAGS_CPU) $(PKG_CFLAGS) $(PNG_CFLAGS) $(JPEG_CFLAGS) $(DEBUG_EXTRA) $(EXTRA_CFLAGS)
+
+# Auto-define HAVE_LIBPNG / HAVE_LIBJPEG when detected
+ifneq ($(PNG_PKG),none)
+CFLAGS += -DHAVE_LIBPNG=1
+endif
+ifneq ($(JPEG_PKG),none)
+CFLAGS += -DHAVE_LIBJPEG=1
+endif
 
 LDLIBS_COMMON = -pthread -lm -lrt
 LDLIBS_FFMPEG = $(PKG_LIBS_FFMPEG)
 LDLIBS_GPU    = $(PKG_LIBS_GPU)
 LDLIBS_PNG    = $(PKG_LIBS_PNG)
+LDLIBS_JPEG   = $(PKG_LIBS_JPEG)
 
 # Verbosity
 V ?= 0
@@ -109,6 +123,7 @@ AVFORMAT_FOUND  := $(shell $(PKG_CONFIG) --exists libavformat && echo yes || ech
 SWSCALE_FOUND   := $(shell $(PKG_CONFIG) --exists libswscale  && echo yes || echo no)
 AVUTIL_FOUND    := $(shell $(PKG_CONFIG) --exists libavutil   && echo yes || echo no)
 PNG_FOUND       := $(shell test "$(PNG_PKG)" != "none" && echo yes || echo no)
+JPEG_FOUND      := $(shell test "$(JPEG_PKG)" != "none" && echo yes || echo no)
 EFENCE_FOUND    := $(shell echo "int main(){}" | $(CC) -x c - -o /dev/null -lefence >/dev/null 2>&1 && echo yes || echo no)
 EFENCE_LIB      := $(if $(filter yes,$(EFENCE_FOUND)),-lefence,)
 
@@ -138,6 +153,10 @@ print-vars:
 	@echo PNG_FOUND=$(PNG_FOUND)
 	@echo PNG_CFLAGS=$(PNG_CFLAGS)
 	@echo PKG_LIBS_PNG=$(PKG_LIBS_PNG)
+	@echo JPEG_PKG=$(JPEG_PKG)
+	@echo JPEG_FOUND=$(JPEG_FOUND)
+	@echo JPEG_CFLAGS=$(JPEG_CFLAGS)
+	@echo PKG_LIBS_JPEG=$(PKG_LIBS_JPEG)
 
 $(BUILDDIR):
 	$(Q)mkdir -p $(BUILDDIR)
@@ -168,11 +187,11 @@ endif
 # Shared libs
 $(LIB_NO_GPU): $(OBJ_COMMON) | $(BUILDDIR)
 	@echo "[LINK] $@ (CPU)"
-	$(Q)$(CC) -shared -o $@ $(OBJ_COMMON) $(LDLIBS_COMMON) $(LDLIBS_PNG)
+	$(Q)$(CC) -shared -o $@ $(OBJ_COMMON) $(LDLIBS_COMMON) $(LDLIBS_PNG) $(LDLIBS_JPEG)
 
 $(LIB_GPU): $(OBJ_COMMON) $(OBJ_GPU) | $(BUILDDIR)
 	@echo "[LINK] $@ (GPU+FFmpeg)"
-	$(Q)$(CC) -shared -o $@ $(OBJ_COMMON) $(OBJ_GPU) $(LDLIBS_COMMON) $(LDLIBS_FFMPEG) $(LDLIBS_GPU) $(LDLIBS_PNG)
+	$(Q)$(CC) -shared -o $@ $(OBJ_COMMON) $(OBJ_GPU) $(LDLIBS_COMMON) $(LDLIBS_FFMPEG) $(LDLIBS_GPU) $(LDLIBS_PNG) $(LDLIBS_JPEG)
 
 # Static lib (CPU part only)
 $(STATIC_LIB): $(OBJ_COMMON)
@@ -191,12 +210,12 @@ SYSTEM_LIBDIR ?= $(LIBDIR)
 example: example.c
 	@echo "[CC ] $@ (system libs)"
 	$(Q)$(CC) $(CFLAGS) -Wl,-rpath,$(SYSTEM_LIBDIR) -o $@ $< \
-		-l$(LIB_BASENAME)_gpu$(VARIANT_SUFFIX) $(LDLIBS_COMMON) $(LDLIBS_FFMPEG) $(LDLIBS_GPU) $(LDLIBS_PNG)
+		-l$(LIB_BASENAME)_gpu$(VARIANT_SUFFIX) $(LDLIBS_COMMON) $(LDLIBS_FFMPEG) $(LDLIBS_GPU) $(LDLIBS_PNG) $(LDLIBS_JPEG)
 else
 example: example.c $(LIB_GPU)
 	@echo "[CC ] $@ (local libs)"
 	$(Q)$(CC) $(CFLAGS) -L. -Wl,-rpath,'$$ORIGIN' -o $@ $< \
-		-l$(LIB_BASENAME)_gpu$(VARIANT_SUFFIX) $(LDLIBS_COMMON) $(LDLIBS_FFMPEG) $(LDLIBS_GPU) $(LDLIBS_PNG)
+		-l$(LIB_BASENAME)_gpu$(VARIANT_SUFFIX) $(LDLIBS_COMMON) $(LDLIBS_FFMPEG) $(LDLIBS_GPU) $(LDLIBS_PNG) $(LDLIBS_JPEG)
 endif
 
 # Debug example (links with Electric Fence if available)
@@ -271,7 +290,7 @@ test: example
 tests/test_sampler: tests/unit/test_sampler.c $(LIB_NO_GPU)
 	@echo "[CC ] $@"
 	$(Q)$(CC) $(CFLAGS) -Iinclude -L. -Wl,-rpath,'$$ORIGIN/..' -o $@ $< \
-		-l$(LIB_BASENAME)$(VARIANT_SUFFIX) $(LDLIBS_COMMON) $(LDLIBS_PNG)
+		-l$(LIB_BASENAME)$(VARIANT_SUFFIX) $(LDLIBS_COMMON) $(LDLIBS_PNG) $(LDLIBS_JPEG)
 
 test-sampler: tests/test_sampler
 	@echo "[RUN] $<"

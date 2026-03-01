@@ -224,4 +224,14 @@ int png_write_gray8(const char *path, const uint8_t *pixels, int w, int h, int s
 /* Write an 8-bit RGBA image. Returns 0 on success. */
 int png_write_rgba8(const char *path, const uint8_t *pixels, int w, int h, int stride);
 
+/* JPEG helpers (libjpeg / libjpeg-turbo) */
+#ifdef HAVE_LIBJPEG
+int jpeg_read_rgba8(const char *path, uint8_t **out_pixels, int *out_w, int *out_h, int *out_stride);
+int jpeg_read_gray8(const char *path, uint8_t **out_pixels, int *out_w, int *out_h, int *out_stride);
+#endif
+
+/* Unified image readers — auto-detect PNG/JPEG by file content */
+int image_read_rgba8(const char *path, uint8_t **out_pixels, int *out_w, int *out_h, int *out_stride);
+int image_read_gray8(const char *path, uint8_t **out_pixels, int *out_w, int *out_h, int *out_stride);
+
 #endif
