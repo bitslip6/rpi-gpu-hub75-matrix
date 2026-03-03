@@ -21,6 +21,7 @@
 #endif
 
 #include <stdlib.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -37,6 +38,7 @@
 #include "spsc.h"
 #include "text_sdf.h"
 #include "compositor.h"
+#include "transformers.h"
 
 /* Image loading is handled by util.c (image_read_rgba8) which supports PNG and JPEG */
 
@@ -145,6 +147,268 @@ static GLuint compile_shader(const char *source, const GLenum shader_type)
 }
 
 /**
+ * @brief GLSL type names and their zero-initializer values for GLES compatibility.
+ * Desktop GLSL drivers zero-initialize variables; GLES does not guarantee this.
+ */
+typedef struct {
+    const char *name;
+    const char *zero;
+    size_t name_len;
+} glsl_type_zero_t;
+
+static const glsl_type_zero_t glsl_types[] = {
+    { "float",  "0.",        5 },
+    { "int",    "0",         3 },
+    { "uint",   "0u",        4 },
+    { "bool",   "false",     4 },
+    { "vec2",   "vec2(0)",   4 },
+    { "vec3",   "vec3(0)",   4 },
+    { "vec4",   "vec4(0)",   4 },
+    { "ivec2",  "ivec2(0)",  5 },
+    { "ivec3",  "ivec3(0)",  5 },
+    { "ivec4",  "ivec4(0)",  5 },
+    { "uvec2",  "uvec2(0)",  5 },
+    { "uvec3",  "uvec3(0)",  5 },
+    { "uvec4",  "uvec4(0)",  5 },
+    { "mat2",   "mat2(0.)",  4 },
+    { "mat3",   "mat3(0.)",  4 },
+    { "mat4",   "mat4(0.)",  4 },
+};
+#define GLSL_TYPE_COUNT (sizeof(glsl_types) / sizeof(glsl_types[0]))
+
+/**
+ * @brief Check if character is a GLSL identifier character (alphanumeric or underscore)
+ */
+static inline int is_ident(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; }
+
+/**
+ * @brief Match a GLSL type keyword at position p, returning the type entry or NULL.
+ * Requires a word boundary after the keyword (not followed by alphanumeric or underscore).
+ */
+static const glsl_type_zero_t *match_type(const char *p) {
+    for (int i = 0; i < (int)GLSL_TYPE_COUNT; i++) {
+        if (strncmp(p, glsl_types[i].name, glsl_types[i].name_len) == 0 &&
+            !is_ident(p[glsl_types[i].name_len])) {
+            return &glsl_types[i];
+        }
+    }
+    return NULL;
+}
+
+/**
+ * @brief Preprocess GLSL source for GLES compatibility.
+ *
+ * Desktop GLSL drivers zero-initialize uninitialized variables, but GLES does not.
+ * This function scans for variable declarations and adds explicit zero initializers
+ * where missing, allowing Shadertoy shaders to be copy-pasted and run on GLES.
+ *
+ * Handles patterns like:
+ *   float i,d,s,m,k,t = iTime;  ->  float i=0.,d=0.,s=0.,m=0.,k=0.,t = iTime;
+ *   vec3 p;                      ->  vec3 p=vec3(0);
+ *   int i;                       ->  int i=0;
+ *
+ * Correctly skips function declarations, function parameters, struct members,
+ * comments, preprocessor directives, and already-initialized variables.
+ *
+ * @param src  The original shader source (null-terminated).
+ * @return     A new malloc'd string with preprocessed source. Caller must free.
+ */
+static char *shader_preprocess(const char *src)
+{
+    size_t src_len = strlen(src);
+    // generous allocation: each var might get "=vec4(0)" (~8 chars) added
+    size_t out_cap = src_len * 3 + 1024;
+    char *out = (char *)malloc(out_cap);
+    if (!out) return NULL;
+    size_t o = 0;
+
+    int in_block_comment = 0;
+    int struct_depth = 0;
+    char last_boundary = ';'; // treat start of source as a statement boundary
+
+    const char *p = src;
+    while (*p) {
+        // --- block comment state ---
+        if (in_block_comment) {
+            if (p[0] == '*' && p[1] == '/') {
+                out[o++] = *p++; out[o++] = *p++;
+                in_block_comment = 0;
+            } else {
+                out[o++] = *p++;
+            }
+            continue;
+        }
+        if (p[0] == '/' && p[1] == '*') {
+            out[o++] = *p++; out[o++] = *p++;
+            in_block_comment = 1;
+            continue;
+        }
+
+        // --- line comment: copy to end of line ---
+        if (p[0] == '/' && p[1] == '/') {
+            while (*p && *p != '\n') out[o++] = *p++;
+            continue;
+        }
+
+        // --- preprocessor directive: copy to end of line ---
+        if (*p == '#' && (last_boundary == ';' || last_boundary == '{' || last_boundary == '}' || last_boundary == '\n')) {
+            while (*p && *p != '\n') out[o++] = *p++;
+            continue;
+        }
+
+        // --- track statement boundary characters ---
+        if (*p == ';' || *p == '{' || *p == '}') {
+            // track struct depth: '}' after struct opens closes struct body
+            if (*p == '{' && struct_depth > 0) struct_depth++;
+            if (*p == '}' && struct_depth > 0) struct_depth--;
+            last_boundary = *p;
+            out[o++] = *p++;
+            continue;
+        }
+
+        // --- detect 'struct' keyword to track struct bodies ---
+        if (strncmp(p, "struct", 6) == 0 && !is_ident(p[6])) {
+            // mark that the next '{' opens a struct body
+            struct_depth = 1;
+            // but we haven't hit '{' yet, so set to a marker value
+            // struct_depth will be incremented to 1 when we see '{'
+            struct_depth = 0;
+            // write "struct" and find the '{' naturally
+            // Actually: set a flag, and when we see '{' with this flag, enter struct mode
+            // Simpler: just scan ahead to check if '{' comes before ';'
+            const char *ahead = p + 6;
+            while (*ahead == ' ' || *ahead == '\t' || *ahead == '\n' || is_ident(*ahead)) ahead++;
+            if (*ahead == '{') struct_depth = 1; // will be incremented when we hit the '{'
+            // temporarily set to 1 so that when '{' is hit, it increments to the right depth
+            // Actually let's just set it so '{' pushes it up. Set struct_depth = 1 now,
+            // the '{' handler above will increment it to 2, but we want depth 1 while inside.
+            // Simpler approach: set struct_depth=1 to mean "we're about to enter a struct"
+            // and '{' increments it. '}' decrements it. When it goes to 0, we're out.
+            if (*ahead == '{') struct_depth = 1;
+            else struct_depth = 0;
+            // copy the struct keyword
+            for (int j = 0; j < 6; j++) out[o++] = *p++;
+            continue;
+        }
+
+        // --- whitespace/newlines: track boundary and copy ---
+        if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
+            if (*p == '\n') last_boundary = '\n';
+            out[o++] = *p++;
+            continue;
+        }
+
+        // --- try to match a type keyword for variable declaration ---
+        if (struct_depth == 0 &&
+            (last_boundary == ';' || last_boundary == '{' || last_boundary == '}' || last_boundary == '\n'))
+        {
+            const glsl_type_zero_t *type = match_type(p);
+            if (type) {
+                // look past type keyword + whitespace to find the identifier
+                const char *after_type = p + type->name_len;
+                while (*after_type == ' ' || *after_type == '\t') after_type++;
+
+                // must start with a letter or underscore (identifier)
+                if (is_ident(*after_type) && !(*after_type >= '0' && *after_type <= '9')) {
+                    // skip the identifier
+                    const char *after_id = after_type;
+                    while (is_ident(*after_id)) after_id++;
+                    // skip whitespace after identifier
+                    const char *check = after_id;
+                    while (*check == ' ' || *check == '\t') check++;
+
+                    // if '(' follows, it's a function declaration — skip
+                    // if ';', ',', '=', or '[' follows, it's a variable declaration
+                    if (*check != '(') {
+                        // find the terminating ';' (tracking paren depth for nested expressions)
+                        const char *semi = after_type;
+                        int pdepth = 0;
+                        while (*semi && !(*semi == ';' && pdepth == 0)) {
+                            if (*semi == '(') pdepth++;
+                            else if (*semi == ')') pdepth--;
+                            semi++;
+                        }
+                        if (*semi == ';') {
+                            // write the type keyword
+                            for (size_t j = 0; j < type->name_len; j++) out[o++] = *p++;
+                            out[o++] = ' ';
+                            // skip whitespace between type and declarator list
+                            while (*p == ' ' || *p == '\t') p++;
+
+                            // process each comma-separated declarator
+                            const char *end = semi;  // points at ';'
+                            while (p < end) {
+                                // find the end of this declarator: next ',' at paren_depth 0, or end
+                                const char *dstart = p;
+                                const char *dend = p;
+                                pdepth = 0;
+                                while (dend < end) {
+                                    if (*dend == '(') pdepth++;
+                                    else if (*dend == ')') pdepth--;
+                                    else if (*dend == ',' && pdepth == 0) break;
+                                    dend++;
+                                }
+
+                                // check if this declarator has '=' at paren_depth 0
+                                int has_init = 0;
+                                pdepth = 0;
+                                for (const char *c = dstart; c < dend; c++) {
+                                    if (*c == '(') pdepth++;
+                                    else if (*c == ')') pdepth--;
+                                    else if (*c == '=' && pdepth == 0) { has_init = 1; break; }
+                                }
+
+                                // copy the declarator text
+                                // trim leading whitespace for clean output
+                                const char *dtrim = dstart;
+                                while (dtrim < dend && (*dtrim == ' ' || *dtrim == '\t' || *dtrim == '\n' || *dtrim == '\r')) dtrim++;
+                                // trim trailing whitespace
+                                const char *dtrim_end = dend;
+                                while (dtrim_end > dtrim && (dtrim_end[-1] == ' ' || dtrim_end[-1] == '\t' || dtrim_end[-1] == '\n' || dtrim_end[-1] == '\r')) dtrim_end--;
+
+                                // check for array brackets — don't zero-init arrays
+                                int is_array = 0;
+                                for (const char *c = dtrim; c < dtrim_end; c++) {
+                                    if (*c == '[') { is_array = 1; break; }
+                                }
+
+                                // write the declarator
+                                for (const char *c = dtrim; c < dtrim_end; c++) out[o++] = *c;
+
+                                // inject zero initializer if missing
+                                if (!has_init && !is_array && dtrim < dtrim_end) {
+                                    out[o++] = '=';
+                                    for (const char *z = type->zero; *z; z++) out[o++] = *z;
+                                }
+
+                                // write comma separator if not last
+                                if (dend < end && *dend == ',') {
+                                    out[o++] = ',';
+                                    dend++; // skip the comma
+                                }
+                                p = dend;
+                            }
+
+                            out[o++] = ';';
+                            p = semi + 1; // skip past ';'
+                            last_boundary = ';';
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- default: copy character ---
+        last_boundary = 0; // not a boundary character
+        out[o++] = *p++;
+    }
+
+    out[o] = '\0';
+    return out;
+}
+
+/**
  * @brief: Creates an OpenGL program by compiling and linking a vertex and fragment shader.
  *              The fragment shader is based on a shadertoy shader file with a header prepended.
  *
@@ -158,6 +422,14 @@ static GLuint create_shadertoy_program(char *file)
     if (filesize == 0)
     {
         die("Failed to read shader source\n");
+    }
+
+    // preprocess: zero-initialize uninitialized variables for GLES compatibility
+    char *preprocessed = shader_preprocess(src);
+    if (preprocessed) {
+        SAFE_FREE(src);
+        src = preprocessed;
+        filesize = strlen(src);
     }
 
     char *src_with_header = (char *)malloc(filesize + 8192);
@@ -643,7 +915,7 @@ static image_buffer_t *text_render_sdf(char *sdf_path, char *msg, float size_px,
     sdf_text_update(txt, 64);
     image_buffer_t *image = image_buffer_new(txt->dimensions.x, txt->dimensions.y);
 
-    sdf_text_render(txt, (uint8_t*)image->data, txt->dimensions.x, txt->dimensions.y, 4, 0.0f);
+    sdf_text_render(txt, (uint8_t*)image->data, txt->dimensions.x, txt->dimensions.y, image->row_stride, 0.0f);
 
     /* Cleanup */
     sdf_text_destroy(txt);
@@ -725,9 +997,77 @@ void *main_render_shader(void *arg)
     const uint16_t height = scene->height;
 
 
-    RGBA white = {255, 255, 255, 0};
-    RGBA black = {0, 0, 255, 0};
-    image_buffer_t *image = text_render_sdf("assets/roboto", "You are pretty good at this   ", 128.0f, white, 1.0f, 0.1f, black);
+    // If the image mapper is flip or mirror_flip, we handle the vertical flip
+    // here (before text compositing) so text renders right-side-up. Clear the
+    // mapper so the mapper thread doesn't double-flip.
+    bool gpu_flip_rows = false;
+    uint8_t *flip_row_buf = NULL;
+    if (scene->image_mapper == flip_mapper || scene->image_mapper == mirror_flip_mapper) {
+        gpu_flip_rows = true;
+        flip_row_buf = malloc((size_t)width * 4);
+        if (scene->image_mapper == flip_mapper) {
+            scene->image_mapper = NULL;
+        } else {
+            scene->image_mapper = mirror_mapper;
+        }
+    }
+
+    // Text overlay: only set up if CLI provided -e
+    image_buffer_t *text_image = NULL;
+    sdf_font_t *text_font = NULL;
+    sdf_text_t *txt = NULL;
+    float scroll_speed = (scene->text_overlay) ? scene->text_overlay->scroll_speed : 128.0f;
+    float scroll_wrap_mod = 0.0f;
+    if (scene->text_overlay && scene->text_overlay->text) {
+        char font_path[128];
+        snprintf(font_path, sizeof(font_path), "assets/%s", scene->text_overlay->font_name);
+        text_font = sdf_font_load_scaled(font_path, scene->text_overlay->font_size);
+        if (text_font) {
+            txt = sdf_text_create(text_font, scene->text_overlay->text);
+            txt->size_px = scene->text_overlay->font_size;
+            txt->color = scene->text_overlay->color;
+            txt->alpha = 254;
+            txt->x = 0.0f;
+            txt->y = 0.0f;
+            txt->dir_x = 0.0f;
+            txt->dir_y = 0.0f;
+            txt->speed = 0.0f;
+            txt->softness = 0.09f;
+            txt->effects.weight = scene->text_overlay->weight;
+            txt->effects.outline_color = scene->text_overlay->outline_color;
+            txt->effects.outline_width = Normal_clamp(scene->text_overlay->outline_width);
+            txt->valign = SDF_VALIGN_BOTTOM;
+
+            sdf_text_update(txt, scene->width);
+
+            fprintf(stderr, "[TEXT-DBG] txt after update: x=%.1f y=%.1f x0=%.1f y0=%.1f speed=%.1f dir=(%.1f,%.1f) dims=%dx%d wrap_mod=%.3f\n",
+                txt->x, txt->y, txt->x0, txt->y0, txt->speed, txt->dir_x, txt->dir_y,
+                txt->dimensions.x, txt->dimensions.y, txt->wrap_mod);
+
+            text_image = image_buffer_new(txt->dimensions.x, txt->dimensions.y);
+            sdf_text_render(txt, (uint8_t*)text_image->data,
+                txt->dimensions.x, txt->dimensions.y, text_image->row_stride, 0.0f);
+
+            // Check if any non-zero pixels were rendered
+            uint32_t nonzero = 0;
+            for (int i = 0; i < txt->dimensions.x * txt->dimensions.y; i++) {
+                uint32_t px = ((uint32_t*)text_image->data)[i];
+                if (px != 0) nonzero++;
+            }
+            fprintf(stderr, "[TEXT-DBG] text_image %dx%d, non-zero pixels: %u / %d\n",
+                text_image->dimensions.x, text_image->dimensions.y,
+                nonzero, txt->dimensions.x * txt->dimensions.y);
+
+            // Scrolling: text enters from right, exits left, then wraps
+            // Use text_image dimensions (allocation size) not txt->dimensions
+            // (which sdf_text_render may have shrunk to actual rendered bounds)
+            scroll_wrap_mod = (float)(scene->width + text_image->dimensions.x) / scroll_speed;
+            fprintf(stderr, "[TEXT-DBG] scroll_speed=%.1f scroll_wrap_mod=%.3f\n", scroll_speed, scroll_wrap_mod);
+        }
+    }
+
+    float this_time = 0.0f;
+    int dbg_frame = 0;
 
     // main loop
     while (scene->do_render)
@@ -744,52 +1084,72 @@ void *main_render_shader(void *arg)
 
         glFinish();
 
-        // yield until the frame is complete...
-        /*
-        GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-
-        while (1)
-        {
-            GLenum w = glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000);
-            if (w == GL_ALREADY_SIGNALED || w == GL_CONDITION_SATISFIED)
-                break;
-            if (w == GL_WAIT_FAILED)
-                break;
-            sched_yield();
-        }
-        glDeleteSync(fence);
-        */
-
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
-// be explicit about read buffer in GLES3
 #ifdef GL_COLOR_ATTACHMENT0
         glReadBuffer(GL_COLOR_ATTACHMENT0);
 #endif
-        // pull the pixels back to the CPU using the CPU
 
-        // present after queuing readback
-        // eglSwapBuffers(gpu_ctx->display, gpu_ctx->egl_surface);
-
-        int32_t xpos = 0;
         uint32_t *dst = (uint32_t *)spsc_push_ptr_begin(scene->ring_buf_mapper, 200);
         if (dst)
         {
             glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, dst);
 
-            // Create image_buffer_t wrapper for destination
-            image_buffer_t dst_buffer = {
-                .dimensions = {scene->width, scene->height},
-                .row_stride = scene->width * 4,
-                .data = (RGBA*)dst
-            };
+            // OpenGL renders Y-flipped (origin at bottom-left). Flip rows here
+            // so the shader is right-side-up before text compositing. This means
+            // the mapper thread's flip_mapper becomes a no-op for GPU output and
+            // text composites in normal screen coordinates.
+            if (gpu_flip_rows) {
+                const size_t row_bytes = (size_t)width * 4;
+                uint8_t *top = (uint8_t *)dst;
+                uint8_t *bot = top + (height - 1) * row_bytes;
+                while (top < bot) {
+                    // swap using the scratch row buffer
+                    memcpy(flip_row_buf, top, row_bytes);
+                    memcpy(top, bot, row_bytes);
+                    memcpy(bot, flip_row_buf, row_bytes);
+                    top += row_bytes;
+                    bot -= row_bytes;
+                }
+            }
 
-            // Calculate rectangles for compositing
-            vec4 dst_rect = {(float)MAX(0, xpos), 16.0f, (float)scene->width, 168.0f};
-            int32_t spos = (xpos < 0) ? abs(xpos) : 0;
-            vec4 src_rect = {(float)MIN(image->dimensions.x, spos), 0.0f, 
-                             (float)image->dimensions.x, (float)image->dimensions.y};
-            
-            composite_rgba_over_rgba(&dst_buffer, image, dst_rect, src_rect);
+            // Composite text overlay if configured
+            if (text_image) {
+                image_buffer_t dst_buffer = {
+                    .dimensions = {scene->width, scene->height},
+                    .row_stride = scene->width * 4,
+                    .data = (RGBA*)dst
+                };
+
+                // Scroll from right to left: xpos starts at scene->width, decreases
+                float wrap_time = fmodf(this_time, scroll_wrap_mod);
+                float xpos = (float)scene->width - scroll_speed * wrap_time;
+
+                // Compute matching src/dst widths so the compositor
+                // does a 1:1 blit with no scaling
+                float dx0 = fmaxf(0, xpos);
+                float sx0 = (xpos < 0) ? -xpos : 0;
+                float visible_w = fminf((float)scene->width - dx0,
+                                        (float)text_image->dimensions.x - sx0);
+
+                float dy0 = (float)scene->text_overlay->y_pos;
+                float dy1 = fminf((float)scene->height, dy0 + (float)text_image->dimensions.y);
+                vec4 dst_rect = {dx0, dy0, dx0 + visible_w, dy1};
+                vec4 src_rect = {sx0, 0.0f, sx0 + visible_w,
+                                 (float)text_image->dimensions.y};
+
+                if (dbg_frame < 5 || (dbg_frame % 90 == 0)) {
+                    fprintf(stderr, "[TEXT-DBG] frame=%d xpos=%.1f visible_w=%.0f dst=(%.0f,%.0f,%.0f,%.0f) src=(%.0f,%.0f,%.0f,%.0f)\n",
+                        dbg_frame, xpos, visible_w,
+                        dst_rect.x, dst_rect.y, dst_rect.z, dst_rect.w,
+                        src_rect.x, src_rect.y, src_rect.z, src_rect.w);
+                }
+                dbg_frame++;
+
+                if (visible_w > 0) {
+                    composite_rgba_over_rgba(&dst_buffer, text_image, dst_rect, src_rect);
+                }
+            }
+
             spsc_push_ptr_commit(scene->ring_buf_mapper);
         }
         else
@@ -797,12 +1157,16 @@ void *main_render_shader(void *arg)
             debug("dropping frame from OpenGL\n");
         }
 
-        calculate_fps(scene->fps, scene->show_fps);
-        //long slept = calculate_fps(scene->fps, scene->show_fps);
-
+        this_time = calculate_fps(scene->fps, scene->show_fps);
     }
 
     debug(" ## GPU render thread exiting...\n");
+
+    // cleanup text overlay
+    if (text_image) free(text_image);
+    if (txt) sdf_text_destroy(txt);
+    if (text_font) sdf_font_free(text_font);
+    free(flip_row_buf);
 
     // cleanup
     glDeleteBuffers(1, &vbo);

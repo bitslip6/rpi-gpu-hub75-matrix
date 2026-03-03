@@ -119,6 +119,21 @@ int parse_float(const char *s, float *out) {
 }
 
 
+/**
+ * @brief parse a 6-digit hex color string "RRGGBB" into an RGBA with alpha=255
+ */
+RGBA parse_hex_color(const char *hex) {
+    RGBA c = {255, 255, 255, 255};
+    if (!hex || *hex == '\0') return c;
+    unsigned int val = 0;
+    if (sscanf(hex, "%06x", &val) == 1) {
+        c.r = (uint8_t)((val >> 16) & 0xFF);
+        c.g = (uint8_t)((val >> 8) & 0xFF);
+        c.b = (uint8_t)(val & 0xFF);
+    }
+    return c;
+}
+
 /* Parse optarg like "1:1:1,2:1:3" into dst[0..*out_count-1].
 Missing panels default to 1. Returns 0 on success, -1 on error.
 @param max_out maximum panel type number (can not exceed number of defined panel types)
@@ -400,7 +415,7 @@ hub75_display_t *hub75_display_parse_args(int argc, char **argv) {
     // Parse command-line options
     int opt = 0;
     int num_scales = 0;
-    while ((opt = getopt(argc, argv, "S:O:T:P:o:x:y:X:Y:s:f:p:c:g:d:m:b:a:t:l:i:jrzvqh?")) != -1) {
+    while ((opt = getopt(argc, argv, "S:O:T:P:o:x:y:X:Y:s:f:p:c:g:d:m:b:a:t:l:i:e:E:k:F:R:jzvqh?")) != -1) {
         switch (opt) {
         case 'r':
             scene->rising_edge = false;
@@ -563,6 +578,113 @@ hub75_display_t *hub75_display_parse_args(int argc, char **argv) {
             else {
                 die("Unknown panel pixel order: %s, must be one of (RGB, RBG, BGR, BRG, GRB, GBR)\n", optarg);
             }
+            break;
+
+        case 'e':
+            if (!scene->text_overlay) {
+                scene->text_overlay = calloc(1, sizeof(text_overlay_t));
+                scene->text_overlay->font_size = 64.0f;
+                scene->text_overlay->y_pos = 0;
+                strncpy(scene->text_overlay->font_name, "roboto", sizeof(scene->text_overlay->font_name));
+                scene->text_overlay->weight = 1.0f;
+                scene->text_overlay->color = (RGBA){255, 255, 255, 255};
+                scene->text_overlay->outline_color = (RGBA){0, 0, 0, 255};
+                scene->text_overlay->outline_width = 0.1f;
+                scene->text_overlay->scroll_speed = 128.0f;
+            }
+            scene->text_overlay->text = strdup(optarg);
+            break;
+        case 'E':
+            if (!scene->text_overlay) {
+                scene->text_overlay = calloc(1, sizeof(text_overlay_t));
+                scene->text_overlay->font_size = 64.0f;
+                scene->text_overlay->y_pos = 0;
+                strncpy(scene->text_overlay->font_name, "roboto", sizeof(scene->text_overlay->font_name));
+                scene->text_overlay->weight = 1.0f;
+                scene->text_overlay->color = (RGBA){255, 255, 255, 255};
+                scene->text_overlay->outline_color = (RGBA){0, 0, 0, 255};
+                scene->text_overlay->outline_width = 0.1f;
+                scene->text_overlay->scroll_speed = 128.0f;
+            }
+            scene->text_overlay->font_size = atoff(optarg);
+            break;
+        case 'k':
+            if (!scene->text_overlay) {
+                scene->text_overlay = calloc(1, sizeof(text_overlay_t));
+                scene->text_overlay->font_size = 64.0f;
+                scene->text_overlay->y_pos = 0;
+                strncpy(scene->text_overlay->font_name, "roboto", sizeof(scene->text_overlay->font_name));
+                scene->text_overlay->weight = 1.0f;
+                scene->text_overlay->color = (RGBA){255, 255, 255, 255};
+                scene->text_overlay->outline_color = (RGBA){0, 0, 0, 255};
+                scene->text_overlay->outline_width = 0.1f;
+                scene->text_overlay->scroll_speed = 128.0f;
+            }
+            scene->text_overlay->y_pos = atoi(optarg);
+            break;
+        case 'F':
+            if (!scene->text_overlay) {
+                scene->text_overlay = calloc(1, sizeof(text_overlay_t));
+                scene->text_overlay->font_size = 64.0f;
+                scene->text_overlay->y_pos = 0;
+                strncpy(scene->text_overlay->font_name, "roboto", sizeof(scene->text_overlay->font_name));
+                scene->text_overlay->weight = 1.0f;
+                scene->text_overlay->color = (RGBA){255, 255, 255, 255};
+                scene->text_overlay->outline_color = (RGBA){0, 0, 0, 255};
+                scene->text_overlay->outline_width = 0.1f;
+                scene->text_overlay->scroll_speed = 128.0f;
+            }
+            // Parse "font:weight:color:outline_color:outline_width" — fields may be empty
+            {
+                char buf[256];
+                strncpy(buf, optarg, sizeof(buf) - 1);
+                buf[sizeof(buf) - 1] = '\0';
+                char *fields[5] = {NULL, NULL, NULL, NULL, NULL};
+                int fi = 0;
+                fields[0] = buf;
+                for (char *p = buf; *p && fi < 4; p++) {
+                    if (*p == ':') {
+                        *p = '\0';
+                        fields[++fi] = p + 1;
+                    }
+                }
+                // field 0: font name
+                if (fields[0] && fields[0][0] != '\0') {
+                    strncpy(scene->text_overlay->font_name, fields[0],
+                            sizeof(scene->text_overlay->font_name) - 1);
+                    scene->text_overlay->font_name[sizeof(scene->text_overlay->font_name) - 1] = '\0';
+                }
+                // field 1: weight
+                if (fields[1] && fields[1][0] != '\0') {
+                    scene->text_overlay->weight = atoff(fields[1]);
+                }
+                // field 2: color (RRGGBB hex)
+                if (fields[2] && fields[2][0] != '\0') {
+                    scene->text_overlay->color = parse_hex_color(fields[2]);
+                }
+                // field 3: outline color (RRGGBB hex)
+                if (fields[3] && fields[3][0] != '\0') {
+                    scene->text_overlay->outline_color = parse_hex_color(fields[3]);
+                }
+                // field 4: outline width (float 0.0-1.0)
+                if (fields[4] && fields[4][0] != '\0') {
+                    scene->text_overlay->outline_width = atoff(fields[4]);
+                }
+            }
+            break;
+        case 'R':
+            if (!scene->text_overlay) {
+                scene->text_overlay = calloc(1, sizeof(text_overlay_t));
+                scene->text_overlay->font_size = 64.0f;
+                scene->text_overlay->y_pos = 0;
+                strncpy(scene->text_overlay->font_name, "roboto", sizeof(scene->text_overlay->font_name));
+                scene->text_overlay->weight = 1.0f;
+                scene->text_overlay->color = (RGBA){255, 255, 255, 255};
+                scene->text_overlay->outline_color = (RGBA){0, 0, 0, 255};
+                scene->text_overlay->outline_width = 0.1f;
+                scene->text_overlay->scroll_speed = 128.0f;
+            }
+            scene->text_overlay->scroll_speed = atoff(optarg);
             break;
 
         default:
@@ -1648,6 +1770,12 @@ void usage(__attribute__((unused))int argc, char **argv) {
         "                       example '-T 1:1:1,.9:.9:.9'  makes panel type 1 90%% brightness\n\n"
         "     -P <T:T:T,T:T:T>  panel type mapping, each T is a panel type number (0-7).\n"
         "                       columns are : sepearted  rows are , separated EG: '-P 0:0:0,0:1:1,1:1:1'\n"
+        "     -e <text>         text overlay message for GPU shader mode\n"
+        "     -E <font_size>    text overlay font size in pixels  (default 64)\n"
+        "     -k <y_pos>        text overlay vertical position    (default 0)\n"
+        "     -F <f:w:c:o:ow>  text font:weight:color:outline_color:outline_width\n"
+        "                       (e.g. roboto:1.2:80ff80:004080:0.15) outline_width 0.0-1.0, default 0.1\n"
+        "     -R <speed>        text scroll speed in pixels/sec   (default 128, 0=static)\n"
         "     -? -h             this help\n"
         "     NOTE: if runing as root, it will automatically use the real-time scheduler which reduces flicker\n"
         , argv[0], SERVER_PORT);

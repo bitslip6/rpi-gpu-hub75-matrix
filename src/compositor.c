@@ -172,7 +172,6 @@ void composite_rgba_over_rgba(image_buffer_t       *dst,
 
             RGBA src_sample;
             sample_rgba_bilinear(&src_sample, src, sx, sy);
-            src_sample.b = 128;
 
             RGBA *dst_px = dst_row + (dx - dst_x0);
             composite_rgba(dst_px, &src_sample, dst_px);

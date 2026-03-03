@@ -161,6 +161,8 @@ int parse_float(const char *s, float *out);
 uint8_t math_norm_q8(float x);
 Normal normalize(float x, float period);
 
+RGBA parse_hex_color(const char *hex);
+
 
 /**
  * @brief set the GPIO pins for hub75 operation.  this is based on hzeller's active board pinouts

@@ -219,6 +219,21 @@ typedef enum {
     PANEL_RGB = 0, PANEL_RBG, PANEL_GRB, PANEL_GBR, PANEL_BRG, PANEL_BGR
 } panel_order_t;
 
+/**
+ * @brief Text overlay configuration for GPU shader rendering
+ */
+typedef struct text_overlay_t {
+    char *text;         // message string (owned, freed on cleanup)
+    float font_size;    // line height in pixels
+    int   y_pos;        // vertical position (top edge, pixels from top)
+    char  font_name[64];   // font directory name (e.g. "roboto")
+    float weight;          // 1.0=normal, >1 bold, <1 thin
+    RGBA  color;           // text color
+    RGBA  outline_color;   // outline color
+    float outline_width;   // outline width (0.0=none, 0.1=default, 0.0-1.0)
+    float scroll_speed;    // pixels per second for text scrolling (0=static)
+} text_overlay_t;
+
 // self referencing function pointers need this defined first
 struct hub75_display;
 
@@ -377,6 +392,9 @@ typedef struct hub75_display {
 
     /** @brief multiplier for shader iTime uniform (default 1.0, lower = slower) */
     float time_scale;
+
+    /** @brief optional text overlay for GPU shader rendering (NULL = no overlay) */
+    text_overlay_t *text_overlay;
 
 } hub75_display_t;
 
