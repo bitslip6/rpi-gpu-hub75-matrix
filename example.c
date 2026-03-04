@@ -102,7 +102,7 @@ static void *render_text_sdf(void *arg) {
     txt->effects.outline_width  = Normal_clamp(0.1f); // set >0 to enable outline
     txt->effects.outline_color  = (RGBA){0, 64, 128, 255};
     txt->effects.outline_smooth = Normal_clamp(0.1f);
-    txt->valign = SDF_VALIGN_BOTTOM;
+    txt->valign = SDF_VALIGN_BASELINE;
     api.sdf_text_update(txt, scene->width);
 
     /* Render loop */

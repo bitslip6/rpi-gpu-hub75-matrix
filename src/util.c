@@ -125,8 +125,14 @@ int parse_float(const char *s, float *out) {
 RGBA parse_hex_color(const char *hex) {
     RGBA c = {255, 255, 255, 255};
     if (!hex || *hex == '\0') return c;
+    size_t len = strlen(hex);
     unsigned int val = 0;
-    if (sscanf(hex, "%06x", &val) == 1) {
+    if (len >= 8 && sscanf(hex, "%08x", &val) == 1) {
+        c.r = (uint8_t)((val >> 24) & 0xFF);
+        c.g = (uint8_t)((val >> 16) & 0xFF);
+        c.b = (uint8_t)((val >> 8) & 0xFF);
+        c.a = (uint8_t)(val & 0xFF);
+    } else if (sscanf(hex, "%06x", &val) == 1) {
         c.r = (uint8_t)((val >> 16) & 0xFF);
         c.g = (uint8_t)((val >> 8) & 0xFF);
         c.b = (uint8_t)(val & 0xFF);
@@ -592,7 +598,12 @@ hub75_display_t *hub75_display_parse_args(int argc, char **argv) {
                 scene->text_overlay->outline_width = 0.1f;
                 scene->text_overlay->scroll_speed = 128.0f;
             }
-            scene->text_overlay->text = strdup(optarg);
+            if (strcmp(optarg, "-") == 0) {
+                scene->text_overlay->stdin_text = true;
+                scene->text_overlay->text = NULL; // will be read from stdin in gpu.c
+            } else {
+                scene->text_overlay->text = strdup(optarg);
+            }
             break;
         case 'E':
             if (!scene->text_overlay) {

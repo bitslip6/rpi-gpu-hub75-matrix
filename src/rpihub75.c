@@ -370,6 +370,10 @@ static inline void io_store_barrier(void) {
 #endif
 }
 
+#ifndef WARMUP_FRAMES
+#define WARMUP_FRAMES 8
+#endif
+
 void* hub75_display_run_pi4(const hub75_display_t *scene) {
 
     int cpu_model = cpu_get_pi_model();
@@ -428,11 +432,56 @@ void* hub75_display_run_pi4(const hub75_display_t *scene) {
     }
     debug(" [$] first frame acquired\n");
 
-    // lock the memory we just touched (bcm_signal)...
-    bool is_realtime = enable_rt_and_lock_mem();
+    // Phase 1: SCHED_FIFO 99 + mlockall for warmup measurement
+    enable_rt_fifo_and_lock_mem();
 
-    // const int max_phase = JITTER_SIZE;
-    uint32_t full_frame = 0;
+    // Measure actual frame time over warmup frames
+    struct timespec ts_a, ts_b;
+    uint64_t worst_frame_ns = 0;
+    debug(" [.] measuring frame time (%d warmup frames)...\n", WARMUP_FRAMES);
+    for (int wf = 0; wf < WARMUP_FRAMES && scene->do_render; wf++) {
+        clock_gettime(CLOCK_MONOTONIC, &ts_a);
+        uint32_t woff = 0;
+        for (uint8_t pwm = 0; pwm < bit_depth; pwm++) {
+            for (uint16_t y = 0; y < half_height; y++) {
+                asm volatile ("" : : : "memory");
+                PERIBase[7]  = addr_map[y] & ~last_addr;
+                SLOW
+                PERIBase[10] = ~addr_map[y] & last_addr;
+                SLOW
+                last_addr = addr_map[y];
+                for (uint16_t x = 0; x < width; x++) {
+                    asm volatile ("" : : : "memory");
+                    uint32_t new_mask = bcm_signal[woff] | jitter_mask[jitter_idx];
+                    PERIBase[10] = (~new_mask & color_pins) | PIN_CLK;
+                    SLOW
+                    PERIBase[7]  = (new_mask & ~color_pins);
+                    SLOW SLOW SLOW
+                    PERIBase[7]  = new_mask | PIN_CLK;
+                    SLOW SLOW SLOW
+                    color_pins = new_mask;
+                    jitter_idx = (jitter_idx + 1) % JITTER_SIZE;
+                    woff += bit_depth;
+                }
+                PERIBase[7] = PIN_LATCH | PIN_OE;
+                SLOW SLOW
+                PERIBase[10] = PIN_LATCH;
+                SLOW SLOW
+                PERIBase[10] = PIN_OE;
+                SLOW
+            }
+        }
+        clock_gettime(CLOCK_MONOTONIC, &ts_b);
+        uint64_t elapsed_ns = (uint64_t)(ts_b.tv_sec - ts_a.tv_sec) * 1000000000ULL
+                             + (uint64_t)(ts_b.tv_nsec - ts_a.tv_nsec);
+        if (elapsed_ns > worst_frame_ns) worst_frame_ns = elapsed_ns;
+        sched_yield();
+    }
+    debug(" [*] measured worst-case frame time: %luμs\n", (unsigned long)(worst_frame_ns / 1000));
+
+    // Phase 2: attempt SCHED_DEADLINE with measured timing
+    bool is_deadline = enable_deadline_from_measurement(worst_frame_ns, bit_depth, 3);
+
     while (scene->do_render) {
 
         uint32_t offset = 0;
@@ -456,7 +505,7 @@ void* hub75_display_run_pi4(const hub75_display_t *scene) {
 
 
             frame_count++;
-            
+
             for (uint16_t y = 0; y < half_height; y++) {
                 asm volatile ("" : : : "memory");  // Prevents optimization
 
@@ -501,13 +550,16 @@ void* hub75_display_run_pi4(const hub75_display_t *scene) {
             // if using phase, uncomment this code to advance phase each row
             // phase += 8; if (phase >= JITTER_SIZE - (width + width)) { phase = 0; }
         }
-        full_frame++;
 
-        if (is_realtime) {
-            if (full_frame & 1) {
-                usleep(500);      // make sure we yield enough for the kernel to service kernel tasks
-                sched_yield();
-            }
+        // End of one full BCM frame — yield to the scheduler.
+        // With SCHED_DEADLINE the kernel reclaims only the unused portion of the
+        // period, so the panel is driven nearly continuously with no artificial gap.
+        // Without deadline, fall back to the old yield-every-other-frame approach.
+        if (is_deadline) {
+            sched_yield();
+        } else if (frame_count & 1) {
+            usleep(500);
+            sched_yield();
         }
 
         // only hit the sys call after about 4.6 seconds or so (render speed should be about 3200Hz)
@@ -612,11 +664,56 @@ void* hub75_display_run(const hub75_display_t *scene) {
     }
     debug(" [$] first frame acquired\n");
 
-    // lock the memory we just touched (bcm_signal)...
-    bool is_realtime = enable_rt_and_lock_mem();
+    // Phase 1: SCHED_FIFO 99 + mlockall for warmup measurement
+    enable_rt_fifo_and_lock_mem();
 
-    // const int max_phase = JITTER_SIZE;
-    uint32_t full_frame = 0;
+    // ---- Warmup: measure actual frame time under FIFO 99 ----
+    #ifndef WARMUP_FRAMES
+    #define WARMUP_FRAMES 8
+    #endif
+    struct timespec ts_a, ts_b;
+    uint64_t worst_frame_ns = 0;
+
+    debug(" [.] measuring frame time (%d warmup frames)...\n", WARMUP_FRAMES);
+    for (int wf = 0; wf < WARMUP_FRAMES && scene->do_render; wf++) {
+        clock_gettime(CLOCK_MONOTONIC, &ts_a);
+
+        uint32_t offset = 0;
+        for (uint8_t pwm = 0; pwm < bit_depth; pwm++) {
+            for (uint16_t y = 0; y < half_height; y++) {
+                const uint32_t addr_bits = addr_map[y];
+                uint32_t oe_addr = PIN_OE | addr_bits;
+                *reg_out = oe_addr;
+                io_store_barrier();
+                jitter_idx = 0;
+
+                for (uint16_t x = 0; x < width; x++) {
+                    uint32_t v = bcm_signal[offset] | addr_bits;// | jitter_mask[jitter_idx];
+                    *reg_out = v;
+                    *reg_out = v | PIN_CLK;
+                    offset++;
+                    jitter_idx++;
+                }
+                __asm__ __volatile__("" ::: "memory");
+                *reg_set = PIN_OE;
+                SLOW2
+                *reg_set = PIN_LATCH | PIN_OE;
+                *reg_clr = PIN_LATCH;
+            }
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &ts_b);
+        uint64_t elapsed_ns = (uint64_t)(ts_b.tv_sec - ts_a.tv_sec) * 1000000000ULL
+                             + (uint64_t)(ts_b.tv_nsec - ts_a.tv_nsec);
+        if (elapsed_ns > worst_frame_ns) worst_frame_ns = elapsed_ns;
+        sched_yield();   // brief yield between warmup frames
+    }
+    debug(" [*] measured worst-case frame time: %luμs\n", (unsigned long)(worst_frame_ns / 1000));
+
+    // Phase 2: attempt SCHED_DEADLINE with measured timing
+    bool is_deadline = enable_deadline_from_measurement(worst_frame_ns, bit_depth, 3);
+
+    // ---- Main display loop ----
     while (scene->do_render) {
 
         uint32_t offset = 0;
@@ -624,12 +721,7 @@ void* hub75_display_run(const hub75_display_t *scene) {
 
             // check for a new frame, reset jitter phase once we hit the end
             if ((pwm & 15u) == 0u) {   // true at i = 0,16,32,...
-                // Only swap to a new frame if there is at least one additional item
-                // beyond the one we currently hold. This avoids re-popping the same slot
-                // and releasing it too early while still in use.
                 if (spsc_count(scene->ring_buf_renderer) >= 2) {
-                    // release the current frame
-                    // acquire the next frame (non-blocking)
                     const uint32_t *tmp = spsc_pop_ptr_begin(scene->ring_buf_renderer, 0);
                     if (tmp) {
                         spsc_pop_ptr_commit(scene->ring_buf_renderer);
@@ -638,60 +730,45 @@ void* hub75_display_run(const hub75_display_t *scene) {
                 }
             }
 
-
             frame_count++;
-            
+
             for (uint16_t y = 0; y < half_height; y++) {
 
                 const uint32_t addr_bits = addr_map[y];
 
-                // Precharge: ensure address lines are stable while OE is high before shifting next row
-                // This reduces row-boundary ghosting on some panels.
                 uint32_t oe_addr = PIN_OE | addr_bits;
                 *reg_out = oe_addr;
                 io_store_barrier();
 
-                // jitter_idx must be at least width pixels before end of jitter_mask
-                // jitter_idx = ((y * 1315423911u) + phase) % JITTER_SIZE; // decorrelate rows
-                // jitter_idx = phase; // phase can offset jitter patterns
-                jitter_idx = 0;     // just use the default pattern, phase can introduce horizontal visible lines
+                jitter_idx = 0;
 
                 for (uint16_t x = 0; x < width; x++) {
 
-                    uint32_t v = bcm_signal[offset] | addr_bits | jitter_mask[jitter_idx];
+                    uint32_t v = bcm_signal[offset] | addr_bits;// | jitter_mask[jitter_idx];
                     *reg_out = v;                 // set data + addr + oe, clk low
-                    *reg_out = v | PIN_CLK;       // clk high 
+                    *reg_out = v | PIN_CLK;       // clk high
 
-                    /* advance after full edge */
                     offset ++;
                     jitter_idx++;
                 }
 
-                // make sure the compiler doesn't optimize away memory access
                 __asm__ __volatile__("" ::: "memory");
 
-                // latch the complete row into the display
-                *reg_set = PIN_OE;                 // turn OE high to disable display during latch
-                SLOW2                              // TODO: make latch time variable
-                *reg_set = PIN_LATCH | PIN_OE;     // turn the latch and OE high
-                *reg_clr = PIN_LATCH;              // latch low <- falling edge latches data
-            }
-
-            // if using phase, uncomment this code to advance phase each row
-            // phase += 8; if (phase >= JITTER_SIZE - (width + width)) { phase = 0; }
-        }
-        full_frame++;
-
-        if (is_realtime) {
-            if (full_frame & 1) {
-                usleep(500);      // make sure we yield enough for the kernel to service kernel tasks
-                sched_yield();
+                *reg_set = PIN_OE;
+                SLOW2
+                *reg_set = PIN_LATCH | PIN_OE;
+                *reg_clr = PIN_LATCH;
             }
         }
 
-        // only hit the sys call after about 4.6 seconds or so (render speed should be about 3200Hz)
+        // End of full BCM frame — yield to scheduler.
+        // Deadline: kernel reclaims only unused portion of the period.
+        // FIFO on isolated CPU: yield is a near-no-op (returns immediately),
+        // but prevents soft lockup warnings on long runs.
+        sched_yield();
+
         if (frame_count > 15000) {
-            time_t current_time_s = time(NULL);  // syscalls are slow, so avoid them when possible...
+            time_t current_time_s = time(NULL);
             if (UNLIKELY(current_time_s >= last_time_s + 5)) {
                 if (scene->show_fps) {
                     gettimeofday(&end_time, NULL);

@@ -42,6 +42,30 @@
 
 /* Image loading is handled by util.c (image_read_rgba8) which supports PNG and JPEG */
 
+/**
+ * Read next record from stdin, delimited by blank line or EOF.
+ * Returns malloc'd string (caller frees), or NULL on EOF.
+ * Newlines within the record are replaced with spaces.
+ */
+static char *read_stdin_record(void) {
+    char *buf = NULL;
+    size_t total = 0;
+    char line[1024];
+    while (fgets(line, sizeof(line), stdin)) {
+        if (line[0] == '\n' || (line[0] == '\r' && line[1] == '\n')) {
+            if (total > 0) break; // end of record
+            continue;             // skip leading blank lines
+        }
+        size_t len = strlen(line);
+        if (len > 0 && line[len-1] == '\n') line[len-1] = ' ';
+        buf = realloc(buf, total + len + 1);
+        memcpy(buf + total, line, len);
+        total += len;
+    }
+    if (buf) buf[total] = '\0';
+    return buf;
+}
+
 /*
  * Test Shader Source:
  * This constant contains a simple GLSL fragment shader used for testing purposes.
@@ -909,8 +933,7 @@ static image_buffer_t *text_render_sdf(char *sdf_path, char *msg, float size_px,
     txt->effects.outline_width  = Normal_clamp(outline_width); // set >0 to enable outline
     txt->effects.outline_color  = outline_color;
     txt->effects.outline_smooth = Normal_clamp(0.1f);
-    txt->valign = SDF_VALIGN_BOTTOM;
-         
+    txt->valign = SDF_VALIGN_BASELINE;
 
     sdf_text_update(txt, 64);
     image_buffer_t *image = image_buffer_new(txt->dimensions.x, txt->dimensions.y);
@@ -1018,6 +1041,13 @@ void *main_render_shader(void *arg)
     sdf_text_t *txt = NULL;
     float scroll_speed = (scene->text_overlay) ? scene->text_overlay->scroll_speed : 128.0f;
     float scroll_wrap_mod = 0.0f;
+    // If stdin_text mode, read the first record from stdin
+    if (scene->text_overlay && scene->text_overlay->stdin_text && !scene->text_overlay->text) {
+        char *first = read_stdin_record();
+        if (first) {
+            scene->text_overlay->text = first;
+        }
+    }
     if (scene->text_overlay && scene->text_overlay->text) {
         char font_path[128];
         snprintf(font_path, sizeof(font_path), "assets/%s", scene->text_overlay->font_name);
@@ -1036,13 +1066,11 @@ void *main_render_shader(void *arg)
             txt->effects.weight = scene->text_overlay->weight;
             txt->effects.outline_color = scene->text_overlay->outline_color;
             txt->effects.outline_width = Normal_clamp(scene->text_overlay->outline_width);
-            txt->valign = SDF_VALIGN_BOTTOM;
+            txt->valign = SDF_VALIGN_BASELINE;
 
             sdf_text_update(txt, scene->width);
 
-            fprintf(stderr, "[TEXT-DBG] txt after update: x=%.1f y=%.1f x0=%.1f y0=%.1f speed=%.1f dir=(%.1f,%.1f) dims=%dx%d wrap_mod=%.3f\n",
-                txt->x, txt->y, txt->x0, txt->y0, txt->speed, txt->dir_x, txt->dir_y,
-                txt->dimensions.x, txt->dimensions.y, txt->wrap_mod);
+            //fprintf(stderr, "[TEXT-DBG] txt after update: x=%.1f y=%.1f x0=%.1f y0=%.1f speed=%.1f dir=(%.1f,%.1f) dims=%dx%d wrap_mod=%.3f\n", txt->x, txt->y, txt->x0, txt->y0, txt->speed, txt->dir_x, txt->dir_y, txt->dimensions.x, txt->dimensions.y, txt->wrap_mod);
 
             text_image = image_buffer_new(txt->dimensions.x, txt->dimensions.y);
             sdf_text_render(txt, (uint8_t*)text_image->data,
@@ -1054,19 +1082,19 @@ void *main_render_shader(void *arg)
                 uint32_t px = ((uint32_t*)text_image->data)[i];
                 if (px != 0) nonzero++;
             }
-            fprintf(stderr, "[TEXT-DBG] text_image %dx%d, non-zero pixels: %u / %d\n",
-                text_image->dimensions.x, text_image->dimensions.y,
-                nonzero, txt->dimensions.x * txt->dimensions.y);
+            // fprintf(stderr, "[TEXT-DBG] text_image %dx%d, non-zero pixels: %u / %d\n", text_image->dimensions.x, text_image->dimensions.y, nonzero, txt->dimensions.x * txt->dimensions.y);
 
             // Scrolling: text enters from right, exits left, then wraps
             // Use text_image dimensions (allocation size) not txt->dimensions
             // (which sdf_text_render may have shrunk to actual rendered bounds)
             scroll_wrap_mod = (float)(scene->width + text_image->dimensions.x) / scroll_speed;
-            fprintf(stderr, "[TEXT-DBG] scroll_speed=%.1f scroll_wrap_mod=%.3f\n", scroll_speed, scroll_wrap_mod);
+            // fprintf(stderr, "[TEXT-DBG] scroll_speed=%.1f scroll_wrap_mod=%.3f\n", scroll_speed, scroll_wrap_mod);
         }
     }
 
     float this_time = 0.0f;
+    float scroll_time_offset = 0.0f;  // subtracted from this_time to reset scroll on text cycle
+    float prev_wrap_time = 0.0f;
     int dbg_frame = 0;
 
     // main loop
@@ -1121,7 +1149,35 @@ void *main_render_shader(void *arg)
                 };
 
                 // Scroll from right to left: xpos starts at scene->width, decreases
-                float wrap_time = fmodf(this_time, scroll_wrap_mod);
+                float scroll_time = this_time - scroll_time_offset;
+                float wrap_time = fmodf(scroll_time, scroll_wrap_mod);
+
+                // Detect scroll wrap and cycle to next stdin record
+                if (wrap_time < prev_wrap_time && scene->text_overlay->stdin_text && txt) {
+                    char *new_text = read_stdin_record();
+                    if (new_text) {
+                        sdf_text_set_text(txt, new_text);
+                        sdf_text_update(txt, scene->width);
+
+                        int new_w = txt->dimensions.x;
+                        int new_h = txt->dimensions.y;
+                        if (new_w != text_image->dimensions.x || new_h != text_image->dimensions.y) {
+                            free(text_image);
+                            text_image = image_buffer_new(new_w, new_h);
+                        } else {
+                            memset(text_image->data, 0, (size_t)new_h * text_image->row_stride);
+                        }
+
+                        txt->y = 0;
+                        sdf_text_render(txt, (uint8_t*)text_image->data, new_w, new_h,
+                                        text_image->row_stride, 0.0f);
+                        scroll_wrap_mod = (float)(scene->width + text_image->dimensions.x) / scroll_speed;
+                        scroll_time_offset = this_time;  // reset scroll origin to now
+                        wrap_time = 0.0f;
+                        free(new_text);
+                    }
+                }
+                prev_wrap_time = wrap_time;
                 float xpos = (float)scene->width - scroll_speed * wrap_time;
 
                 // Compute matching src/dst widths so the compositor
@@ -1138,10 +1194,7 @@ void *main_render_shader(void *arg)
                                  (float)text_image->dimensions.y};
 
                 if (dbg_frame < 5 || (dbg_frame % 90 == 0)) {
-                    fprintf(stderr, "[TEXT-DBG] frame=%d xpos=%.1f visible_w=%.0f dst=(%.0f,%.0f,%.0f,%.0f) src=(%.0f,%.0f,%.0f,%.0f)\n",
-                        dbg_frame, xpos, visible_w,
-                        dst_rect.x, dst_rect.y, dst_rect.z, dst_rect.w,
-                        src_rect.x, src_rect.y, src_rect.z, src_rect.w);
+                    // fprintf(stderr, "[TEXT-DBG] frame=%d xpos=%.1f visible_w=%.0f dst=(%.0f,%.0f,%.0f,%.0f) src=(%.0f,%.0f,%.0f,%.0f)\n", dbg_frame, xpos, visible_w, dst_rect.x, dst_rect.y, dst_rect.z, dst_rect.w, src_rect.x, src_rect.y, src_rect.z, src_rect.w);
                 }
                 dbg_frame++;
 

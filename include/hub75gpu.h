@@ -232,6 +232,7 @@ typedef struct text_overlay_t {
     RGBA  outline_color;   // outline color
     float outline_width;   // outline width (0.0=none, 0.1=default, 0.0-1.0)
     float scroll_speed;    // pixels per second for text scrolling (0=static)
+    bool  stdin_text;      // true when -e - was specified (read records from stdin)
 } text_overlay_t;
 
 // self referencing function pointers need this defined first

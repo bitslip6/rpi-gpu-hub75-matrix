@@ -38,8 +38,32 @@ int cpu_pin_thread(size_t cpu_id);
 int cpu_get_pi_model(void);
 
 /**
+ * @brief Phase 1: enable SCHED_FIFO 99 + mlockall for warmup measurement frames
+ */
+bool enable_rt_fifo_and_lock_mem(void);
+
+/**
+ * @brief Phase 2: switch to SCHED_DEADLINE using measured frame time.
+ * On isolated CPUs, stays on SCHED_FIFO 99 (no deadline overhead needed).
+ * On non-isolated CPUs, tries progressively lower utilization targets.
+ *
+ * @param measured_runtime_ns  worst-case measured frame time in nanoseconds
+ * @param bit_depth            BCM bit depth
+ * @param display_cpu          CPU the display thread is pinned to
+ * @return true if SCHED_DEADLINE was activated
+ */
+bool enable_deadline_from_measurement(uint64_t measured_runtime_ns, uint8_t bit_depth,
+                                      unsigned int display_cpu);
+
+/**
+ * @brief Legacy single-call wrapper (prefers two-phase approach above)
+ */
+bool enable_deadline_scheduler(uint16_t width, uint16_t half_height,
+                               uint8_t bit_depth, int pi_model);
+
+/**
  * @brief install signal handlers for graceful shutdown on SIGINT/SIGTERM
- * 
+ *
  */
 void signal_handler_install(void);
 

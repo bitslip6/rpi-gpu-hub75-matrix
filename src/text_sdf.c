@@ -749,8 +749,7 @@ sdf_text_t *sdf_text_create(sdf_font_t *font, const char *text) {
   t->effects.weight = 1.0f; // neutral 
 
   /* Default vertical alignment: baseline */
-
-  t->valign = SDF_VALIGN_BOTTOM;
+  t->valign = SDF_VALIGN_BASELINE;
 
   /* Default orientation: horizontal */
   t->orient = SDF_ORIENT_HORIZONTAL;
@@ -1068,6 +1067,7 @@ sdf_line_extents_t sdf_text_compute_line_extents(const sdf_text_t *t) {
   const char *p = t->text;
   for (size_t i = 0; i < t->text_len && p[i] != '\0'; ++i) {
     unsigned ch = (unsigned char)p[i];
+    if (ch < 32 || ch > 126) ch = ' ';
     const sdf_glyph_t *g = font_glyph(t->font, ch);
     if (!g)
       continue;
@@ -1194,6 +1194,7 @@ static void _sdf_text_update_shape(sdf_text_t *t) {
   const char *p = t->text;
   for (size_t i = 0; i < t->text_len && p[i] != '\0'; ++i) {
     unsigned ch = (unsigned char)p[i];
+    if (ch < 32 || ch > 126) ch = ' ';
     const sdf_glyph_t *g = font_glyph(t->font, ch);
     if (!g)
       continue; /* extremely unlikely if no fallback */
@@ -1254,12 +1255,15 @@ static void _sdf_text_update_shape(sdf_text_t *t) {
       } else if (t->valign == SDF_VALIGN_BOTTOM) {
         dys[i] = g ? (line_bottom_i - (int)g->height) : 0;
       } else {
-        dys[i] = -by;
+        /* baseline: align each glyph so its baseline row (at height - bearing_y
+         * from the bitmap top) coincides with the line's maximum ascent */
+        dys[i] = g ? (line_bottom_i - ((int)g->height - by)) : 0;
       }
+      // printf("[shape] '%c' by=%d h=%d ascent=%d  line_bot=%d  dys=%d\n", (char)ch, by, g ? (int)g->height : 0, g ? ((int)g->height - by) : 0, line_bottom_i, dys[i]);
       pen_x += (int)advs[i];
     }
 
-    
+
 
   } else { /* SDF_ORIENT_VERTICAL */
     /* Vertical stack: advance along Y; horizontal placement uses bearing_x
