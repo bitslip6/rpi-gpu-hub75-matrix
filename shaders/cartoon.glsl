@@ -98,7 +98,7 @@ void mainImage( out vec4 fragColor, in vec2 fragCoord )
 	vec4 rz = march(ro,rd);
 	vec3 ligt = normalize( vec3(-.5, 0.2, -0.2) );
     float sun = dot(rd,ligt);
-    vec3 bg = vec3(0.5,0.6,.9)*sun*0.5+0.6;
+    vec3 bg = vec3(0.5,0.6,.9)*sun*0.4+0.6;
     vec3 col = bg;
     
     if ( rz.x < FAR )
