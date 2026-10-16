@@ -688,7 +688,7 @@ void* hub75_display_run(const hub75_display_t *scene) {
                 jitter_idx = 0;
 
                 for (uint16_t x = 0; x < width; x++) {
-                    uint32_t v = bcm_signal[offset] | addr_bits;// | jitter_mask[jitter_idx];
+                    uint32_t v = bcm_signal[offset] | addr_bits | jitter_mask[jitter_idx];
                     *reg_out = v;
                     *reg_out = v | PIN_CLK;
                     offset++;
@@ -744,7 +744,7 @@ void* hub75_display_run(const hub75_display_t *scene) {
 
                 for (uint16_t x = 0; x < width; x++) {
 
-                    uint32_t v = bcm_signal[offset] | addr_bits;// | jitter_mask[jitter_idx];
+                    uint32_t v = bcm_signal[offset] | addr_bits | jitter_mask[jitter_idx];
                     *reg_out = v;                 // set data + addr + oe, clk low
                     *reg_out = v | PIN_CLK;       // clk high
 

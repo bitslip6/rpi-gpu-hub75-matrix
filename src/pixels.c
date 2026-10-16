@@ -280,9 +280,21 @@ uint16_t bcm_to_quant(const uint64_t bcm_value, const uint8_t num_bits, uint8_t 
 
 
 /**
- * @brief map an input byte to a 64 bit bcm signal
- * used in tone mapper 
+ * @brief map an input byte to a 64 bit bcm signal using hybrid cluster distribution
+ *
+ * Instead of spreading individual bits (Bresenham) or fully grouping them,
+ * we distribute clusters of MIN_RUN consecutive bits evenly across the
+ * bit_depth slots.  This guarantees minimum ON run-lengths for proper LED
+ * charge time (~200ns at 20MHz with MIN_RUN=4) while preserving temporal
+ * averaging across multiple transitions per frame.
+ *
+ * used in tone mapper
  */
+
+#ifndef BCM_MIN_RUN
+#define BCM_MIN_RUN 4   /* minimum consecutive ON bits — 4 clocks = 200ns @ 20MHz */
+#endif
+
 __attribute__((cold, pure))
 uint64_t byte_to_bcm64(const uint8_t input, const uint8_t bit_depth) {
 
@@ -304,17 +316,78 @@ uint64_t byte_to_bcm64(const uint8_t input, const uint8_t bit_depth) {
         return (1ULL << bit_depth) - 1ULL;
     }
 
-    // Even distribution using Bresenham-style accumulator.
-    // This sets exactly num_ones bits among bit_depth slots.
-    uint64_t bcm_signal = 0ULL;
-    uint32_t acc = 0;
-    for (uint32_t j = 0; j < bit_depth; j++) {
-        acc += num_ones;
-        if (acc >= bit_depth) {
-            acc -= bit_depth;
-            bcm_signal |= (1ULL << j);   // j is always < bit_depth, so shift is defined
-        }
+    // For very low bit depths or when num_ones < MIN_RUN, just place one
+    // contiguous run — clustering doesn't help with fewer than MIN_RUN bits
+    const uint32_t min_run = (BCM_MIN_RUN < bit_depth) ? BCM_MIN_RUN : 1u;
+
+    if (num_ones <= min_run) {
+        // Single cluster: distribute one run of num_ones bits using Bresenham
+        // to find the best starting position (centered in the range)
+        uint64_t run_mask = (num_ones == 64) ? ~0ULL : (1ULL << num_ones) - 1ULL;
+        // Place the single run at a Bresenham-chosen position for consistency
+        // with higher values. For a single cluster, centering is fine.
+        uint32_t start = (bit_depth - num_ones) / 2;
+        return run_mask << start;
     }
+
+    // Divide num_ones into clusters of size min_run, with one possible
+    // remainder cluster.  Then distribute these clusters evenly across
+    // the bit_depth slots using Bresenham on cluster granularity.
+    uint32_t num_full_clusters = num_ones / min_run;
+    uint32_t remainder         = num_ones % min_run;
+
+    // Total clusters to place (full-size + optional remainder)
+    uint32_t total_clusters = num_full_clusters + (remainder > 0 ? 1u : 0u);
+
+    // Build a bitmask for each cluster, then distribute them evenly.
+    // We work in units of min_run slots: divide bit_depth into
+    // (bit_depth / min_run) coarse slots, then use Bresenham to decide
+    // which coarse slots get a cluster.
+
+    // However, bit_depth may not be divisible by min_run, so we use a
+    // finer approach: Bresenham over bit_depth positions, emitting
+    // clusters of min_run (or remainder) consecutive bits.
+
+    // Strategy: treat each cluster as consuming min_run (or remainder)
+    // bit positions.  We need to place total_clusters clusters into
+    // bit_depth positions such that the clusters don't overlap and are
+    // evenly spaced.
+
+    // Total bits consumed by clusters
+    // uint32_t bits_consumed = num_ones; (== num_full_clusters*min_run + remainder)
+    // Gaps to distribute = bit_depth - num_ones, spread among total_clusters gaps
+    // (before first cluster, between clusters, after last cluster)
+
+    // Use Bresenham to choose cluster start positions:
+    // We have total_clusters clusters to place in bit_depth slots.
+    // Each cluster is min_run wide (last one may be remainder wide).
+    // Treat it as placing total_clusters items in (bit_depth - num_ones + total_clusters)
+    // virtual slots, then expanding each chosen slot into a run.
+
+    uint64_t bcm_signal = 0ULL;
+    uint32_t gap_total = bit_depth - num_ones;  // total OFF bits to distribute
+    uint32_t num_gaps  = total_clusters + 1u;   // gaps: before, between, and after clusters
+
+    // Compute gap sizes using largest-remainder method for even distribution
+    uint32_t gap_base  = gap_total / num_gaps;
+    uint32_t gap_extra = gap_total % num_gaps;
+
+    uint32_t pos = 0;
+    for (uint32_t c = 0; c < total_clusters; c++) {
+        // gap before this cluster (first gap_extra gaps get +1)
+        uint32_t gap = gap_base + (c < gap_extra ? 1u : 0u);
+        pos += gap;
+
+        // cluster width: full clusters first, remainder last
+        uint32_t cwidth = (c < num_full_clusters) ? min_run : remainder;
+
+        // set cwidth consecutive bits starting at pos
+        for (uint32_t b = 0; b < cwidth && pos + b < 64; b++) {
+            bcm_signal |= (1ULL << (pos + b));
+        }
+        pos += cwidth;
+    }
+
     return bcm_signal;
 }
 

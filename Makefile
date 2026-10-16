@@ -127,7 +127,7 @@ JPEG_FOUND      := $(shell test "$(JPEG_PKG)" != "none" && echo yes || echo no)
 EFENCE_FOUND    := $(shell echo "int main(){}" | $(CC) -x c - -o /dev/null -lefence >/dev/null 2>&1 && echo yes || echo no)
 EFENCE_LIB      := $(if $(filter yes,$(EFENCE_FOUND)),-lefence,)
 
-.PHONY: all lib libgpu static clean distclean install uninstall check-libs example scratch print-vars debug perf example-debug example-perf example-fast test-sampler
+.PHONY: all lib libgpu static clean distclean install uninstall check-libs example scratch print-vars debug perf example-debug example-perf example-fast test-sampler pio-dma-bench pio-clock-scope pio-hub75-scope
 
 all: check-libs $(LIB_NO_GPU) $(LIB_GPU) 
 ifeq ($(BUILD),debug)
@@ -295,3 +295,27 @@ tests/test_sampler: tests/unit/test_sampler.c $(LIB_NO_GPU)
 test-sampler: tests/test_sampler
 	@echo "[RUN] $<"
 	$(Q)./tests/test_sampler
+
+# Standalone RP1 PIO hardware-DMA throughput benchmark (does not drive GPIO).
+$(BUILDDIR)/pio_dma_bench: tests/pio_dma_bench.c | $(BUILDDIR)
+	@echo "[CC ] $@"
+	$(Q)$(CC) -O2 -std=gnu2x -Wall -Wextra -o $@ $<
+
+pio-dma-bench: $(BUILDDIR)/pio_dma_bench
+	@echo "Run: ./$< [seconds] [clock_divider] [chunk_KiB] [--gpio BASE|--project-pins] [--autopull|--pack4]"
+
+# Scope-only GPIO17 clock test: no DMA, no other GPIO outputs.
+$(BUILDDIR)/pio_clock_scope: tests/pio_clock_scope.c | $(BUILDDIR)
+	@echo "[CC ] $@"
+	$(Q)$(CC) -O2 -std=gnu2x -Wall -Wextra -o $@ $<
+
+pio-clock-scope: $(BUILDDIR)/pio_clock_scope
+	@echo "Run (panels disconnected): ./$< [seconds] [clock_divider]"
+
+# One DMA word per pixel clock: 18 RGB pins + side-set GPIO17 CLK.
+$(BUILDDIR)/pio_hub75_scope: tests/pio_hub75_scope.c | $(BUILDDIR)
+	@echo "[CC ] $@"
+	$(Q)$(CC) -O2 -std=gnu2x -Wall -Wextra -o $@ $<
+
+pio-hub75-scope: $(BUILDDIR)/pio_hub75_scope
+	@echo "Run (panels disconnected): ./$< [seconds] [clock_divider] [chunk_KiB] [--light-dma] --output"
