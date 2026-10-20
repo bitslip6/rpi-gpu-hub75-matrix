@@ -18,7 +18,7 @@ float map(vec3 p){
         p.xz = abs(p.xz);
         p.xz-=.5;
 	}
-	return dot(sign(p),p)/5.;
+	return dot(sign(p),p)/4.;
 }
 
 vec4 rm (vec3 ro, vec3 rd){

@@ -40,7 +40,7 @@ directory.
 Multiple tone mapping implementations are provided including ACES, reinhard, and exposure as well as saturation and 
 contrast controls. Tone mapping compresses the upper and lower end of the linear sRGB data to provide a more natural
 and balanced image on the LED panel. You can implement your own tone mapping by implementing the func_tone_mapper_t
-function and setting it in the active "scene_info". Tone mapping changes take effect on the next frame update and 
+function and setting it in the active hub75_display_t. Tone mapping changes take effect on the next frame update and 
 do not add any delay after initial BCM mapping. 
 
 Gamma correction is also provided. Global gamma can be controlled on the command line. Each red, green, and blue color
@@ -65,6 +65,29 @@ Please read HZeller's excellent write-up on wiring the PI to the HUB75 display. 
 active 3 port boards to ensure proper level translation and to map the address lines, OE, and clock pins to all 3 boards
 
 
+
+Persistent Pi 5 display-response setup
+------------------------------------
+For a quieter GPIO-emission CPU, stop display/GPIO/PIO applications, keep recovery
+access, then inspect and install the reversible isolation profile:
+
+```sh
+sudo ./configure-system.py --dry-run
+sudo ./configure-system.py
+```
+
+To undo changes owned by this installer:
+
+```sh
+sudo ./configure-system.py --restore
+```
+
+The installer backs up boot arguments, reserves CPU3, masks irqbalance, installs
+root-owned helpers and enables automatic runtime isolation after boot. It never
+drives GPIO, installs a kernel, changes the governor/RT budget or reboots. It
+reports when an operator-controlled reboot is needed. See
+[setup, persistence and recovery details](tests/README-configure-system.md),
+including restoration of a system that was already manually configured.
 
 Glossary
 --------
@@ -121,9 +144,9 @@ cd rpi-gpu-hub75-matrix
 # compile with support for hzeller's 3 port board (default):
 # https://www.electrodragon.com/product/rgb-matrix-panel-drive-board-raspberry-pi/
 make DEF="-DHZELLER=1"
-# OR compile with support for ADAFruit single port: https://www.adafruit.com/product/3211
+# OR compile with support for Adafruit single-port HUB75 HAT:
 make DEF="-DADA_HAT=1"
-# OR ADAFruit Tripple Port: https://www.adafruit.com/product/6358
+# OR Adafruit triple-port HUB75 HAT:
 make DEF="-DADA_3HAT=1"
 # OR edit include/rpihub75.h and edit the #define for pin mapping if using a different board or pin configuration
 
@@ -131,7 +154,7 @@ make DEF="-DADA_3HAT=1"
 sudo make install
 
 # compile the example program
-gcc -Wall -O3 -mtune=native -lrpihub75_gpu example.c -o example
+gcc -Wall -O3 -mtune=native example.c -o example -lrpihub75_gpu
 # or use the makefile
 make example
 
@@ -216,76 +239,73 @@ to shift in data for 1 64x64 panel. This translates to a single 64x64 panel refr
 4 panels together per port at >2400Hz. 
 
 Rather than call "SetPixel", you draw directly to a 24bpp or 32bpp buffer and then call this library's function
-map_byte_image_to_bcm() to translate the 24bpp RGB buffer to the BCM signal. The buffer that this function writes the BCM
-data is read from on another thread via the render_forever() method.
+hub75_display_map_image_to_bcm() to translate the 24bpp/32bpp buffer to the BCM signal. The buffer that this function writes
+the BCM data to is read from another thread by hub75_display_run().
 
-The render_forever() method will run until scene->do_render is set to false.
+hub75_display_run() will run until scene->do_render is set to false.
 
 Minimum Program
 ---------------
 ```c
 #include <pthread.h>
-#include <rpihub75/rpihub75.h>
-#include <rpihub75/util.h>
-#include <rpihub75/video.h>
+#include <rpihub75/hub75gpu.h>
 #include <rpihub75/pixels.h>
 
-void* render_loop(void *arg) {
-    // get the current scene info
-    scene_info *scene = (scene_info*)arg;
+static void* render_loop(void *arg) {
+    hub75_display_t *scene = (hub75_display_t*)arg;
     for (;;) {
-        int red = 255, green = 128, blue = 64;
-	RGB color = {red, green, blue};
-	hub_pixel(scene, 32, 16, color);         // render to scene internal image buffer
-	hub_pixel(scene, 32, 16, color);
-	hub_line(scene, 5, 5, 32, 32, color);
-	hub_line_aa(scene, 5, 5, 32, 32, color); // anti-aliased
-	//hub_triangle(scene, x1, y1, x2, y2, x3, y3, color);
-	//hub_triangle_aa(scene, x1, y1, x2, y2, x3, y3, color); // anti-aliased
-	scene->bcm_mapper(scene, NULL); // render image bugger in scene
-	calculate_fps(scene->fps, scene->show_fps);
+        RGB color = {255, 128, 64};
+        hub_pixel(scene, 32, 16, color);          // draw into scene->image
+        hub_line(scene, 5, 5, 32, 32, color);
+        hub_line_aa(scene, 5, 5, 32, 32, color);  // anti-aliased
+
+        // Map scene->image (or pass an external RGB/RGBA buffer) into BCM bitplanes
+        hub75_display_map_image_to_bcm(scene, NULL);
+        calculate_fps(scene->fps, scene->show_fps);
     }
 }
 
 int main(int argc, char **argv) {
-	scene_info *scene = default_scene(argc, argv);
-	check_scene(scene);
-	pthread_t update_thread;
-	pthread_create(&update_thread, NULL, render_loop, scene);
-	render_forever(scene); // does not return
-}
+    // Parse CLI into a display config
+    hub75_display_t *scene = hub75_display_parse_args(argc, argv);
+    // Validate and allocate internal buffers
+    hub75_display_start(scene);
 
+    // Start your render thread
+    pthread_create(&scene->render_thread, NULL, render_loop, scene);
+
+    // Drive the HUB75 output forever (until scene->do_render becomes false)
+    hub75_display_run(scene);
+}
 ```
 
 
 Example using your own drawing buffer:
 -------------------------------------
 ```c
-scene_info *scene = default_scene(argc, argv);
-// example scene->stride is 3 for 24bpp (3 bytes per pixel)
-uint8_t *imageRGB = (uint8_t*)malloc(scene->width * scene->height * scene->stride); 
+hub75_display_t *scene = hub75_display_parse_args(argc, argv);
+// example: scene->stride is 3 for 24bpp (RGB) or 4 for 32bpp (RGBA)
+uint8_t *imageRGB = (uint8_t*)malloc((size_t)scene->width * scene->height * scene->stride);
 
-int x = 32;
-int y = 16;
-uint8_t red = 255; 
-uint8_t green = 128; 
-uint8_t blue = 64; 
+int x = 32, y = 16;
+uint8_t red = 255, green = 128, blue = 64;
 
-// scene->stride is 3
-imageRGB[((y*scene->width) +x *scene->stride)] = red;
-imageRGB[((y*scene->width) +x *scene->stride)+1] = green;
-imageRGB[((y*scene->width) +x *scene->stride)+2] = blue;
+// write one RGB pixel at (x,y)
+size_t off = ((size_t)y * scene->width + (size_t)x) * scene->stride;
+imageRGB[off + 0] = red;
+imageRGB[off + 1] = green;
+imageRGB[off + 2] = blue;
 
-scene->bcm_mapper(scene, imageRGB);   // pass the imange buffer here. supports RGB with scene->stride = 3 and RGBA with scene->stride = 4
+// Pass your buffer to be mapped (NULL would map scene->image)
+hub75_display_map_image_to_bcm(scene, imageRGB);
 
-calculate_fps(scene->fps);
+calculate_fps(scene->fps, scene->show_fps);
 ```
 
 
-Users can update either 24bpp RGB or 32bpp RGBA frame buffers directly and then call scene->bcm_mapper() after rendering
-a new frame. Calling this method will translate the RGB data to BCM bit data. BCM data is organized as a multi dimensional
+Users can update either 24bpp RGB or 32bpp RGBA frame buffers directly and then call hub75_display_map_image_to_bcm() after rendering a new frame. Calling this method will translate the RGB data to BCM bit data. BCM data is organized as a multi dimensional
 array of uint32_t data. Each uint32_t stores a bitmask for the r1,r2,g1,g2,b1,b2 pins for the current pixel's bit-plane. There
-is no need to call any other functions as the "render_forever()" code pulls directly from this buffer.
+is no need to call any other functions as the hub75_display_run() code pulls directly from this buffer.
 
 
 RGB to BCM Mapping
@@ -305,7 +325,7 @@ these values would be precomputed after every frame and toggled for each display
 
 each bit plane (that is a uint32_t with all of the pin toggles for all 3 output ports for a particular pixel on a single 
 bit plane, there are bit_depth number of bit planes per image) is updated atomically in a single write. This means there
-is no need for double buffering to achieve a flicker-free display. Simply call map_byte_image_to_bcm with your new image
+is no need for double buffering to achieve a flicker-free display. Simply call hub75_display_map_image_to_bcm with your new image
 buffer as often as you like. The data will be overwritten and the new PWM data will be updated immediately. This allows you
 to draw to the display at up to 9600Hz (depending on the number of chained displays) however frame rates of about 120fps seem 
 to produce excellent results and higher frame rates have diminishing returns after that.
@@ -354,9 +374,8 @@ GPU Support
 To add GPU shader support you will need to install glesv2, gbm and mesagl.
 sudo apt-get install libgles2-mesa-dev libgbm-dev libegl1-mesa-dev
 
-support for single buffer shadertoy shaders is already added so just pass your shader via the -s command line
-parameter. This will set the path to the shader in the scene_info->shader string. render_shader() in gpu.c
-will look for a shader on the filesystem at path scene_info->shader and attempt to compile it. It will update
+Support for single-buffer Shadertoy-style fragment shaders is included: pass your shader via -s on the command line.
+This sets scene->shader_file. render_shader() in gpu.c will load the shader file and attempt to compile it. It will update
 glUniforms iTime and iResolution like shadertoy, however no support for additional buffers or textures has
 been added as of yet. Send a PR if you are inclined.
 
@@ -386,11 +405,8 @@ make
 sudo make install
 # you may need to manually run "sudo ldconfig" depending on your OS environment
 
-# to compile the example app without GPU support:
-gcc -O3 -Wall -lrpihub75 example.c -o example 
-
-# to compile the example app with GPU support:
-gcc -O3 -Wall -lrpihub75_gpu example.c -o example 
+# to compile a simple app (headers are installed to /usr/local/include/rpihub75)
+gcc -O3 -Wall example.c -o example -lrpihub75_gpu
 
 # print command line configuration help
 ./example 
@@ -404,70 +420,51 @@ Example Program
 ---------------
 
 ```c
-// see main.c for this example
-#include <pthread.h>
-#include <rpihub75/rpihub75.h>
-#include <rpihub75/util.h>
-#include <rpihub75/gpu.h>
+#include <rpihub75/hub75gpu.h>
+#include <rpihub75/pixels.h>
 
-unsigned int ri(unsigned int max) {
-	return rand() % max;
+static unsigned ri(unsigned max) { return (max == 0) ? 0u : (unsigned)rand() % max; }
+
+static void* render_cpu(void *arg) {
+    hub75_display_t *scene = (hub75_display_t*)arg;
+    const size_t buffer_sz = (size_t)scene->width * scene->height * scene->stride;
+    uint8_t *image = (uint8_t*)calloc(1, buffer_sz);
+
+    for (;;) {
+        // Fade existing pixels
+        for (size_t i=0; i<buffer_sz; ++i) image[i] = (uint8_t)(image[i] * 0.96f);
+
+        uint16_t x1 = (uint16_t)ri(scene->width);
+        uint16_t x2 = (uint16_t)ri(scene->width);
+        uint16_t x3 = (uint16_t)ri(scene->width);
+        uint16_t y1 = (uint16_t)ri(scene->height);
+        uint16_t y2 = (uint16_t)ri(scene->height);
+        uint16_t y3 = (uint16_t)ri(scene->height);
+
+        RGB color = {(uint8_t)ri(250), (uint8_t)ri(250), (uint8_t)ri(250)};
+
+        // Draw into scene->image via helpers (see pixels.h)
+        hub_line(scene, x1, y1, x2, y2, color);
+        hub_line_aa(scene, x2, y2, x3, y3, color);
+
+        // Map to bitplanes
+        hub75_display_map_image_to_bcm(scene, NULL);
+        calculate_fps(scene->fps, scene->show_fps);
+    }
 }
 
-// our CPU rendering implementation, see gpu.c for shader rendering details
-void* render_cpu(void *arg) {
-    // get the current scene info
-    const scene_info *scene = (scene_info*)arg;
-    const int buffer_sz     = scene->width * scene->height * scene->stride;
-    uint8_t *image          = (uint8_t*)malloc(buffer_sz);
+int main(int argc, char **argv) {
+    hub75_display_t *scene = hub75_display_parse_args(argc, argv);
+    hub75_display_start(scene);
 
-    // loop forever on this thread
-    for(;;) {
-        // darken every pixel in the image
-        for (int x=0; x<buffer_sz; x++) {
-            image[x] = (uint8_t)(image[x] * 0.96f);
-        }
-
-        uint16_t x1 = ri(scene->width);
-        uint16_t x2 = ri(scene->width);
-        uint16_t x3 = ri(scene->width);
-        uint16_t y1 = ri(scene->height);
-        uint16_t y2 = ri(scene->height);
-        uint16_t y3 = ri(scene->height);
-
-        RGB color = {ri(250), ri(250), ri(250)};
-
-        // Draw a random antialiased triangle, see pixels.h for drawing primitives
-        // drawing primitives begin with "hub_" and draw to scene->image buffer
-        hub_triangle_aa(scene, x1, y1, x2, y2, x3, y3, color);
-
-        // render the RGB data to the active PWM buffers. sleep delay the frame to sync with scene->fps
-        // You can optionally draw directly into *image, and then pass the image
-        // to scene->bcm_mapper(scene, image, TRUE);
-        scene->bcm_mapper(scene, NULL, TRUE);
-    }
-
-
-int main(int argc, char **argv)
-{
-    // parse command line options to define the scene
-    // use -h for help, see this function in util.c for more information on command line parsing
-    scene_info *scene = default_scene(argc, argv);
-
-    // Ensure that the scene is valid
-    check_scene(scene);
-    
-    // Create another thread to run the frame drawing function (GPU or CPU)
-    pthread_t update_thread;
-    // Use the GPU shader renderer if we have one, else use the CPU renderer above
     if (scene->shader_file == NULL) {
-        pthread_create(&update_thread, NULL, render_cpu, scene);
+        pthread_create(&scene->render_thread, NULL, render_cpu, scene);
     } else {
-        pthread_create(&update_thread, NULL, render_shader, scene);
+        // If -s points to a .glsl, shader will be used; if it points to a video, video renderer is used
+        pthread_create(&scene->render_thread, NULL, render_shader, scene);
     }
 
-    // This function will never return
-    render_forever(scene);
+    hub75_display_run(scene); // does not return
 }
 ```
 
@@ -476,13 +473,12 @@ Command Line Arguments
 ----------------------
 You can configure your setup for your application from the command line if you so choose by adding the call: 
 ```c
-    scene_info *scene = default_scene(argc, argv);
+    hub75_display_t *scene = hub75_display_parse_args(argc, argv);
 ```
 
-This will parse the following command line parameters and setup your scene_info configuration for you.
+This will parse the following command line parameters and set up your hub75_display_t configuration for you.
 If you prefer you can also hard code this configuration or load it from a configuration file. This structure
-is required to call render_forever() and the scene->bcm_mapper() function pointer points to the current
-pwm_mapping function for the scene. (see func_bcm_mapper_t)
+is required to call hub75_display_run(), and hub75_display_map_image_to_bcm() renders the linear RGB/RGBA data to the BCM buffers for rendering.
 
 
 ```txt
@@ -500,7 +496,7 @@ pwm_mapping function for the scene. (see func_bcm_mapper_t)
      -b <brightness>   overall brightness level (0-254)
      -m <frames>       motion blur frames       (0-32)
      -l <dither>       dither strength, 0 = off (0.0-10.0)
-     -i <mapper>       image mapper (mirror, flip, mirror_flip) (need to add support for U and V mapping)
+    -i <mapper>       image mapper (u, mirror, flip, mirror_flip)
       // both sigmoid and saturation tone mappers accept a level ie: saturation:2.0
      -t <tone_mapper>  (aces, reinhard, none, saturation:0.5-5.0, sigmoid:0.5-2.0, hable)
      -j                adjust brightness in BCM data, only for pi3-4

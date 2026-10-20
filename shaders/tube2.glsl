@@ -57,7 +57,7 @@ void mainImage(out vec4 O, vec2 C) {
       // Calculate color based on position and space distortion
       // The sin() creates a nice looking palette, division by dot() creates falloff
     , O = (1.+sin(.5*O.z+length(p-O)+vec4(0,4,3,6)))
-       / (.5+2.*dot(O.xy,O.xy))
+       // (.5+2.*dot(O.xy,O.xy))
     
       // Domain repetition, repeats the single line and the 2 planes infinitely
     , p = abs(fract(p)-.5)

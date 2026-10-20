@@ -1,118 +1,277 @@
-/**
- * This is an example program using the rpi-gpu-hub75 library.
- * To compile:
- * gcc -O3 -Wall -lrpihub75_gpu example.c -o example
- * ./example
- * # this should display command line options
- * # example for 4 64x64 panels (128x128 pixels) 2 chains connected to 2 ports, 
- * # 48 pwm color bits, 192 brightness, 2.2 gamma, render the cartoon.glsl shader
- * # at 120 fps with 
- * ./example -w 128 -h 128 -p 2 -c 2 -d 48 -b 192 -g 2.2 -f 120 -s shaders/cartoon.glsl
+/*
+ * rpi-gpu-hub75 Example Application
+ * ---------------------------------
+ * This program demonstrates the minimal steps needed to:
+ *   1. Parse command line options into a `scene_info` structure (parse_scene)
+ *   2. Start the rendering system (start_scene)
+ *   3. Provide a custom CPU drawing loop OR render a GPU shader / video
+ *   4. Gracefully shut down on Ctrl+C (SIGINT) / SIGTERM
  *
+ * Build (auto‑detects libs via pkg-config, prefer using the provided Makefile):
+ *   make example            # release build (default)
+ *   make BUILD=debug example
+ *   ./example -h            # show command line options supplied by parse_scene()
+ *
+ * Quick Run (4x 64x64 -> 128x128, 2 ports, 2 chains each, 48 bpp, gamma 2.2):
+ *   ./example -w 128 -h 128 -p 2 -c 2 -d 48 -b 192 -g 2.2 -f 120 -s shaders/cartoon.glsl
+ *
+ * To try the CPU demo (random triangles) just omit -s:
+ *   ./example -w 128 -h 128 -p 2 -c 2 -d 48 -b 192 -g 2.2 -f 120
+ *
+ * NOTE: parse_scene() supplies many more options (see -h output).
  */
-// TODO: add make file flag for enabling asserts
-//#define ENABLE_ASSEERTS 0
-// replace #define with scene debug printing options...
-// NOTE: this is defined in rpihub75.h and must be recompiled and reinstalled with the lib....
-//#define CONSOLE_DEBUG 1
+#include <stddef.h>
+#include <bits/types/sig_atomic_t.h>
+#include <stdio.h>
+#include <stdbool.h>
+#include <stddef.h>
 
+// #define _GNU_SOURCE
 #include <pthread.h>
-#include <rpihub75/rpihub75.h>
-#include <rpihub75/util.h>
-#include <rpihub75/gpu.h>
-#include <rpihub75/video.h>
-#include <rpihub75/pixels.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <stdatomic.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <string.h>
+#include <math.h>
+#include <time.h>
 
-unsigned int ri(unsigned int max) {
-	return rand() % max;
+#include "hub75gpu.h"
+#include "util.h"
+#include "pixels.h"
+#include "text_sdf.h"
+#include "compositor.h"
+
+
+// --------------- Utility Helpers (example only) -----------------
+
+// Return a random integer in [0, max-1]. If max==0 returns 0.
+static inline unsigned ri(unsigned max) {
+    return (max == 0) ? 0u : (unsigned)rand() % max;
 }
 
-// our CPU rendering implementation, see gpu.c for shader rendering details
-void* render_cpu(void *arg) {
-    // get the current scene info
-    scene_info *scene = (scene_info*)arg;
-    // allocate  memory for image data, we can also use the preallocated scene->image if that's easier
-    uint8_t *img = malloc(scene->width * scene->height * scene->stride);
-    memset(img, 0, scene->width * scene->height * scene->stride);
+// Return a random uint16_t in [0, max-1]
+static inline uint16_t rnd16(uint16_t max) {
+    return (uint16_t)ri(max);
+}
 
-    debug("rendering on CPU\n");
-    // need to pause a second for gpio to be setup
-    usleep(50000);
-    for(;;) {
-        // darken every pixel in the image for each byte of R,G,B data
-        if (1) {
-            for (int i=0; i<scene->height*scene->width*scene->stride; i++) {
-                scene->image[i] = (uint8_t)scene->image[i] * 0.96f;
-            }
+// Return a random 8 bit value in [0,255]
+static inline uint8_t rnd8(void) {
+    return (uint8_t)ri(256u);
+}
+
+// Trivial helper to test if a filename ends with a given extension (case sensitive)
+static bool has_extension(const char *filename, const char *extension) {
+    const char *dot = strrchr(filename, '.');
+    return (dot && dot != filename) ? (strcmp(dot + 1, extension) == 0) : false;
+}
+
+
+
+/* ---------------- Text SDF Demo (Task 5.1) ---------------- */
+static void *render_text_sdf(void *arg) {
+    hub75_display_t *scene = (hub75_display_t*)arg;
+    printf("[TEXT] SDF text scroller demo (Ctrl+C to exit)\n");
+
+    /* Get API table */
+    hub75gpu_t api = hub75_api(scene);
+
+    // Configure font: load and scale to 64px line height 
+    sdf_font_t *font = api.sdf_font_load_scaled("assets/roboto", 64.0f);
+    if (!font) {
+        fprintf(stderr, "[TEXT] Failed to load SDF font from 'assets/robots' (expect metrics.csv + PNGs).\n");
+        scene->do_render = false;
+        return NULL;
+    }
+
+    // Create text object
+    const char msg[] = "Hello, HUB75 SDF Scroller!  ";
+    sdf_text_t *txt = api.sdf_text_create(font, msg);
+    txt->size_px = 148.0f;
+    txt->color = (RGBA){128, 255, 128, 255};
+    txt->alpha = 200;
+    txt->x = txt->x0 = 180.0f;
+    txt->y = txt->y0 = 90.0f;
+    txt->dir_x = -1.0f;
+    txt->speed = 128.0f;
+    txt->softness = 0.08f;
+    txt->effects.weight         = 1.2f;
+    txt->effects.glow_color     = (RGBA){192, 232, 245, 255};
+    // txt->effects.glow_radius    = Normal_clamp(1.0f);
+    txt->effects.outline_width  = Normal_clamp(0.1f); // set >0 to enable outline
+    txt->effects.outline_color  = (RGBA){0, 64, 128, 255};
+    txt->effects.outline_smooth = Normal_clamp(0.1f);
+    txt->valign = SDF_VALIGN_BASELINE;
+    api.sdf_text_update(txt, scene->width);
+
+    /* Render loop */
+    const bool dump_once = true;//(dump_env && *dump_env && dump_env[0] != '0');
+    string_t *dump_path = string_new("text_debug.png", 128);
+    uint32_t frame = 0;
+
+    //float last_time = 0.0f;
+    float this_time = 0.0f;
+
+    // Random velocities (pixels/frame), small magnitudes
+    float vx[3], vy[3];
+
+    Polygonf_t tri;
+    tri.num_points = 3;
+
+    for (int i = 0; i < 3; ++i) {
+        float ang = (float)rand() / (float)RAND_MAX * 6.28318530718f;
+        float speed = .01f * ((float)rand() / (float)RAND_MAX); // allow >1 px/frame
+        vx[i] = cosf(ang) * speed;
+        vy[i] = sinf(ang) * speed;
+        tri.points[i].x = ((float)rand() / (float)RAND_MAX);
+        tri.points[i].y = ((float)rand() / (float)RAND_MAX);
+
+        printf("  v[%d] = (%3.3f / %3.3f) %.2f, %.2f\n", i, (double)tri.points[i].x, (double)tri.points[i].y, (double)vx[i], (double)vy[i]);
+    }
+
+    // Triangle base color
+    // RGB color = { 255, 160, 32 };
+    RGBA color1 = { 0, 255, 160, 254 };
+ 
+    printf ("text size: [%dx%d]\n", txt->dimensions.x, txt->dimensions.y);
+    image_buffer_t *text_image = image_buffer_new(txt->dimensions.x, txt->dimensions.y);
+    image_buffer_t *sin_image  = image_buffer_new(txt->dimensions.x, txt->dimensions.y);
+
+    this_time = 0.0f;
+
+    api.sdf_text_render(txt, (uint8_t*)text_image->data, txt->dimensions.x, txt->dimensions.y, (int)text_image->row_stride, 0.9529411f);
+    png_write_buffer("text_buffer2.png", text_image);
+
+    vec4 dst_rect = { 0, 16, scene->width, (float)MIN(scene->height, txt->dimensions.y) };
+    vec4 src_rect = { 0, 0, 0, (float)txt->dimensions.y};
+
+
+    txt->y = 0;
+    while (scene->do_render) {
+        frame++;
+        api.frame_begin();
+        api.clear(); /* black background */
+
+        for (int i = 0; i < 3; ++i) {
+            tri.points[i].x += vx[i];
+            tri.points[i].y += vy[i];
+            if (tri.points[i].x < 0.01f)  { tri.points[i].x = 0.01f;  vx[i] = -vx[i]; }
+            if (tri.points[i].x >= 0.99f)  { tri.points[i].x = 0.99f; vx[i] = -vx[i]; }
+            if (tri.points[i].y < 0.01f)  { tri.points[i].y = 0.01f;  vy[i] = -vy[i]; }
+            if (tri.points[i].y >= 0.99f)  { tri.points[i].y = 0.99f; vy[i] = -vy[i]; }
+        }
+
+        color1.r = (uint8_t)(128 + 127 * sinf((float)frame * 0.02f));
+        color1.g = (uint8_t)(128 + 127 * sinf((float)frame * 0.03f));
+        color1.b = (uint8_t)(128 + 127 * sinf((float)frame * 0.04f));
+
+
+        // render the polygon
+        api.poly(&tri, color1);
+
+        // the wrapping text time offset (0 -> wrap_mod, 0 -> wrap_mod) ...
+        float wrap_time = api.wrap(this_time, txt->wrap_mod);
+
+        // compute the x position of this frame to render the text
+        float xpos = (txt->x0 + ((float)txt->dir_x * (float)txt->speed) * wrap_time);
+        float spos = (xpos < 0) ? fabsf(xpos) : 0;
+        // calculate the start position to render the text into
+        dst_rect.x = MAX(0, xpos);
+        // compute a sliding window of the source text to render FROM
+        // calculate the start X position of the text image to render from
+        src_rect.x = MIN((float)txt->dimensions.x, spos);
+        // the end X position of the text imgae to render from
+        src_rect.z = MIN((spos + scene->width), (float)txt->dimensions.x);
+
+        apply_sine_wave_vertical(sin_image, text_image, 24.5f, 2, wrap_time);
+
+        // if we have at least 1 pixel to render, do the composite
+        if (src_rect.z > src_rect.x) {
+            composite_rgba_over_rgba(&scene->frame_buffer,
+                sin_image,
+                dst_rect,
+                src_rect);
         }
 
 
-        // generate some random points on the screen
-        uint16_t x1 = ri(scene->width);
-        uint16_t x2 = ri(scene->width);
-        uint16_t x3 = ri(scene->width);
-        uint16_t y1 = ri(scene->height);
-        uint16_t y2 = ri(scene->height);
-        uint16_t y3 = ri(scene->height);
+        if (dump_once && frame == 120) {
+            png_write_display(dump_path, scene);
+            fprintf(stderr, "[TEXT] Wrote debug frame to %s\n", dump_path->str);
+        }
 
-        // generate a random color
-        RGB color = {ri(250), ri(250), ri(250)};
-
-        hub_triangle_aa(scene, x1, y1, x2, y2, x3, y3, color);
-
-        // draw a line
-        //hub_line(scene, x1, y1, x2, y2, color);
-
-        // draw a rectangle
-        //hub_fill(scene, x1, y1, x2, y2, color);
-
-        // draw a rectangle
-        //hub_circle(scene, x1, y1, y3 % 20, color);
-
-        // render the RGB data to the active BCM buffers.
-        scene->bcm_mapper(scene, NULL);
-
-        // calcualte_fps will delay execution to achieve the desired frames per second
-        calculate_fps(scene->fps, scene->show_fps);
+        api.frame_end();
+        this_time = calculate_fps(scene->fps, scene->show_fps);
     }
+
+    /* Cleanup */
+    if (dump_path) string_free(dump_path);
+    api.sdf_text_destroy(txt);
+    api.sdf_font_free(font);
+    return NULL;
 }
 
 
-int main(int argc, char **argv)
-{
-    printf("rpi-gpu-hub75 v0.2 example program %s pin out configuration\n", ADDRESS_TYPE);
-    srand(time(NULL));
+// --------------- Main Entry Point --------------------------------
+int main(int argc, char **argv) {
+    printf("rpi-gpu-hub75 example PI Hardware \"hat\": (%s)\n", ADDRESS_TYPE);
+    srand((unsigned)time(NULL));
 
-    // parse command line options to define the scene
-    // use -h for help, see this function in util.c for more information on command line parsing
-    scene_info *scene = default_scene(argc, argv);
+    // Parse command line into a new scene. Use -h to see available options.
+    hub75_display_t *scene = hub75_display_parse_args(argc, argv);
 
-    // ensure that the scene is valid
-    check_scene(scene);
+    scene->stride = 4;
+    // Validate configuration, allocate internal buffers, etc.
+    hub75_display_bind_scene(scene);
 
-    
-    // create another thread to run the frame drawing function (GPU or CPU)
-    pthread_t update_thread;
-    // use the CPU renderer if no shader or video file was passed
+    signal_handler_install();
+
+    /* To try the text SDF demo, replace render_3d with render_text_sdf */
+    // pthread_create(&scene->render_thread, NULL, render_text_sdf, scene);
+    /*
+    pthread_create(&scene->render_thread, NULL, render_text_sdf, scene);
+
+    hub75_display_run(scene);
+
+    hub75_display_wait(scene);
+    return 0;
+    */
+
+
+
+    // Decide what to render:
+    //  * No -s : run CPU demo
+    //  * -s path/to/file.glsl : GPU shader
+    //  * -s path/to/file.(mp4|mov|...) : Video playback
     if (scene->shader_file == NULL) {
-        pthread_create(&update_thread, NULL, render_cpu, scene);
-    }
-    // use the gpu shader or video renderer if we have one, else use the cpu renderer above
-    else if (access(scene->shader_file, R_OK) == 0) {
+        pthread_create(&scene->render_thread, NULL, render_text_sdf, scene);
+    } else if (access(scene->shader_file, R_OK) == 0) {
         if (has_extension(scene->shader_file, "glsl")) {
-            printf("render shader [%s]\n", scene->shader_file);
-            scene->stride = 4;
-            pthread_create(&update_thread, NULL, render_shader, scene);
+            printf("[GPU] Shader: %s\n", scene->shader_file);
+            // If your shader needs RGBA (alpha), adjust stride if desired:
+            pthread_create(&scene->render_thread, NULL, main_render_shader, scene);
         } else {
-            printf("render video [%s]", scene->shader_file);
-            pthread_create(&update_thread, NULL, render_video_fn, scene);
+            printf("[GPU] Video: %s\n", scene->shader_file);
+            pthread_create(&scene->render_thread, NULL, main_render_video, scene);
         }
     } else {
-        die("unable to open file %s\n", scene->shader_file);
+        fprintf(stderr, "[WARN] Unable to open '%s'; falling back to CPU renderer.\n", scene->shader_file);
+        pthread_create(&scene->render_thread, NULL, render_text_sdf, scene);
     }
 
+    hub75_display_run(scene);
 
-    // this function will never return. make sure you have already forked your drawing thread 
-    // before calling this function
-    render_forever(scene);
+    hub75_display_wait(scene);
+    return 0;
+
+    while(scene->do_render) {
+        sleep(1);
+    }
+
+    // This call never returns; it drives the BCM output loop.
+    // render_forever(scene);
+
+    // wait on threads...
+    hub75_display_wait(scene);
+    return 0; // not reached
 }
