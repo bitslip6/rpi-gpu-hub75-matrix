@@ -414,7 +414,7 @@ void* hub75_display_run_pi4(const hub75_display_t *scene) {
     gettimeofday(&start_time, NULL);
 
     __attribute__((unused)) uint16_t phase = 1;         // phase is where we start pulling jitter bits from
-    uint16_t jitter_idx = 0;    // jitter_mask has an extra 16K of bits in it, so overrun is ok
+    uint32_t jitter_idx = 0;    // jitter_mask has an extra 16K of bits in it, so overrun is ok
     const uint32_t *bcm_signal; // pointer to the current bcm data to be displayed
 
     debug(" [.] waiting for first frame acquisition...\n");
@@ -711,7 +711,7 @@ void* hub75_display_run(const hub75_display_t *scene) {
     debug(" [*] measured worst-case frame time: %luμs\n", (unsigned long)(worst_frame_ns / 1000));
 
     // Phase 2: attempt SCHED_DEADLINE with measured timing
-    bool is_deadline = enable_deadline_from_measurement(worst_frame_ns, bit_depth, 3);
+    (void)enable_deadline_from_measurement(worst_frame_ns, bit_depth, 3);
 
     // ---- Main display loop ----
     while (scene->do_render) {

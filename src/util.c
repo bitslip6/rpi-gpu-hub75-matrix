@@ -661,9 +661,10 @@ hub75_display_t *hub75_display_parse_args(int argc, char **argv) {
                 }
                 // field 0: font name
                 if (fields[0] && fields[0][0] != '\0') {
-                    strncpy(scene->text_overlay->font_name, fields[0],
+                    const size_t font_len = strnlen(fields[0],
                             sizeof(scene->text_overlay->font_name) - 1);
-                    scene->text_overlay->font_name[sizeof(scene->text_overlay->font_name) - 1] = '\0';
+                    memcpy(scene->text_overlay->font_name, fields[0], font_len);
+                    scene->text_overlay->font_name[font_len] = '\0';
                 }
                 // field 1: weight
                 if (fields[1] && fields[1][0] != '\0') {
@@ -1039,7 +1040,6 @@ int png_write_buffer(const char *path, const image_buffer_t *buffer) {
     png_init_io(png_ptr, fp);
 
     uint8_t color_type = PNG_COLOR_TYPE_RGBA;
-    uint8_t out_bpp = 4;
 
     png_set_IHDR(png_ptr, info_ptr,
                  (png_uint_32)buffer->dimensions.x,
@@ -1053,7 +1053,7 @@ int png_write_buffer(const char *path, const image_buffer_t *buffer) {
     png_write_info(png_ptr, info_ptr);
 
     for (int y = 0; y < buffer->dimensions.y; ++y) {
-        const png_bytep row = (const png_bytep)((uint8_t*)buffer->data + y * buffer->row_stride);
+        const png_bytep row = (uint8_t*)buffer->data + (size_t)y * buffer->row_stride;
         png_write_row(png_ptr, row);
     }
 
@@ -1788,6 +1788,7 @@ void usage(__attribute__((unused))int argc, char **argv) {
         "                       (e.g. roboto:1.2:80ff80:004080:0.15) outline_width 0.0-1.0, default 0.1\n"
         "     -R <speed>        text scroll speed in pixels/sec   (default 128, 0=static)\n"
         "     -? -h             this help\n"
+        "     NOTE: Pi 5 users can run 'sudo ./configure-system.py' for better display response (persistent; --restore to undo).\n"
         "     NOTE: if runing as root, it will automatically use the real-time scheduler which reduces flicker\n"
         , argv[0], SERVER_PORT);
 }

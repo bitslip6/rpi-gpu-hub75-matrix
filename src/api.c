@@ -212,18 +212,6 @@ static inline void camera_frustum_corners_ws(const camera_t *cam, vec3 out8[8]){
 #ifdef HAVE_LIBPNG
 static bool write_shadowmap_png(const char *filename, const ShadowMap *SM) {
     if (!SM || !SM->depth || SM->w <= 0 || SM->h <= 0) return false;
-    /* Compute auto-contrast range over valid samples (z < 1e8) */
-    int total = SM->w * SM->h;
-    int valid = 0;
-    float zmin = 1e9f, zmax = -1e9f;
-    for (int i = 0; i < total; ++i) {
-        float z = SM->depth[i];
-        if (z < 1e8f) {
-            valid++;
-            if (z < zmin) zmin = z;
-            if (z > zmax) zmax = z;
-        }
-    }
     FILE *fp = fopen(filename, "wb");
     if (!fp) return false;
     png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
@@ -240,6 +228,18 @@ static bool write_shadowmap_png(const char *filename, const ShadowMap *SM) {
     png_write_info(png_ptr, info_ptr);
     uint8_t *row = (uint8_t*)malloc((size_t)SM->w);
     if (!row) { png_destroy_write_struct(&png_ptr, &info_ptr); fclose(fp); return false; }
+    /* Compute after setjmp so these locals cannot be clobbered by longjmp. */
+    int total = SM->w * SM->h;
+    int valid = 0;
+    float zmin = 1e9f, zmax = -1e9f;
+    for (int i = 0; i < total; ++i) {
+        float z = SM->depth[i];
+        if (z < 1e8f) {
+            valid++;
+            if (z < zmin) zmin = z;
+            if (z > zmax) zmax = z;
+        }
+    }
     const bool use_autorange = (valid > 0 && zmax > zmin);
     /* Optional clamp to NDC range for visualization */
     const float vis_min = -1.0f, vis_max = 1.0f;
@@ -249,16 +249,19 @@ static bool write_shadowmap_png(const char *filename, const ShadowMap *SM) {
             float v = 1.0f;
             if (z < 1e8f) {
                 /* Clamp for display, then map */
-                if (z < vis_min) z = vis_min; if (z > vis_max) z = vis_max;
+                if (z < vis_min) z = vis_min;
+                if (z > vis_max) z = vis_max;
                 if (use_autorange) {
                     /* Auto-contrast to [0,1]; invert so closer-to-light appears brighter */
                     float t = (z - zmin) / (zmax - zmin);
-                    if (t < 0.f) t = 0.f; if (t > 1.f) t = 1.f;
+                    if (t < 0.f) t = 0.f;
+                    if (t > 1.f) t = 1.f;
                     v = 1.0f - t;
                 } else {
                     /* Fallback to fixed mapping [-1,1] -> [0,1] */
                     v = 1.0f - (z * 0.5f + 0.5f);
-                    if (v < 0.f) v = 0.f; if (v > 1.f) v = 1.f;
+                    if (v < 0.f) v = 0.f;
+                    if (v > 1.f) v = 1.f;
                 }
             } else {
                 /* Unwritten -> pure white */
@@ -389,78 +392,6 @@ static float sample_shadow_visibility(uint16_t li, vec3 v_world) {
     return (z_ndc > map_z + SM->z_bias) ? 0.0f : 1.0f;
     }
     return 1.0f;
-}
-
-/* Compute shaded color for a face using face normal + centroid shadow test (matches prior behavior) */
-static RGB compute_face_shaded_color(size_t face_index,
-                                     const object_t *obj,
-                                     const scene3d_lighting_t *lighting,
-                                     const mat4 M_model,
-                                     const float N3[9]){
-    RGB base_rgb = (face_index < obj->edge_colors->length) ? obj->edge_colors->list[face_index] : (RGB){255,255,255};
-    if (!lighting) return base_rgb;
-
-    vec3 n_obj = (obj->normals && face_index < obj->normals->length) ? obj->normals->list[face_index] : (vec3){0,0,1};
-    vec3 n_world = mat3_mul_vec3(N3, n_obj);
-    float n_len = sqrtf(n_world.x*n_world.x + n_world.y*n_world.y + n_world.z*n_world.z);
-    if (n_len > 1e-6f) { n_world.x/=n_len; n_world.y/=n_len; n_world.z/=n_len; }
-
-    float br = base_rgb.r/255.0f, bg = base_rgb.g/255.0f, bb = base_rgb.b/255.0f;
-    float lr = lighting->ambient.r, lg = lighting->ambient.g, lb = lighting->ambient.b;
-
-    /* World-space centroid for shadow test */
-    vec3 face = obj->faces->list[face_index];
-    vec3 v0w = cm_m4_mul_point3(M_model, obj->verticies->list[(uint16_t)face.x]);
-    vec3 v1w = cm_m4_mul_point3(M_model, obj->verticies->list[(uint16_t)face.y]);
-    vec3 v2w = cm_m4_mul_point3(M_model, obj->verticies->list[(uint16_t)face.z]);
-    vec3 cw = { (v0w.x+v1w.x+v2w.x)/3.0f, (v0w.y+v1w.y+v2w.y)/3.0f, (v0w.z+v1w.z+v2w.z)/3.0f };
-
-    for (uint16_t li = 0; li < lighting->num_lights; ++li) {
-        const light_t *L = &lighting->lights[li];
-        if (L->intensity <= 0.0f) continue;
-        if (L->type == LIGHT_DIRECTIONAL) {
-            float Lx = -L->direction.x, Ly = -L->direction.y, Lz = -L->direction.z;
-            float Llen = sqrtf(Lx*Lx + Ly*Ly + Lz*Lz);
-            if (Llen > 1e-6f) { Lx/=Llen; Ly/=Llen; Lz/=Llen; }
-            float ndotl = n_world.x*Lx + n_world.y*Ly + n_world.z*Lz;
-            if (ndotl > 0.0f) {
-                float vis = 1.0f;
-                if (!tls_use_pixel_shadows && tls_shadow_maps && li < tls_shadow_count && obj->shadow_enabled && L->casts_shadows && L->shadow_enabled) {
-                    ShadowMap *SM = &tls_shadow_maps[li];
-                    if (SM && SM->valid && SM->depth) {
-                        vec4 cclip = cm_m4_mul_point4(SM->VP, cw);
-                        float invw = (fabsf(cclip.w) > 1e-6f) ? (1.0f / cclip.w) : 1.0f;
-                        float x_ndc = cclip.x * invw;
-                        float y_ndc = cclip.y * invw;
-                        float z_ndc = cclip.z * invw;
-                        int sx = (int)((x_ndc * 0.5f + 0.5f) * (float)(SM->w - 1) + 0.5f);
-                        int sy = (int)((y_ndc * 0.5f + 0.5f) * (float)(SM->h - 1) + 0.5f);
-                        if ((unsigned)sx < (unsigned)SM->w && (unsigned)sy < (unsigned)SM->h) {
-                            size_t sidx = (size_t)sy * (size_t)SM->w + (size_t)sx;
-                            float map_z = SM->depth[sidx];
-                            if (z_ndc > map_z + SM->z_bias) {
-                                vis = 0.0f;
-                            }
-                        }
-                    }
-                }
-                if (vis > 0.0f) {
-                    lr += L->color.r * L->intensity * ndotl;
-                    lg += L->color.g * L->intensity * ndotl;
-                    lb += L->color.b * L->intensity * ndotl;
-                }
-            }
-        }
-    }
-
-    float cr = fminf(fmaxf(br * lr, 0.0f), 1.0f);
-    float cg = fminf(fmaxf(bg * lg, 0.0f), 1.0f);
-    float cb = fminf(fmaxf(bb * lb, 0.0f), 1.0f);
-    RGB shaded_rgb;
-    shaded_rgb.r = (uint8_t)(cr * 255.0f);
-    shaded_rgb.g = (uint8_t)(cg * 255.0f);
-    shaded_rgb.b = (uint8_t)(cb * 255.0f);
-    return shaded_rgb;
 }
 
 /* Compute shaded color for a vertex using its world-space position and normal */
@@ -1648,15 +1579,6 @@ void api_geo_render_wire(const camera_t *cam, object_t *obj, const transform_t *
     if (front_face) free(front_face);
 }
 
-
-/* qsort comparator: sort by depth descending (far to near) */
-static int _cmp_trifill_desc(const void *a, const void *b) {
-    const _TriFill *ta = (const _TriFill*)a;
-    const _TriFill *tb = (const _TriFill*)b;
-    if (ta->depth < tb->depth) return 1;   /* b before a */
-    if (ta->depth > tb->depth) return -1;  /* a before b */
-    return 0;
-}
 
 void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t *obj_xform, const scene3d_lighting_t *lighting) {
     if (!tls_scene || !cam || !obj || !obj_xform || !obj->faces || !obj->verticies) {

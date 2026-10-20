@@ -140,15 +140,8 @@ static void *render_text_sdf(void *arg) {
 
     this_time = 0.0f;
 
-    api.sdf_text_render(txt, (uint8_t*)text_image->data, txt->dimensions.x, txt->dimensions.y, text_image->row_stride, 0.9529411f);
+    api.sdf_text_render(txt, (uint8_t*)text_image->data, txt->dimensions.x, txt->dimensions.y, (int)text_image->row_stride, 0.9529411f);
     png_write_buffer("text_buffer2.png", text_image);
-
-    image_buffer_t panel;
-    panel.data = scene->frame_buffer.data;
-    panel.dimensions.x = scene->frame_buffer.dimensions.x;
-    panel.dimensions.y = scene->frame_buffer.dimensions.y;
-    panel.row_stride = scene->frame_buffer.row_stride;
-
 
     vec4 dst_rect = { 0, 16, scene->width, (float)MIN(scene->height, txt->dimensions.y) };
     vec4 src_rect = { 0, 0, 0, (float)txt->dimensions.y};

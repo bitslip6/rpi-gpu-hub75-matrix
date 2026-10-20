@@ -296,6 +296,59 @@ test-sampler: tests/test_sampler
 	@echo "[RUN] $<"
 	$(Q)./tests/test_sampler
 
+# Pin-free RIO ownership tests: no display library, GPU/FFmpeg, or ARM-only flags.
+.PHONY: test-rio-scan
+RIO_SCAN_TEST_CFLAGS ?= $(STD_FLAGS) $(OPT_FLAGS) $(WARN_FLAGS) -pthread -Iinclude $(EXTRA_CFLAGS)
+
+$(BUILDDIR)/test_rio_scan: tests/unit/test_rio_scan.c src/rio_scan.c include/rio_scan.h | $(BUILDDIR)
+	@echo "[CC ] $@ (pin-free)"
+	$(Q)$(CC) $(RIO_SCAN_TEST_CFLAGS) -o $@ tests/unit/test_rio_scan.c src/rio_scan.c
+
+test-rio-scan: $(BUILDDIR)/test_rio_scan
+	@echo "[RUN] $< (no GPIO access)"
+	$(Q)./$<
+
+# Standalone RIO scope benchmark. Build only; GPIO requires explicit opt-in.
+.PHONY: rio-scope test-rio-scope test-rio-isolate test-rio-environment test-configure-system
+
+$(BUILDDIR)/rio_scope: tests/rio_scope.c tests/rio_scope_io.h tests/rio_scope_lock.h src/rio_scan.c include/rio_scan.h | $(BUILDDIR)
+	@echo "[CC ] $@ (safe RAM backend by default)"
+	$(Q)$(CC) $(RIO_SCAN_TEST_CFLAGS) -Itests -o $@ tests/rio_scope.c src/rio_scan.c
+
+rio-scope: $(BUILDDIR)/rio_scope
+	@echo "Safe RAM smoke test: ./$< --cycles 3"
+	@echo "Read tests/README-rio-scope.md before any --output run."
+
+$(BUILDDIR)/test_rio_scope_io: tests/unit/test_rio_scope_io.c tests/rio_scope_io.h | $(BUILDDIR)
+	@echo "[CC ] $@ (pin-free MMIO trace model)"
+	$(Q)$(CC) $(RIO_SCAN_TEST_CFLAGS) -Itests -o $@ tests/unit/test_rio_scope_io.c
+
+$(BUILDDIR)/test_rio_scope_setup: tests/unit/test_rio_scope_setup.c tests/rio_scope.c tests/rio_scope_io.h tests/rio_scope_lock.h src/rio_scan.c include/rio_scan.h | $(BUILDDIR)
+	@echo "[CC ] $@ (pin-free setup/cleanup model)"
+	$(Q)$(CC) $(RIO_SCAN_TEST_CFLAGS) -Itests -o $@ tests/unit/test_rio_scope_setup.c src/rio_scan.c
+
+$(BUILDDIR)/test_rio_scope_lock: tests/unit/test_rio_scope_lock.c tests/rio_scope_lock.h | $(BUILDDIR)
+	@echo "[CC ] $@ (temporary-file advisory-lock test; no GPIO)"
+	$(Q)$(CC) $(RIO_SCAN_TEST_CFLAGS) -Itests -o $@ tests/unit/test_rio_scope_lock.c
+
+test-rio-scope: test-configure-system $(BUILDDIR)/test_rio_scope_io $(BUILDDIR)/test_rio_scope_setup $(BUILDDIR)/test_rio_scope_lock $(BUILDDIR)/rio_scope
+	$(Q)./$(BUILDDIR)/test_rio_scope_io
+	$(Q)./$(BUILDDIR)/test_rio_scope_setup
+	$(Q)./$(BUILDDIR)/test_rio_scope_lock
+	$(Q)RIO_SCOPE_EXE=$(abspath $(BUILDDIR)/rio_scope) python3 -m unittest discover -s tests/unit -p 'test_rio*.py' -v
+
+test-rio-isolate:
+	@echo "[RUN] isolation tests (temporary filesystem/fake affinities; no host tuning)"
+	$(Q)python3 -m unittest discover -s tests/unit -p 'test_rio_isolate.py' -v
+
+test-rio-environment:
+	@echo "[RUN] boot/runtime controller tests (temporary files/fake affinities; no host tuning)"
+	$(Q)python3 -m unittest discover -s tests/unit -p 'test_rio_environment.py' -v
+
+test-configure-system:
+	@echo "[RUN] persistent system setup tests (fake systemd/affinities and temporary files only)"
+	$(Q)python3 -m unittest discover -s tests/unit -p 'test_configure_system.py' -v
+
 # Standalone RP1 PIO hardware-DMA throughput benchmark (does not drive GPIO).
 $(BUILDDIR)/pio_dma_bench: tests/pio_dma_bench.c | $(BUILDDIR)
 	@echo "[CC ] $@"

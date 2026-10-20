@@ -906,49 +906,6 @@ void cleanup_gpu_context(gpu_context_t *ctx)
     free(ctx);
 }
 
-static image_buffer_t *text_render_sdf(char *sdf_path, char *msg, float size_px, RGBA color, float weight, float outline_width, RGBA outline_color) {
-
-    // Configure font: load and scale to 64px line height 
-    sdf_font_t *font = sdf_font_load_scaled(sdf_path, 64.0f);
-    if (!font) {
-        fprintf(stderr, "[TEXT] Failed to load SDF font from '%s' (expect metrics.csv + PNGs).\n", sdf_path);
-        return NULL;
-    }
-
-    // Create text object
-    //const char msg[] = "Hello, HUB75 SDF Scroller!  ";
-    sdf_text_t *txt = sdf_text_create(font, msg);
-    txt->size_px = size_px;
-    txt->color = color;
-    txt->alpha = 254;
-    txt->y = 2.0f;
-    txt->x = 0.0f;
-    txt->dir_x = -1.0f;
-    txt->dir_y = 0.0f;
-    txt->speed = 255.0f;
-    txt->softness = 0.09f;
-    txt->effects.weight         = weight;
-    // txt->effects.glow_color     = (RGBA){192, 232, 245, 255};
-    // txt->effects.glow_radius    = Normal_clamp(1.0f);
-    txt->effects.outline_width  = Normal_clamp(outline_width); // set >0 to enable outline
-    txt->effects.outline_color  = outline_color;
-    txt->effects.outline_smooth = Normal_clamp(0.1f);
-    txt->valign = SDF_VALIGN_BASELINE;
-
-    sdf_text_update(txt, 64);
-    image_buffer_t *image = image_buffer_new(txt->dimensions.x, txt->dimensions.y);
-
-    sdf_text_render(txt, (uint8_t*)image->data, txt->dimensions.x, txt->dimensions.y, image->row_stride, 0.0f);
-
-    /* Cleanup */
-    sdf_text_destroy(txt);
-    sdf_font_free(font);
-    return image;
-}
-
-
-
-
 // ---------- full renderer ----------
 /**
  * @brief Primary rendering function that sets up DRM/GBM and EGL/GL contexts, compiles
@@ -1074,7 +1031,7 @@ void *main_render_shader(void *arg)
 
             text_image = image_buffer_new(txt->dimensions.x, txt->dimensions.y);
             sdf_text_render(txt, (uint8_t*)text_image->data,
-                txt->dimensions.x, txt->dimensions.y, text_image->row_stride, 0.0f);
+                txt->dimensions.x, txt->dimensions.y, (int)text_image->row_stride, 0.0f);
 
             // Check if any non-zero pixels were rendered
             uint32_t nonzero = 0;
@@ -1170,7 +1127,7 @@ void *main_render_shader(void *arg)
 
                         txt->y = 0;
                         sdf_text_render(txt, (uint8_t*)text_image->data, new_w, new_h,
-                                        text_image->row_stride, 0.0f);
+                                        (int)text_image->row_stride, 0.0f);
                         scroll_wrap_mod = (float)(scene->width + text_image->dimensions.x) / scroll_speed;
                         scroll_time_offset = this_time;  // reset scroll origin to now
                         wrap_time = 0.0f;
