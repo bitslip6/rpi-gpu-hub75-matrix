@@ -12,6 +12,8 @@
 #include <sys/param.h>
 #include <gbm.h>
 #include <fcntl.h>
+#include <errno.h>
+#include <poll.h>
 #include <unistd.h>
 #include <time.h>
 #include <string.h>
@@ -42,28 +44,121 @@
 
 /* Image loading is handled by util.c (image_read_rgba8) which supports PNG and JPEG */
 
-/**
- * Read next record from stdin, delimited by blank line or EOF.
- * Returns malloc'd string (caller frees), or NULL on EOF.
- * Newlines within the record are replaced with spaces.
- */
-static char *read_stdin_record(void) {
+typedef struct {
+    const text_overlay_t *overlay;
+    int32_t display_width;
+    spsc_semring_t *queue; /* Owns image pointers until the renderer dequeues them. */
+    atomic_bool stop;
+} stdin_text_worker_t;
+
+typedef struct {
+    unsigned char data[4096];
+    size_t pos, len;
+} stdin_text_reader_t;
+
+/* Only the worker reads stdin. Polling keeps shutdown interruptible, including
+ * when the producer leaves a partial line in an otherwise idle pipe. */
+static int stdin_text_getc(stdin_text_worker_t *worker, stdin_text_reader_t *reader) {
+    while (reader->pos == reader->len) {
+        if (atomic_load(&worker->stop)) return -1;
+        struct pollfd fd = {.fd = STDIN_FILENO, .events = POLLIN};
+        int ready = poll(&fd, 1, 100);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (ready == 0) continue;
+        if (fd.revents & POLLNVAL) return -1;
+        ssize_t n = read(STDIN_FILENO, reader->data, sizeof(reader->data));
+        if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        if (n <= 0) return -1;
+        reader->pos = 0;
+        reader->len = (size_t)n;
+    }
+    return reader->data[reader->pos++];
+}
+
+/* Preserve blank-line/EOF records and flatten newlines to spaces. */
+static char *read_stdin_record(stdin_text_worker_t *worker, stdin_text_reader_t *reader) {
     char *buf = NULL;
     size_t total = 0;
     char line[1024];
-    while (fgets(line, sizeof(line), stdin)) {
-        if (line[0] == '\n' || (line[0] == '\r' && line[1] == '\n')) {
-            if (total > 0) break; // end of record
-            continue;             // skip leading blank lines
+    while (!atomic_load(&worker->stop)) {
+        size_t len = 0;
+        int ch;
+        while (len < sizeof(line) - 1 && (ch = stdin_text_getc(worker, reader)) >= 0) {
+            line[len++] = (char)ch;
+            if (ch == '\n') break;
         }
-        size_t len = strlen(line);
-        if (len > 0 && line[len-1] == '\n') line[len-1] = ' ';
-        buf = realloc(buf, total + len + 1);
+        if (len == 0) break;
+        if (line[0] == '\n' || (len == 2 && line[0] == '\r' && line[1] == '\n')) {
+            if (total > 0) break;
+            continue;
+        }
+        if (line[len-1] == '\n') line[len-1] = ' ';
+        char *next = realloc(buf, total + len + 1);
+        if (!next) { free(buf); return NULL; }
+        buf = next;
         memcpy(buf + total, line, len);
         total += len;
     }
+    if (atomic_load(&worker->stop)) { free(buf); return NULL; }
     if (buf) buf[total] = '\0';
     return buf;
+}
+
+static image_buffer_t *render_overlay_text(sdf_font_t *font, const text_overlay_t *overlay,
+                                          const char *text, int32_t display_width) {
+    sdf_text_t *txt = sdf_text_create(font, text);
+    if (!txt) return NULL;
+    txt->size_px = overlay->font_size;
+    txt->color = overlay->color;
+    txt->alpha = 254;
+    txt->x = txt->y = 0.0f;
+    txt->dir_x = txt->dir_y = 0.0f;
+    txt->speed = 0.0f;
+    txt->softness = 0.09f;
+    txt->effects.weight = overlay->weight;
+    txt->effects.outline_color = overlay->outline_color;
+    txt->effects.outline_width = Normal_clamp(overlay->outline_width);
+    txt->valign = SDF_VALIGN_BASELINE;
+    sdf_text_update(txt, display_width);
+
+    image_buffer_t *image = image_buffer_new(txt->dimensions.x, txt->dimensions.y);
+    if (image) {
+        sdf_text_render(txt, (uint8_t*)image->data, image->dimensions.x,
+                        image->dimensions.y, (int)image->row_stride, 0.0f);
+    }
+    sdf_text_destroy(txt);
+    return image;
+}
+
+static void *stdin_text_worker(void *arg) {
+    stdin_text_worker_t *worker = arg;
+    char font_path[128];
+    snprintf(font_path, sizeof(font_path), "assets/%s", worker->overlay->font_name);
+    sdf_font_t *font = sdf_font_load_scaled(font_path, worker->overlay->font_size);
+    if (!font) return NULL;
+
+    stdin_text_reader_t reader = {0};
+    while (!atomic_load(&worker->stop)) {
+        char *record = read_stdin_record(worker, &reader);
+        if (!record) break;
+        image_buffer_t *image = render_overlay_text(font, worker->overlay, record,
+                                                     worker->display_width);
+        free(record);
+        if (!image) break;
+
+        image_buffer_t **slot = NULL;
+        while (!atomic_load(&worker->stop) && !slot) {
+            slot = spsc_push_ptr_begin(worker->queue, 100);
+        }
+        if (!slot) { free(image); break; }
+        *slot = image;
+        spsc_push_ptr_commit(worker->queue);
+    }
+    sdf_font_free(font);
+    return NULL;
 }
 
 /*
@@ -995,64 +1090,40 @@ void *main_render_shader(void *arg)
     // Text overlay: only set up if CLI provided -e
     image_buffer_t *text_image = NULL;
     sdf_font_t *text_font = NULL;
-    sdf_text_t *txt = NULL;
     float scroll_speed = (scene->text_overlay) ? scene->text_overlay->scroll_speed : 128.0f;
     float scroll_wrap_mod = 0.0f;
-    // If stdin_text mode, read the first record from stdin
-    if (scene->text_overlay && scene->text_overlay->stdin_text && !scene->text_overlay->text) {
-        char *first = read_stdin_record();
-        if (first) {
-            scene->text_overlay->text = first;
+    stdin_text_worker_t text_worker = {
+        .overlay = scene->text_overlay,
+        .display_width = scene->width
+    };
+    atomic_init(&text_worker.stop, false);
+    pthread_t text_thread;
+    bool text_worker_started = false;
+    if (scene->text_overlay && scene->text_overlay->stdin_text) {
+        text_worker.queue = spsc_create(2, sizeof(image_buffer_t*));
+        if (text_worker.queue) {
+            text_worker_started = pthread_create(&text_thread, NULL, stdin_text_worker, &text_worker) == 0;
+            if (!text_worker_started) {
+                spsc_destroy(text_worker.queue);
+                text_worker.queue = NULL;
+            }
         }
-    }
-    if (scene->text_overlay && scene->text_overlay->text) {
+        if (!text_worker_started) debug("[TEXT] Failed to start stdin text worker\n");
+    } else if (scene->text_overlay && scene->text_overlay->text) {
         char font_path[128];
         snprintf(font_path, sizeof(font_path), "assets/%s", scene->text_overlay->font_name);
         text_font = sdf_font_load_scaled(font_path, scene->text_overlay->font_size);
         if (text_font) {
-            txt = sdf_text_create(text_font, scene->text_overlay->text);
-            txt->size_px = scene->text_overlay->font_size;
-            txt->color = scene->text_overlay->color;
-            txt->alpha = 254;
-            txt->x = 0.0f;
-            txt->y = 0.0f;
-            txt->dir_x = 0.0f;
-            txt->dir_y = 0.0f;
-            txt->speed = 0.0f;
-            txt->softness = 0.09f;
-            txt->effects.weight = scene->text_overlay->weight;
-            txt->effects.outline_color = scene->text_overlay->outline_color;
-            txt->effects.outline_width = Normal_clamp(scene->text_overlay->outline_width);
-            txt->valign = SDF_VALIGN_BASELINE;
-
-            sdf_text_update(txt, scene->width);
-
-            //fprintf(stderr, "[TEXT-DBG] txt after update: x=%.1f y=%.1f x0=%.1f y0=%.1f speed=%.1f dir=(%.1f,%.1f) dims=%dx%d wrap_mod=%.3f\n", txt->x, txt->y, txt->x0, txt->y0, txt->speed, txt->dir_x, txt->dir_y, txt->dimensions.x, txt->dimensions.y, txt->wrap_mod);
-
-            text_image = image_buffer_new(txt->dimensions.x, txt->dimensions.y);
-            sdf_text_render(txt, (uint8_t*)text_image->data,
-                txt->dimensions.x, txt->dimensions.y, (int)text_image->row_stride, 0.0f);
-
-            // Check if any non-zero pixels were rendered
-            uint32_t nonzero = 0;
-            for (int i = 0; i < txt->dimensions.x * txt->dimensions.y; i++) {
-                uint32_t px = ((uint32_t*)text_image->data)[i];
-                if (px != 0) nonzero++;
+            text_image = render_overlay_text(text_font, scene->text_overlay,
+                                             scene->text_overlay->text, scene->width);
+            if (text_image) {
+                scroll_wrap_mod = (float)(scene->width + text_image->dimensions.x) / scroll_speed;
             }
-            // fprintf(stderr, "[TEXT-DBG] text_image %dx%d, non-zero pixels: %u / %d\n", text_image->dimensions.x, text_image->dimensions.y, nonzero, txt->dimensions.x * txt->dimensions.y);
-
-            // Scrolling: text enters from right, exits left, then wraps
-            // Use text_image dimensions (allocation size) not txt->dimensions
-            // (which sdf_text_render may have shrunk to actual rendered bounds)
-            scroll_wrap_mod = (float)(scene->width + text_image->dimensions.x) / scroll_speed;
-            // fprintf(stderr, "[TEXT-DBG] scroll_speed=%.1f scroll_wrap_mod=%.3f\n", scroll_speed, scroll_wrap_mod);
         }
     }
 
     float this_time = 0.0f;
     float scroll_time_offset = 0.0f;  // subtracted from this_time to reset scroll on text cycle
-    float prev_wrap_time = 0.0f;
-    int dbg_frame = 0;
 
     // main loop
     while (scene->do_render)
@@ -1097,6 +1168,21 @@ void *main_render_shader(void *arg)
                 }
             }
 
+            // Never wait for stdin or rasterize text on the render thread.
+            if (text_worker_started &&
+                (!text_image || this_time - scroll_time_offset >= scroll_wrap_mod)) {
+                image_buffer_t **slot = spsc_pop_ptr_begin(text_worker.queue, 0);
+                if (slot) {
+                    image_buffer_t *next = *slot;
+                    spsc_pop_ptr_commit(text_worker.queue);
+                    free(text_image);
+                    text_image = next;
+                    scroll_wrap_mod = (float)(scene->width + text_image->dimensions.x) / scroll_speed;
+                }
+                // Repeat the current image on underrun or EOF.
+                scroll_time_offset = this_time;
+            }
+
             // Composite text overlay if configured
             if (text_image) {
                 image_buffer_t dst_buffer = {
@@ -1109,32 +1195,6 @@ void *main_render_shader(void *arg)
                 float scroll_time = this_time - scroll_time_offset;
                 float wrap_time = fmodf(scroll_time, scroll_wrap_mod);
 
-                // Detect scroll wrap and cycle to next stdin record
-                if (wrap_time < prev_wrap_time && scene->text_overlay->stdin_text && txt) {
-                    char *new_text = read_stdin_record();
-                    if (new_text) {
-                        sdf_text_set_text(txt, new_text);
-                        sdf_text_update(txt, scene->width);
-
-                        int new_w = txt->dimensions.x;
-                        int new_h = txt->dimensions.y;
-                        if (new_w != text_image->dimensions.x || new_h != text_image->dimensions.y) {
-                            free(text_image);
-                            text_image = image_buffer_new(new_w, new_h);
-                        } else {
-                            memset(text_image->data, 0, (size_t)new_h * text_image->row_stride);
-                        }
-
-                        txt->y = 0;
-                        sdf_text_render(txt, (uint8_t*)text_image->data, new_w, new_h,
-                                        (int)text_image->row_stride, 0.0f);
-                        scroll_wrap_mod = (float)(scene->width + text_image->dimensions.x) / scroll_speed;
-                        scroll_time_offset = this_time;  // reset scroll origin to now
-                        wrap_time = 0.0f;
-                        free(new_text);
-                    }
-                }
-                prev_wrap_time = wrap_time;
                 float xpos = (float)scene->width - scroll_speed * wrap_time;
 
                 // Compute matching src/dst widths so the compositor
@@ -1149,11 +1209,6 @@ void *main_render_shader(void *arg)
                 vec4 dst_rect = {dx0, dy0, dx0 + visible_w, dy1};
                 vec4 src_rect = {sx0, 0.0f, sx0 + visible_w,
                                  (float)text_image->dimensions.y};
-
-                if (dbg_frame < 5 || (dbg_frame % 90 == 0)) {
-                    // fprintf(stderr, "[TEXT-DBG] frame=%d xpos=%.1f visible_w=%.0f dst=(%.0f,%.0f,%.0f,%.0f) src=(%.0f,%.0f,%.0f,%.0f)\n", dbg_frame, xpos, visible_w, dst_rect.x, dst_rect.y, dst_rect.z, dst_rect.w, src_rect.x, src_rect.y, src_rect.z, src_rect.w);
-                }
-                dbg_frame++;
 
                 if (visible_w > 0) {
                     composite_rgba_over_rgba(&dst_buffer, text_image, dst_rect, src_rect);
@@ -1172,9 +1227,18 @@ void *main_render_shader(void *arg)
 
     debug(" ## GPU render thread exiting...\n");
 
-    // cleanup text overlay
+    // Stop the worker before freeing its queue or overlay configuration.
+    if (text_worker_started) {
+        atomic_store(&text_worker.stop, true);
+        pthread_join(text_thread, NULL);
+        image_buffer_t **slot;
+        while ((slot = spsc_pop_ptr_begin(text_worker.queue, 0)) != NULL) {
+            free(*slot);
+            spsc_pop_ptr_commit(text_worker.queue);
+        }
+        spsc_destroy(text_worker.queue);
+    }
     if (text_image) free(text_image);
-    if (txt) sdf_text_destroy(txt);
     if (text_font) sdf_font_free(text_font);
     free(flip_row_buf);
 
