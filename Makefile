@@ -296,6 +296,17 @@ test-sampler: tests/test_sampler
 	@echo "[RUN] $<"
 	$(Q)./tests/test_sampler
 
+# Sine compositor regression test (no GPIO access).
+.PHONY: test-compositor-sine
+$(BUILDDIR)/test_compositor_sine: tests/unit/test_compositor_sine.c $(LIB_NO_GPU) include/compositor.h
+	@echo "[CC ] $@"
+	$(Q)$(CC) $(CFLAGS) -L. -Wl,-rpath,'$$ORIGIN/../..' -o $@ $< \
+		-l$(LIB_BASENAME)$(VARIANT_SUFFIX) $(LDLIBS_COMMON) $(LDLIBS_PNG) $(LDLIBS_JPEG)
+
+test-compositor-sine: $(BUILDDIR)/test_compositor_sine
+	@echo "[RUN] $< (no GPIO access)"
+	$(Q)./$<
+
 # Pin-free RIO ownership tests: no display library, GPU/FFmpeg, or ARM-only flags.
 .PHONY: test-rio-scan
 RIO_SCAN_TEST_CFLAGS ?= $(STD_FLAGS) $(OPT_FLAGS) $(WARN_FLAGS) -pthread -Iinclude $(EXTRA_CFLAGS)

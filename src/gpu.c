@@ -1211,7 +1211,15 @@ void *main_render_shader(void *arg)
                                  (float)text_image->dimensions.y};
 
                 if (visible_w > 0) {
-                    composite_rgba_over_rgba(&dst_buffer, text_image, dst_rect, src_rect);
+                    if (scene->text_overlay->sine_scroll) {
+                        // Use elapsed time, not the per-message scroll phase.
+                        composite_rgba_sine_over_rgba(&dst_buffer, text_image, xpos, dy0,
+                            scene->text_overlay->sine_frequency,
+                            scene->text_overlay->sine_amplitude,
+                            this_time * scene->text_overlay->sine_offset_speed);
+                    } else {
+                        composite_rgba_over_rgba(&dst_buffer, text_image, dst_rect, src_rect);
+                    }
                 }
             }
 

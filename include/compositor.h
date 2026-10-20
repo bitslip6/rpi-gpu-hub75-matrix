@@ -39,5 +39,15 @@ void composite_rgba_over_rgba(image_buffer_t       *dst,
                                const vec4                  dst_quad,
                                const vec4                  src_quad);
 
+/**
+ * @brief Composite a 1:1 translated source with a vertical sine displacement.
+ * Only visible columns are sampled; no scratch image is needed. Frequency is
+ * complete waves across the destination width, independent of source length;
+ * amplitude is in pixels. x/y are the unshifted origin and phase is in radians.
+ * Pixels outside the source are transparent; clipping is to the destination.
+ */
+void composite_rgba_sine_over_rgba(image_buffer_t *dst, const image_buffer_t *src,
+                                   float x, float y, float frequency, float amplitude,
+                                   float phase);
 
 #endif // COMPOSITOR_H

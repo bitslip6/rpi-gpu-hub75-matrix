@@ -233,6 +233,10 @@ typedef struct text_overlay_t {
     float outline_width;   // outline width (0.0=none, 0.1=default, 0.0-1.0)
     float scroll_speed;    // pixels per second for text scrolling (0=static)
     bool  stdin_text;      // true when -e - was specified (read records from stdin)
+    bool  sine_scroll;     // vertically deform the scrolling overlay with a sine wave
+    float sine_frequency;  // complete waves across the display width
+    float sine_amplitude;  // vertical displacement in pixels
+    float sine_offset_speed; // wave phase speed in radians per second (signed)
 } text_overlay_t;
 
 // self referencing function pointers need this defined first

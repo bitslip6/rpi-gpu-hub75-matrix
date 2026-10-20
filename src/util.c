@@ -421,7 +421,7 @@ hub75_display_t *hub75_display_parse_args(int argc, char **argv) {
     // Parse command-line options
     int opt = 0;
     int num_scales = 0;
-    while ((opt = getopt(argc, argv, "S:O:T:P:o:x:y:X:Y:s:f:p:c:g:d:m:b:a:t:l:i:e:E:k:F:R:jzvqh?")) != -1) {
+    while ((opt = getopt(argc, argv, "S:O:T:P:o:x:y:X:Y:s:f:p:c:g:d:m:b:a:t:l:i:e:E:k:F:R:W:jzvqh?")) != -1) {
         switch (opt) {
         case 'r':
             scene->rising_edge = false;
@@ -587,6 +587,7 @@ hub75_display_t *hub75_display_parse_args(int argc, char **argv) {
             break;
 
         case 'e':
+        case 'W':
             if (!scene->text_overlay) {
                 scene->text_overlay = calloc(1, sizeof(text_overlay_t));
                 scene->text_overlay->font_size = 64.0f;
@@ -597,6 +598,28 @@ hub75_display_t *hub75_display_parse_args(int argc, char **argv) {
                 scene->text_overlay->outline_color = (RGBA){0, 0, 0, 255};
                 scene->text_overlay->outline_width = 0.1f;
                 scene->text_overlay->scroll_speed = 128.0f;
+            }
+            if (opt == 'W') {
+                float values[3];
+                const char *p = optarg;
+                for (int i = 0; i < 3; ++i) {
+                    char *end;
+                    errno = 0;
+                    values[i] = strtof(p, &end);
+                    // Check IEEE float bits: isfinite() is optimized away under -ffast-math.
+                    uint32_t bits;
+                    memcpy(&bits, &values[i], sizeof(bits));
+                    if (end == p || errno == ERANGE || (bits & 0x7f800000u) == 0x7f800000u ||
+                        (i < 2 ? *end != ':' : *end != '\0')) {
+                        die("Invalid -W value: expected frequency:amplitude:offset_speed (finite numbers)\n");
+                    }
+                    p = end + 1;
+                }
+                scene->text_overlay->sine_frequency = values[0];
+                scene->text_overlay->sine_amplitude = values[1];
+                scene->text_overlay->sine_offset_speed = values[2];
+                scene->text_overlay->sine_scroll = true;
+                break;
             }
             if (strcmp(optarg, "-") == 0) {
                 scene->text_overlay->stdin_text = true;
@@ -1787,6 +1810,9 @@ void usage(__attribute__((unused))int argc, char **argv) {
         "     -F <f:w:c:o:ow>  text font:weight:color:outline_color:outline_width\n"
         "                       (e.g. roboto:1.2:80ff80:004080:0.15) outline_width 0.0-1.0, default 0.1\n"
         "     -R <speed>        text scroll speed in pixels/sec   (default 128, 0=static)\n"
+        "     -W <f:a:s>        sine overlay frequency:amplitude:offset_speed (e.g. 2:24.5:1)\n"
+        "                       waves across display : pixels : radians/sec (0 freezes, negative reverses)\n"
+        "                       -k sets the unshifted top edge; leave room above and below\n"
         "     -? -h             this help\n"
         "     NOTE: Pi 5 users can run 'sudo ./configure-system.py' for better display response (persistent; --restore to undo).\n"
         "     NOTE: if runing as root, it will automatically use the real-time scheduler which reduces flicker\n"

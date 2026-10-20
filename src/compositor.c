@@ -178,3 +178,45 @@ void composite_rgba_over_rgba(image_buffer_t       *dst,
         }
     }
 }
+
+/* 1:1 sine-scroller blit: calculate the wave once per visible column and
+ * inverse-map destination pixels into the unchanged, cached text image. */
+void composite_rgba_sine_over_rgba(image_buffer_t *dst, const image_buffer_t *src,
+                                   float x, float y, float frequency, float amplitude,
+                                   float phase) {
+    if (!dst || !src || !dst->data || !src->data ||
+        dst->dimensions.x <= 0 || dst->dimensions.y <= 0 ||
+        src->dimensions.x <= 0 || src->dimensions.y <= 0) {
+        return;
+    }
+
+    const float src_w = (float)src->dimensions.x;
+    const float src_h = (float)src->dimensions.y;
+    const float dst_w = (float)dst->dimensions.x;
+    const float dst_h = (float)dst->dimensions.y;
+    const float wave_step = 2.0f * (float)M_PI * frequency / dst_w;
+    const int32_t x0 = (int32_t)floorf(clampf(x, 0.0f, dst_w));
+    const int32_t x1 = (int32_t)ceilf(clampf(x + src_w, 0.0f, dst_w));
+
+    for (int32_t dx = x0; dx < x1; ++dx) {
+        // The sampler's pixel centers are integer coordinates, so integer
+        // translations preserve source pixels without an extra half-pixel blur.
+        const float sx = (float)dx - x;
+        const float x_coverage = fminf(1.0f, fminf(sx + 1.0f, src_w - sx));
+        const float top = y + amplitude * sinf(((float)dx + 0.5f) * wave_step + phase);
+        const int32_t y0 = (int32_t)floorf(clampf(top, 0.0f, dst_h));
+        const int32_t y1 = (int32_t)ceilf(clampf(top + src_h, 0.0f, dst_h));
+
+        for (int32_t dy = y0; dy < y1; ++dy) {
+            const float sy = (float)dy - top;
+            RGBA sample;
+            sample_rgba_bilinear(&sample, src, sx, sy);
+            // The shared sampler clamps edges. Fade its edge samples against
+            // transparent pixels instead of smearing the first/last row/column.
+            const float y_coverage = fminf(1.0f, fminf(sy + 1.0f, src_h - sy));
+            sample.a = (uint8_t)((float)sample.a * x_coverage * y_coverage);
+            RGBA *pixel = buffer_get_px(dst, dx, dy);
+            composite_rgba(pixel, &sample, pixel);
+        }
+    }
+}
