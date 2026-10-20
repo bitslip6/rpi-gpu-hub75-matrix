@@ -66,6 +66,29 @@ active 3 port boards to ensure proper level translation and to map the address l
 
 
 
+Persistent Pi 5 display-response setup
+------------------------------------
+For a quieter GPIO-emission CPU, stop display/GPIO/PIO applications, keep recovery
+access, then inspect and install the reversible isolation profile:
+
+```sh
+sudo ./configure-system.py --dry-run
+sudo ./configure-system.py
+```
+
+To undo changes owned by this installer:
+
+```sh
+sudo ./configure-system.py --restore
+```
+
+The installer backs up boot arguments, reserves CPU3, masks irqbalance, installs
+root-owned helpers and enables automatic runtime isolation after boot. It never
+drives GPIO, installs a kernel, changes the governor/RT budget or reboots. It
+reports when an operator-controlled reboot is needed. See
+[setup, persistence and recovery details](tests/README-configure-system.md),
+including restoration of a system that was already manually configured.
+
 Glossary
 --------
 ### PWM 
