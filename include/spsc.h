@@ -42,6 +42,8 @@ spsc_semring_t *spsc_create(size_t capacity, size_t item_size_bytes);
 void spsc_destroy(spsc_semring_t *q);
 void *spsc_push_ptr_begin(spsc_semring_t *q, long timeout_ms);
 void spsc_push_ptr_commit(spsc_semring_t *q);
+/* Return exactly one successful, uncommitted producer reservation. */
+void spsc_push_ptr_cancel(spsc_semring_t *q);
 void *spsc_pop_ptr_begin(spsc_semring_t *q, long timeout_ms);
 void spsc_pop_ptr_commit(spsc_semring_t *q);
 

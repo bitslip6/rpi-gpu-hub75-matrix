@@ -13,6 +13,7 @@
 
 #include "rpihub75.h"
 #include "video.h"
+#include "video_fit.h"
 #include "pixels.h"
 #include "util.h"
 
@@ -79,15 +80,21 @@ bool render_video(hub75_display_t *scene, const char *filename) {
 
     // tightly packed RGB24 dest
     size_t tight_row_bytes = scene->width * 3;
-    rgb_tight = av_malloc((size_t)scene->height * tight_row_bytes);
+    rgb_tight = av_mallocz((size_t)scene->height * tight_row_bytes);
     if (!rgb_tight) { FAIL("rgb_tight alloc failed"); }
-    frame_rgb->data[0] = rgb_tight;
+    int output_w, output_h, offset_x, offset_y;
+    AVRational sar = av_guess_sample_aspect_ratio(format_ctx,
+                            format_ctx->streams[video_stream_index], NULL);
+    video_fit(codec_ctx->width, codec_ctx->height, sar.num, sar.den,
+              scene->width, scene->height, scene->video_preserve_aspect,
+              &output_w, &output_h, &offset_x, &offset_y);
+    frame_rgb->data[0] = rgb_tight + (size_t)offset_y * tight_row_bytes + offset_x * 3;
     frame_rgb->linesize[0] = (int)tight_row_bytes;
 
     // scaler
     int sws_flags = SWS_POINT; // or SWS_FAST_BILINEAR
     sws_ctx = sws_getContext(codec_ctx->width, codec_ctx->height, codec_ctx->pix_fmt,
-                             scene->width, scene->height, AV_PIX_FMT_RGB24,
+                             output_w, output_h, AV_PIX_FMT_RGB24,
                              sws_flags, NULL, NULL, NULL);
     if (!sws_ctx) { FAIL("sws_getContext failed"); }
 
@@ -116,7 +123,7 @@ bool render_video(hub75_display_t *scene, const char *filename) {
                           0, codec_ctx->height,
                           frame_rgb->data, frame_rgb->linesize);
 
-                hub75_display_map_image_to_bcm(scene, frame_rgb->data[0]);
+                hub75_display_map_image_to_bcm(scene, rgb_tight);
 
                 // optional: show fps
                 AVRational fr = format_ctx->streams[video_stream_index]->avg_frame_rate;

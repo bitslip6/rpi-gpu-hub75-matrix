@@ -19,7 +19,6 @@
 #include <string.h>
 #include <semaphore.h>
 #if defined(__arm__) || defined(__aarch64__)
-#include <arm_neon.h>
 #endif
 
 #include <stdlib.h>
@@ -191,6 +190,8 @@ const char *shadertoy_header =
     "uniform float iChannelTime[4];\n"
     "uniform sampler2D iChannel0;\n"
     "uniform sampler2D iChannel1;\n"
+    "uniform sampler2D iChannel2;\n"
+    "uniform sampler2D iChannel3;\n"
     "uniform float iTime;\n"
     "uniform float iTimeDelta;\n"
 
@@ -332,7 +333,7 @@ static const glsl_type_zero_t *match_type(const char *p) {
  * @param src  The original shader source (null-terminated).
  * @return     A new malloc'd string with preprocessed source. Caller must free.
  */
-static char *shader_preprocess(const char *src)
+char *h75_shader_preprocess(const char *src)
 {
     size_t src_len = strlen(src);
     // generous allocation: each var might get "=vec4(0)" (~8 chars) added
@@ -544,7 +545,7 @@ static GLuint create_shadertoy_program(char *file)
     }
 
     // preprocess: zero-initialize uninitialized variables for GLES compatibility
-    char *preprocessed = shader_preprocess(src);
+    char *preprocessed = h75_shader_preprocess(src);
     if (preprocessed) {
         SAFE_FREE(src);
         src = preprocessed;

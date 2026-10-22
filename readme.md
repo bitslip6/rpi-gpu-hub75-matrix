@@ -10,7 +10,24 @@ This is loosely based on the work done by hzeller adding HUB75 support to RPI (w
 as well as the work of Harry Fairhead documenting the peripheral address space for rpi5(https://www.i-programmer.info/programming/148-hardware/16887-raspberry-pi-iot-in-c-pi-5-memory-mapped-gpio.html). Also thanks to nothings stb image loader library which is used
 for loading textures for shaders. https://github.com/nothings/stb/blob/master/stb_image.h
 
-If you are a Python programmer and can help create a cython wrapper, there is some work done creating a Python wrapper but Python error messages are cryptic and there are lots of idiosyncrasies that just need the touch of an experienced Python programmer (I have very little python experience). Drop an issue and I'll help you along with the structs and functions that need wraping to implement.
+Python and embedded C runtime (implementation preview)
+------------------------------------------------------
+The typed `hub75gpu` package now provides display/frame contexts, native-owned
+images and draw lists, 3D scenes, SDF text and autonomous native playback. CPU
+installation is the default; GPU/EGL/FFmpeg support is explicitly opt-in. Rendering,
+pacing, queues and GPIO remain in C, with no per-frame Python callback.
+
+See [Python installation/API/migration](python/README.md) and the
+[validation record and remaining release gates](python/VALIDATION.md).
+`python -m hub75gpu` defaults to offscreen operation; GPIO requires explicit
+activation and verified wiring. Import/construction do not activate pins or tune
+the host. The additive C contract is `include/hub75_runtime.h`; `make example-runtime`
+and `./example --runtime` exercise it with safe offscreen defaults. The existing
+legacy CLI remains available.
+
+This preview is not electrical/production qualification: local tests and measured
+benchmarks are pin-free. Hardware timing and the proposed long-duration release
+gates still need deployment validation.
 
 
 shaders/cartoon.glsl
@@ -484,6 +501,7 @@ is required to call hub75_display_run(), and hub75_display_map_image_to_bcm() re
 ```txt
  Usage: ./example
      -s <file>         GPU fragment shader or video file (mp2, mp4, etc) to render
+     -A                Preserve video aspect ratio with centered black bars
      -x <width>        image width              (16-384)
      -y <height>       image height             (16-384)
      -w <width>        panel width              (16/32/64)

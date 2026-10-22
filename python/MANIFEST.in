@@ -1,0 +1,7 @@
+include README.md VALIDATION.md pyproject.toml example.py
+recursive-include hub75gpu *.c *.py *.pyi py.typed
+recursive-include tests *.py
+recursive-include examples *.py
+recursive-include benchmarks *.py *.md *.json
+recursive-include native *.c *.h *.in Makefile detect_flags.sh
+prune hub75gpu/.libs

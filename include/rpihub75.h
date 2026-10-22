@@ -291,5 +291,6 @@ void *hub75_display_run(const hub75_display_t *scene);
  * @brief initialize the hub75gpu library
  */
 void hub75gpu_init();
+uint32_t row_to_address(int y, uint16_t half_height);
 
 #endif

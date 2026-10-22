@@ -78,14 +78,17 @@ void interpolate_rgb(RGB* result, const RGB* start, const RGB* end, const Normal
 
 __attribute__((hot))
 void composite_rgba(RGBA* result, const RGBA* src, const RGBA* dst) {
-    // Standard straight-alpha "over": out = src*alpha + dst*(1 - alpha)
-    const uint8_t inv_a = 255 - src->a;
-    const Normal bg_percent = Normal_clamp((float)((float)inv_a / 255.0f));
-    const Normal fg_percent = Normal_clamp(1.0f - bg_percent);
-    result->r = (uint8_t)(src->r * fg_percent + dst->r * bg_percent);
-    result->g = (uint8_t)(src->g * fg_percent + dst->g * bg_percent);
-    result->b = (uint8_t)(src->b * fg_percent + dst->b * bg_percent);
-    result->a = (uint8_t)((float)src->a + (float)dst->a * bg_percent);
+    /* Straight-alpha source-over, including transparent destinations. Cache
+     * both inputs first because result may alias either input. */
+    const RGBA s = *src, d = *dst;
+    if (s.a == 255) { *result = s; return; }
+    if (s.a == 0) { *result = d; return; }
+    const uint32_t inv = 255u - s.a;
+    const uint32_t alpha = (uint32_t)s.a * 255u + (uint32_t)d.a * inv;
+    result->r = (uint8_t)(((uint32_t)s.r * s.a * 255u + (uint32_t)d.r * d.a * inv) / alpha);
+    result->g = (uint8_t)(((uint32_t)s.g * s.a * 255u + (uint32_t)d.g * d.a * inv) / alpha);
+    result->b = (uint8_t)(((uint32_t)s.b * s.a * 255u + (uint32_t)d.b * d.a * inv) / alpha);
+    result->a = (uint8_t)((alpha + 127u) / 255u);
 }
 
 /**
@@ -167,8 +170,10 @@ void composite_rgba_over_rgba(image_buffer_t       *dst,
             const float v = clampf((dst_fy - dst_quad.y) * inv_dst_quad_h, 0.0f, 1.0f);
 
             /* map normalized coords into src_quad space (sub pixel) */
-            const float sx = src_x0 + u * src_w_over_dst;
-            const float sy = src_y0 + v * src_h_over_dst;
+            /* The sampler uses integer pixel centers. Source rectangles use
+             * edge coordinates, so remove the half-pixel center displacement. */
+            const float sx = src_x0 + u * src_w_over_dst - 0.5f;
+            const float sy = src_y0 + v * src_h_over_dst - 0.5f;
 
             RGBA src_sample;
             sample_rgba_bilinear(&src_sample, src, sx, sy);

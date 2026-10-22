@@ -42,6 +42,7 @@
 #include "pixels.h"
 #include "text_sdf.h"
 #include "compositor.h"
+#include "examples/runtime_demo.h"
 
 
 // --------------- Utility Helpers (example only) -----------------
@@ -214,6 +215,9 @@ static void *render_text_sdf(void *arg) {
 
 // --------------- Main Entry Point --------------------------------
 int main(int argc, char **argv) {
+    /* Additive safe-runtime path; legacy CLI behavior remains available. */
+    if (argc > 1 && strcmp(argv[1], "--runtime") == 0)
+        return hub75_runtime_demo(argc - 1, argv + 1);
     printf("rpi-gpu-hub75 example PI Hardware \"hat\": (%s)\n", ADDRESS_TYPE);
     srand((unsigned)time(NULL));
 

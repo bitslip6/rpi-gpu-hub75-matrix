@@ -32,6 +32,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <sys/mman.h>
 #include <stdbool.h>
 #include <sys/time.h>
 #include <time.h>
@@ -69,7 +70,7 @@ void hub75_display_request_shutdown(struct hub75_display *scene) {
     scene->do_render = false;
     //update_bcm_signal_64_rgb(scene, NULL, NULL, NULL, 0);
 
-    hub75_display_wait(scene);
+    /* Request only. Joining here can self-join a render worker. */
 }
 
 void hub75_display_wait(struct hub75_display *scene) {
@@ -79,7 +80,7 @@ void hub75_display_wait(struct hub75_display *scene) {
     } 
     debug(" [.] waiting for mapper thread to stop...\n");
     // mapper
-    if (scene->mapper_thread) {
+    if (scene->mapper_thread && !pthread_equal(scene->mapper_thread, pthread_self())) {
         pthread_t t = scene->mapper_thread;
         scene->mapper_thread = 0;
         pthread_join(t, NULL);
@@ -87,7 +88,7 @@ void hub75_display_wait(struct hub75_display *scene) {
     debug(" [$] mapper thread exited and joined\n");
     debug(" [.] waiting for render thread to stop...\n");
     // render
-    if (scene->render_thread) {
+    if (scene->render_thread && !pthread_equal(scene->render_thread, pthread_self())) {
         pthread_t t = scene->render_thread;
         scene->render_thread = 0;
         pthread_join(t, NULL);
@@ -220,7 +221,7 @@ void hub75_display_bind_scene(hub75_display_t *scene) {
     }
 
     // each BCM "frame" is 32 bits (6 bits for addressing, 18 for RGB data)
-    const uint16_t half_height = (uint16_t)(scene->height / 2);
+    const uint16_t half_height = (uint16_t)(scene->panel_height / 2);
     size_t ring_buf_size = (size_t)(scene->width * half_height * scene->bit_depth * 4);
     // bcm renderer ring
     if (!(scene->ring_buf_renderer = spsc_create(8, ring_buf_size))) {
@@ -370,6 +371,15 @@ static inline void io_store_barrier(void) {
 #endif
 }
 
+static void legacy_scan_release(uint32_t *map,const hub75_display_t *scene,bool pi5,
+                                uint32_t *jitter,const uint32_t *held) {
+    if(pi5)map[RIO5_OFFSET+0x2000/4]=PIN_OE;
+    else map[7]=PIN_OE;
+    io_write_barrier();
+    if(held)spsc_pop_ptr_commit(scene->ring_buf_renderer);
+    free(jitter);munmap(map,64*1024*1024);
+}
+
 #ifndef WARMUP_FRAMES
 #define WARMUP_FRAMES 8
 #endif
@@ -383,6 +393,7 @@ void* hub75_display_run_pi4(const hub75_display_t *scene) {
     // offset to the RIO registers (required for #define register access. 
     // TODO: this needs to be improved and #define to RIOBase removed)
     configure_gpio(PERIBase, cpu_model);
+    PERIBase[7]=PIN_OE;
          
     // index into the OE jitter mask
     // pre compute some variables. let the compiler know the alignment for optimizations
@@ -415,7 +426,7 @@ void* hub75_display_run_pi4(const hub75_display_t *scene) {
 
     __attribute__((unused)) uint16_t phase = 1;         // phase is where we start pulling jitter bits from
     uint32_t jitter_idx = 0;    // jitter_mask has an extra 16K of bits in it, so overrun is ok
-    const uint32_t *bcm_signal; // pointer to the current bcm data to be displayed
+    const uint32_t *bcm_signal = NULL; // pointer to the current bcm data to be displayed
 
     debug(" [.] waiting for first frame acquisition...\n");
 
@@ -428,12 +439,13 @@ void* hub75_display_run_pi4(const hub75_display_t *scene) {
     }
     if (bcm_signal == NULL) {
         debug(" [!] unable to locate first rendered frame\n");
+        legacy_scan_release(PERIBase,scene,false,jitter_mask,NULL);
         return NULL;
     }
     debug(" [$] first frame acquired\n");
 
-    // Phase 1: SCHED_FIFO 99 + mlockall for warmup measurement
-    enable_rt_fifo_and_lock_mem();
+    // Legacy host tuning is explicitly opt-in, never embedding policy.
+    if(getenv("HUB75_LEGACY_RT"))enable_rt_fifo_and_lock_mem();
 
     // Measure actual frame time over warmup frames
     struct timespec ts_a, ts_b;
@@ -461,7 +473,7 @@ void* hub75_display_run_pi4(const hub75_display_t *scene) {
                     SLOW SLOW SLOW
                     color_pins = new_mask;
                     jitter_idx = (jitter_idx + 1) % JITTER_SIZE;
-                    woff += bit_depth;
+                    woff++;
                 }
                 PERIBase[7] = PIN_LATCH | PIN_OE;
                 SLOW SLOW
@@ -480,27 +492,21 @@ void* hub75_display_run_pi4(const hub75_display_t *scene) {
     debug(" [*] measured worst-case frame time: %luμs\n", (unsigned long)(worst_frame_ns / 1000));
 
     // Phase 2: attempt SCHED_DEADLINE with measured timing
-    bool is_deadline = enable_deadline_from_measurement(worst_frame_ns, bit_depth, 3);
+    bool is_deadline = getenv("HUB75_LEGACY_RT") &&
+        enable_deadline_from_measurement(worst_frame_ns, bit_depth, 3);
 
     while (scene->do_render) {
 
         uint32_t offset = 0;
         for (uint8_t pwm = 0; pwm < bit_depth; pwm++) {
 
-            // check for a new frame, reset jitter phase once we hit the end
-            if ((pwm & 15u) == 0u) {   // true at i = 0,16,32,...
-                // Only swap to a new frame if there is at least one additional item
-                // beyond the one we currently hold. This avoids re-popping the same slot
-                // and releasing it too early while still in use.
-                if (spsc_count(scene->ring_buf_renderer) >= 2) {
-                    // release the current frame
-                    // acquire the next frame (non-blocking)
-                    const uint32_t *tmp = spsc_pop_ptr_begin(scene->ring_buf_renderer, 0);
-                    if (tmp) {
-                        spsc_pop_ptr_commit(scene->ring_buf_renderer);
-                        bcm_signal = tmp;
-                    }
-                }
+            /* Swap only at a full BCM boundary. The current slot remains
+             * reserved for its entire scan lifetime, including repeated scans. */
+            if (pwm == 0 && spsc_count(scene->ring_buf_renderer) >= 2) {
+                spsc_pop_ptr_commit(scene->ring_buf_renderer);
+                bcm_signal = spsc_pop_ptr_begin(scene->ring_buf_renderer, 0);
+                /* Single consumer: the already published next item must exist. */
+                if (!bcm_signal) break;
             }
 
 
@@ -535,7 +541,7 @@ void* hub75_display_run_pi4(const hub75_display_t *scene) {
                     jitter_idx = (jitter_idx + 1) % JITTER_SIZE;
 
                     // advance to the next pixel in the bcm signal
-                    offset += bit_depth;// + 1;
+                    offset++;
                 }
                 PERIBase[7] = PIN_LATCH | PIN_OE;
                 SLOW
@@ -583,6 +589,7 @@ void* hub75_display_run_pi4(const hub75_display_t *scene) {
 
     debug(" [-] display run render loop exiting. [%ld] total frames rendered\n", (frame_total + frame_count));
 
+    legacy_scan_release(PERIBase,scene,false,jitter_mask,bcm_signal);
     return NULL;
 }
 
@@ -591,7 +598,7 @@ void* hub75_display_run(const hub75_display_t *scene) {
 
     int cpu_model = cpu_get_pi_model();
     debug(" [+] display_run CPU model %d: pinning to CPU 3\n", cpu_model);
-    cpu_affinity(3);
+    if (getenv("HUB75_LEGACY_RT")) cpu_affinity(3);
 
     if (cpu_model < 2) {
         die(" [!] Unsupported CPU model detected %d\n", cpu_model);
@@ -608,6 +615,7 @@ void* hub75_display_run(const hub75_display_t *scene) {
     uint32_t *RIOBase;
     RIOBase = PERIBase + RIO5_OFFSET;
     configure_gpio(PERIBase, 5);
+    PERIBase[RIO5_OFFSET+0x2000/4]=PIN_OE;
          
     // index into the OE jitter mask
     // pre compute some variables. let the compiler know the alignment for optimizations
@@ -647,7 +655,7 @@ void* hub75_display_run(const hub75_display_t *scene) {
 
     __attribute__((unused)) uint16_t phase = 1;         // phase is where we start pulling jitter bits from
     uint16_t jitter_idx = 0;    // jitter_mask has an extra 16K of bits in it, so overrun is ok
-    const uint32_t *bcm_signal; // pointer to the current bcm data to be displayed
+    const uint32_t *bcm_signal = NULL; // pointer to the current bcm data to be displayed
 
     debug(" [.] waiting for first frame acquisition...\n");
 
@@ -660,12 +668,13 @@ void* hub75_display_run(const hub75_display_t *scene) {
     }
     if (bcm_signal == NULL) {
         debug(" [!] unable to locate first rendered frame\n");
+        legacy_scan_release(PERIBase,scene,true,jitter_mask,NULL);
         return NULL;
     }
     debug(" [$] first frame acquired\n");
 
-    // Phase 1: SCHED_FIFO 99 + mlockall for warmup measurement
-    enable_rt_fifo_and_lock_mem();
+    // Legacy host tuning is explicitly opt-in, never embedding policy.
+    if(getenv("HUB75_LEGACY_RT"))enable_rt_fifo_and_lock_mem();
 
     // ---- Warmup: measure actual frame time under FIFO 99 ----
     #ifndef WARMUP_FRAMES
@@ -711,7 +720,8 @@ void* hub75_display_run(const hub75_display_t *scene) {
     debug(" [*] measured worst-case frame time: %luμs\n", (unsigned long)(worst_frame_ns / 1000));
 
     // Phase 2: attempt SCHED_DEADLINE with measured timing
-    (void)enable_deadline_from_measurement(worst_frame_ns, bit_depth, 3);
+    if (getenv("HUB75_LEGACY_RT"))
+        (void)enable_deadline_from_measurement(worst_frame_ns, bit_depth, 3);
 
     // ---- Main display loop ----
     while (scene->do_render) {
@@ -719,15 +729,12 @@ void* hub75_display_run(const hub75_display_t *scene) {
         uint32_t offset = 0;
         for (uint8_t pwm = 0; pwm < bit_depth; pwm++) {
 
-            // check for a new frame, reset jitter phase once we hit the end
-            if ((pwm & 15u) == 0u) {   // true at i = 0,16,32,...
-                if (spsc_count(scene->ring_buf_renderer) >= 2) {
-                    const uint32_t *tmp = spsc_pop_ptr_begin(scene->ring_buf_renderer, 0);
-                    if (tmp) {
-                        spsc_pop_ptr_commit(scene->ring_buf_renderer);
-                        bcm_signal = tmp;
-                    }
-                }
+            /* Release the old reservation BEFORE acquiring the next tail;
+             * never read a slot after returning it to the producer. */
+            if (pwm == 0 && spsc_count(scene->ring_buf_renderer) >= 2) {
+                spsc_pop_ptr_commit(scene->ring_buf_renderer);
+                bcm_signal = spsc_pop_ptr_begin(scene->ring_buf_renderer, 0);
+                if (!bcm_signal) break;
             }
 
             frame_count++;
@@ -787,6 +794,7 @@ void* hub75_display_run(const hub75_display_t *scene) {
 
     debug(" [-] display run render loop exiting. [%ld] total frames rendered\n", (frame_total + frame_count));
 
+    legacy_scan_release(PERIBase,scene,true,jitter_mask,bcm_signal);
     return NULL;
 }
 

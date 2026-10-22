@@ -85,8 +85,10 @@ uint8_t *flip_mapper(const uint8_t *image,
             uint8_t       *dst_row = dst + y * row_sz;
 
             // prefetch next rows to hide latency on A72/A76
-            __builtin_prefetch(src_row - row_sz, 0, 3);
-            __builtin_prefetch(dst_row + row_sz, 1, 3);
+            if (y + 1 < height) {
+                __builtin_prefetch(src_row - row_sz, 0, 3);
+                __builtin_prefetch(dst_row + row_sz, 1, 3);
+            }
 
             memcpy(dst_row, src_row, row_sz);
         }
@@ -184,8 +186,8 @@ uint8_t *mirror_mapper(const uint8_t *image,
             const uint8_t *sr = src_row + (w - 1 - right) * bpp;
 
             // write two pixels per iteration to reduce loop overhead
-            memcpy(dl, sr, bpp);
-            memcpy(dr, sl, bpp);
+            memcpy(dl, sl, bpp);
+            memcpy(dr, sr, bpp);
 
             ++left;
             --right;
@@ -238,8 +240,8 @@ uint8_t *mirror_flip_mapper(const uint8_t *image,
                 const uint8_t *s      = src_row + src_px * 3;
                 uint8_t       *d      = dst_row + i * blk_bytes;
 
-                __builtin_prefetch(s - 96, 0, 3);
-                __builtin_prefetch(d + 96, 1, 3);
+                if (src_px >= 32) __builtin_prefetch(s - 96, 0, 3);
+                if (w - i * px_block > 32) __builtin_prefetch(d + 96, 1, 3);
 
                 // deinterleave 16 pixels of RGB
                 uint8x16x3_t rgb = vld3q_u8(s);
@@ -269,7 +271,7 @@ uint8_t *mirror_flip_mapper(const uint8_t *image,
 
         // copy w pixels, mirrored horizontally
         for (size_t x = 0; x < w; ++x) {
-            __builtin_prefetch(sp - 3 * bpp, 0, 1);
+            if (x + 3 < w) __builtin_prefetch(sp - 3 * bpp, 0, 1);
             // copy one pixel of bpp bytes
             switch (bpp) {
                 case 3:
@@ -284,7 +286,7 @@ uint8_t *mirror_flip_mapper(const uint8_t *image,
                     break;
             }
             dp += bpp;
-            sp -= bpp;
+            if (x + 1 < w) sp -= bpp;
         }
     }
 

@@ -125,10 +125,14 @@ int sdf_metrics_csv_load(const char *csv_path, sdf_metrics_row_t **out_rows,
     r.bearing_y = (float)strtod(trim_inplace(fields[3]), NULL);
     r.width = (int)strtol(trim_inplace(fields[4]), NULL, 10);
     r.height = (int)strtol(trim_inplace(fields[5]), NULL, 10);
+    if (!isfinite(r.advance_width) || !isfinite(r.bearing_x) || !isfinite(r.bearing_y) ||
+        fabsf(r.advance_width) > 4096 || fabsf(r.bearing_x) > 4096 || fabsf(r.bearing_y) > 4096 ||
+        r.width < 0 || r.width > 255 || r.height < 0 || r.height > 255 || n >= 65536) {
+      sdf_metrics_rows_free(rows,n); fclose(f); return -1;
+    }
     r.path = dup_cstr(trim_inplace(fields[6]));
     if (!r.path) {
-      fprintf(stderr, "sdf_metrics_csv_load: OOM duplicating path\n");
-      continue;
+      sdf_metrics_rows_free(rows,n); fclose(f); return -1;
     }
 
     if (n == cap) {
@@ -138,7 +142,7 @@ int sdf_metrics_csv_load(const char *csv_path, sdf_metrics_row_t **out_rows,
       if (!tmp) {
         fprintf(stderr, "sdf_metrics_csv_load: OOM grow\n");
         free(r.path);
-        break;
+        sdf_metrics_rows_free(rows,n); fclose(f); return -1;
       }
       /* zero the new part */
       memset(tmp + cap, 0, (ncap - cap) * sizeof(*rows));
@@ -210,6 +214,7 @@ sdf_font_t *sdf_font_load(const char *font_dir) {
   font->glyph_count = 0;
   font->dir = strdup(font_dir); /* ownership freed in sdf_font_free later */
   font->name = font->dir;       /* alias for now */
+  if (!font->dir) { sdf_metrics_rows_free(rows,count); sdf_font_free(font); return NULL; }
 
   for (size_t i = 0; i < count; ++i) {
     const sdf_metrics_row_t *r = &rows[i];
@@ -234,11 +239,13 @@ sdf_font_t *sdf_font_load(const char *font_dir) {
           (char)ch, ch, r->width, r->height, w, h);
     }
 
+    if (w <= 0 || h <= 0 || w > 255 || h > 255) {
+      free(pixels); sdf_metrics_rows_free(rows,count); sdf_font_free(font); return NULL;
+    }
     /* Create glyph */
     sdf_glyph_t *g = (sdf_glyph_t *)calloc(1, sizeof(sdf_glyph_t));
     if (!g) {
-      free(pixels);
-      continue;
+      free(pixels); sdf_metrics_rows_free(rows,count); sdf_font_free(font); return NULL;
     }
     int cw = (w > 255) ? 255 : w;
     int chh = (h > 255) ? 255 : h;
@@ -600,11 +607,12 @@ sdf_font_t *sdf_font_create_scaled(const sdf_font_t *base,
       continue;
     }
     f->table[i] = _scale_glyph(base->table[i], s);
-    if (f->table[i])
-      f->glyph_count++;
+    if (!f->table[i]) { sdf_font_free(f); return NULL; }
+    f->glyph_count++;
   }
   if (base->box_valid) {
     sdf_glyph_t *scaled_box = _scale_glyph(&base->box, s);
+    if (!scaled_box) { sdf_font_free(f); return NULL; }
     if (scaled_box) {
       f->box = *scaled_box; /* copy struct */
       free(scaled_box);     /* pixels remain owned by f->box */
@@ -615,6 +623,7 @@ sdf_font_t *sdf_font_create_scaled(const sdf_font_t *base,
   if (base->kern_pairs && base->kern_count > 0) {
     f->kern_pairs =
         (sdf_kern_pair_t *)malloc(base->kern_count * sizeof(sdf_kern_pair_t));
+    if (!f->kern_pairs) { sdf_font_free(f); return NULL; }
     if (f->kern_pairs) {
       f->kern_count = base->kern_count;
       for (size_t i = 0; i < base->kern_count; ++i) {
@@ -1007,7 +1016,7 @@ void sdf_text_render(sdf_text_t *t, uint8_t *dst, int w, int h, int row_stride,
 
   t->dimensions.y = max_y;
   t->dimensions.x = max_x;
-  printf("MAX_Y: %dx%d\n", max_x, max_y);
+  /* Rendering must not log once per frame in embedded applications. */
 }
 
 /* Apply per-text font scaling to match t->size_px (interpreted as desired line
@@ -1215,10 +1224,14 @@ static void _sdf_text_update_shape(sdf_text_t *t) {
         k = sdf_font_get_kerning(t->font, ch, rn);
       }
       float adv_f = (g ? g->advance_width : 0.0f) + t->tracking + k;
+      if (!isfinite(adv_f) || fabsf(adv_f) > 1000000)
+        goto invalid_shape;
       int adv_i = iroundf(adv_f);
       advs[i] = (float)adv_i;
     } else { // vertical
       int gh = g ? (int)g->height : 0;
+      if (!isfinite(t->tracking) || fabsf(t->tracking) > 1000000)
+        goto invalid_shape;
       int adv_i = gh + iroundf(t->tracking);
       advs[i] = (float)adv_i;
     }
@@ -1249,6 +1262,8 @@ static void _sdf_text_update_shape(sdf_text_t *t) {
       const sdf_glyph_t *g = font_glyph(t->font, ch);
       int bx = g ? iroundf(g->bearing_x) : 0;
       int by = g ? iroundf(g->bearing_y) : 0;
+      if (pen_x > 1000000 || pen_x < -1000000)
+        goto invalid_shape;
       dxs[i] = pen_x + bx;
       if (t->valign == SDF_VALIGN_TOP) {
         dys[i] = -line_top_i;
@@ -1275,6 +1290,8 @@ static void _sdf_text_update_shape(sdf_text_t *t) {
       const sdf_glyph_t *g = font_glyph(t->font, ch);
       int bx = g ? iroundf(g->bearing_x) : 0;
       int by = g ? iroundf(g->bearing_y) : 0;
+      if (pen_y > 1000000 || pen_y < -1000000)
+        goto invalid_shape;
       dxs[i] = bx;
       dys[i] = pen_y - by;
       pen_y += (int)advs[i];
@@ -1300,7 +1317,14 @@ static void _sdf_text_update_shape(sdf_text_t *t) {
   t->_ofs_y = dys;
   t->_glyph_count = n;
   t->shape_dirty = false;
-  printf(" [!] updated text shape: glyphs=%zu\n", n);
+  return;
+invalid_shape:
+  free(glyphs);
+  free(advs);
+  free(dxs);
+  free(dys);
+  /* Keep prior caches valid, but signal a failed/bounded layout to callers. */
+  t->shape_dirty = true;
 }
 
 

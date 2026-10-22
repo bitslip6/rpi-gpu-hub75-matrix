@@ -26,6 +26,10 @@
 
 /* Thread-local storage for the current scene being processed by this thread */
 static _Thread_local hub75_display_t *tls_scene = NULL;
+static _Thread_local hub75_error_t tls_render_status = HUB75_OK;
+hub75_error_t hub75_api_render_status(void) { return tls_render_status; }
+void hub75_camera_free(camera_t *camera) { free(camera); }
+void hub75_transform_free(transform_t *transform) { free(transform); }
 static _Thread_local scene3d_t *tls_current_os = NULL;
 /* When true, skip per-vertex shadow sampling; per-pixel sampling will be applied in the raster loop */
 static _Thread_local bool tls_use_pixel_shadows = false;
@@ -1625,7 +1629,7 @@ void api_geo_render_filled(const camera_t *cam, object_t *obj, const transform_t
     size_t needed_tri_capacity = nf * 2u;
     if (!obj->trifill_buffer || obj->trifill_capacity < needed_tri_capacity) {
         void *newbuf = realloc(obj->trifill_buffer, sizeof(_TriFill) * needed_tri_capacity);
-        if (!newbuf) return;
+        if (!newbuf) { tls_render_status = HUB75_ERR_OUT_OF_MEMORY; return; }
         obj->trifill_buffer = newbuf;
         obj->trifill_capacity = needed_tri_capacity;
     }
@@ -1913,7 +1917,7 @@ void api_geo_render_wire_clip_cull(const camera_t *cam, object_t *obj, const tra
     /* Compute clip-space for all vertices (keep x,y,w) */
     size_t nv = obj->verticies->length;
     vec4 *clip_xyw = (vec4*)malloc(sizeof(vec4) * nv);
-    if (!clip_xyw) return;
+    if (!clip_xyw) { tls_render_status = HUB75_ERR_OUT_OF_MEMORY; return; }
     for (size_t i = 0; i < nv; ++i) {
         vec3 p = obj->verticies->list[i];
         clip_xyw[i] = mat4_mul_point_clip_xyw(mvp, p);
@@ -2019,6 +2023,7 @@ void api_geo_render_wire_clip_cull(const camera_t *cam, object_t *obj, const tra
 
 /* Render a list of object instances with per-object draw mode */
 static void api_render_scene3d(const camera_t *cam, const scene3d_t *os, const scene3d_lighting_t *lighting) {
+    tls_render_status = HUB75_OK;
     if (!tls_scene || !cam || !os || !os->instances || os->count == 0) {
         debug("api_render_scene3d: invalid parameters\n");
         return;
@@ -2031,7 +2036,9 @@ static void api_render_scene3d(const camera_t *cam, const scene3d_t *os, const s
         bool need_alloc = (os->zbuf == NULL) || (os->zbuf_width != W) || (os->zbuf_height != H);
         if (need_alloc) {
             if (((scene3d_t*)os)->zbuf) free(((scene3d_t*)os)->zbuf);
-            ((scene3d_t*)os)->zbuf = (uint16_t*)aligned_alloc(16, (size_t)W * (size_t)H * sizeof(uint16_t));
+            size_t zbytes = (size_t)W * (size_t)H * sizeof(uint16_t);
+            ((scene3d_t*)os)->zbuf = (uint16_t*)aligned_alloc(16, (zbytes + 15u) & ~(size_t)15u);
+            if (!os->zbuf) tls_render_status = HUB75_ERR_OUT_OF_MEMORY;
             ((scene3d_t*)os)->zbuf_width = W;
             ((scene3d_t*)os)->zbuf_height = H;
         }
@@ -2063,10 +2070,10 @@ static void api_render_scene3d(const camera_t *cam, const scene3d_t *os, const s
 
         tls_shadow_count = L->num_lights;
         tls_shadow_maps = (ShadowMap*)calloc(tls_shadow_count, sizeof(ShadowMap));
-        if (!tls_shadow_maps) { tls_shadow_count = 0; }
+        if (!tls_shadow_maps) { tls_shadow_count = 0; tls_render_status = HUB75_ERR_OUT_OF_MEMORY; }
 
     const int SM_W = 512, SM_H = 512;
-        for (uint16_t li = 0; li < L->num_lights; ++li) {
+        for (uint16_t li = 0; li < tls_shadow_count; ++li) {
             light_t *Lt = &L->lights[li];
             ShadowMap *SM = &tls_shadow_maps[li];
             SM->valid = false;
@@ -2200,7 +2207,7 @@ static void api_render_scene3d(const camera_t *cam, const scene3d_t *os, const s
 
             SM->w = SM_W; SM->h = SM_H;
             SM->depth = (float*)malloc((size_t)SM_W * (size_t)SM_H * sizeof(float));
-            if (!SM->depth) { SM->valid = false; continue; }
+            if (!SM->depth) { SM->valid = false; tls_render_status = HUB75_ERR_OUT_OF_MEMORY; continue; }
             for (int i = 0; i < SM_W*SM_H; ++i) SM->depth[i] = 1e9f;
 
             int tri_count = 0;
@@ -2368,12 +2375,13 @@ static uint16_t os_add_directional(scene3d_t *os,
                                    RGBF color,
                                    float intensity,
                                    bool casts_shadows) {
-    if (!os) return UINT16_MAX;
+    if (!os || os->lighting.num_lights == UINT16_MAX) return UINT16_MAX;
     uint16_t n = os->lighting.num_lights;
     light_t *newlights = (light_t*)realloc(os->lighting.lights, (size_t)(n + 1) * sizeof(light_t));
     if (!newlights) return UINT16_MAX;
     os->lighting.lights = newlights;
     light_t *L = &os->lighting.lights[n];
+    memset(L, 0, sizeof(*L));
     L->type = LIGHT_DIRECTIONAL;
     L->direction = direction;
     L->color = color;
@@ -2408,10 +2416,11 @@ static void os_set_directional_pose(scene3d_t *os, uint16_t id,
 }
 
 static uint16_t os_add_object(scene3d_t *os, object_t *obj, transform_t *xform) {
-    if (!os || !obj || !xform) return UINT16_MAX;
+    if (!os || !obj || !xform || os->count == UINT16_MAX) return UINT16_MAX;
     /* Ensure capacity */
     if (os->count >= os->capacity) {
-        uint16_t new_cap = (os->capacity == 0) ? 1u : (uint16_t)(os->capacity * 2u);
+        uint16_t new_cap = os->capacity == 0 ? 1u :
+            (os->capacity > UINT16_MAX / 2 ? UINT16_MAX : (uint16_t)(os->capacity * 2u));
         object_instance_t *new_arr = (object_instance_t*)realloc(os->instances, (size_t)new_cap * sizeof(object_instance_t));
         if (!new_arr) return UINT16_MAX;
         /* Zero-init new tail */
@@ -2492,6 +2501,7 @@ void api_object_scene_free(scene3d_t *os) {
     if (!os) return;
     if (os->instances) free(os->instances);
     if (os->lighting.lights) free(os->lighting.lights);
+    free(os->zbuf);
     free(os);
 }
 

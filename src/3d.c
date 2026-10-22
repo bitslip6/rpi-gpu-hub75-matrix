@@ -230,7 +230,8 @@ object_t* object_new(const uint16_t num_vertices, const uint16_t num_edges, cons
 
     obj->verticies = vert_list_new(num_vertices);
     obj->rendered_vertices = calloc(num_vertices, sizeof(vec3));
-    obj->edge_colors = color_list_new(num_edges);  /* Should be num_edges, not num_vertices */
+    /* Filled faces and wire edges share the color table. */
+    obj->edge_colors = color_list_new(num_edges > num_faces ? num_edges : num_faces);
     obj->edges = edge_list_new(num_edges);
     obj->faces = face_list_new(num_faces);
     obj->normals = normal_list_new(num_faces);
@@ -508,6 +509,22 @@ object_t* object_pyramid(void) {
     e[4] = (vec2){0,4};  e[5] = (vec2){1,4};
     e[6] = (vec2){2,4};  e[7] = (vec2){3,4};
 
+    vec3 *f = obj->faces->list;
+    f[0]=(vec3){0,1,2}; f[1]=(vec3){0,2,3};
+    f[2]=(vec3){0,4,1}; f[3]=(vec3){1,4,2};
+    f[4]=(vec3){2,4,3}; f[5]=(vec3){3,4,0};
+    for (uint16_t i=0; i<6; ++i) {
+        vec3 a=v[(uint16_t)f[i].x], b=v[(uint16_t)f[i].y], c=v[(uint16_t)f[i].z];
+        vec3 n=vec3_cross(vec3_sub(b,a),vec3_sub(c,a));
+        vec3 center={(a.x+b.x+c.x)/3.0f,(a.y+b.y+c.y)/3.0f,(a.z+b.z+c.z)/3.0f};
+        if (vec3_dot(n,center)<0) {
+            float swap=f[i].y; f[i].y=f[i].z; f[i].z=swap;
+            n=(vec3){-n.x,-n.y,-n.z};
+        }
+        obj->normals->list[i]=vec3_norm(n);
+    }
+    for (uint16_t i=0; i<obj->edge_colors->length; ++i)
+        obj->edge_colors->list[i]=(RGB){255,255,255};
     return obj;
 }
 
@@ -775,14 +792,16 @@ object_t* object_sphere(uint16_t subdivisions) {
 
     /* Midpoint cache to avoid duplicate vertices on shared edges */
     MidCache mc = {0};
-    mc.cap = (uint32_t)(num_edges * 2u + 64u);
-    mc.tab = (mc.cap ? calloc(mc.cap, sizeof(MidEntry)) : NULL);
+    mc.cap = 1;
+    while (mc.cap < (uint32_t)num_edges * 2u + 64u) mc.cap <<= 1;
+    mc.tab = calloc(mc.cap, sizeof(MidEntry));
+    if (!mc.tab) { object_free(obj); return NULL; }
 
     /* Subdivide faces */
     for (uint16_t s = 0; s < subdivisions; ++s) {
         uint16_t old_fcount = fcount;
         vec3 *oldF = malloc(old_fcount * sizeof(vec3));
-        if (!oldF) break;
+        if (!oldF) { free(mc.tab); object_free(obj); return NULL; }
         for (uint16_t i = 0; i < old_fcount; ++i) oldF[i] = F[i];
         fcount = 0;
         for (uint16_t i = 0; i < old_fcount; ++i) {
@@ -805,8 +824,10 @@ object_t* object_sphere(uint16_t subdivisions) {
     vec2 *E = obj->edges->list;
     uint16_t ecount = 0;
     EdgeSet es = {0};
-    es.cap = (uint32_t)num_edges * 2u + 64u;
-    es.tab = (es.cap ? calloc(es.cap, sizeof(EdgeEntry)) : NULL);
+    es.cap = 1;
+    while (es.cap < (uint32_t)num_edges * 2u + 64u) es.cap <<= 1;
+    es.tab = calloc(es.cap, sizeof(EdgeEntry));
+    if (!es.tab) { free(mc.tab); object_free(obj); return NULL; }
 
     for (uint16_t i = 0; i < fcount; ++i) {
         uint16_t i0 = (uint16_t)F[i].x, i1 = (uint16_t)F[i].y, i2 = (uint16_t)F[i].z;
@@ -829,6 +850,8 @@ object_t* object_sphere(uint16_t subdivisions) {
     obj->verticies->length = vcount;
     obj->faces->length = fcount;
     obj->edges->length = ecount;
+    for (uint16_t i=0; i<obj->edge_colors->length; ++i)
+        obj->edge_colors->list[i]=(RGB){255,255,255};
     return obj;
 }
 
@@ -972,6 +995,10 @@ object_t* object_plane(uint16_t width_segments, uint16_t height_segments, bool f
     (void)face_up_not_implemented; /* Reserved for future orientation support. */
     if (width_segments < 1) width_segments = 1;
     if (height_segments < 1) height_segments = 1;
+    if (((uint64_t)width_segments + 1u) * ((uint64_t)height_segments + 1u) > UINT16_MAX ||
+        (uint64_t)width_segments * height_segments * 2u > UINT16_MAX ||
+        (uint64_t)width_segments * (height_segments + 1u) + (uint64_t)height_segments * (width_segments + 1u) > UINT16_MAX)
+        return NULL;
     
     uint16_t num_vertices = (uint16_t)((width_segments + 1) * (height_segments + 1));
     uint16_t num_edges = (uint16_t)(width_segments * (height_segments + 1) + height_segments * (width_segments + 1));

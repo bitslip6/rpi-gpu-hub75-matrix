@@ -1,0 +1,6 @@
+/build/
+/dist/
+/*.egg-info/
+/hub75gpu/.libs/
+/hub75gpu/_native*.so
+__pycache__/

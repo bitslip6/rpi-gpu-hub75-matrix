@@ -70,7 +70,7 @@ typedef float NormalSigned;
 /**
  * @brief clamp a float to the Normal (0-1) range
  */
-inline Normal Normal_clamp(float x) {
+static inline Normal Normal_clamp(float x) {
     if (x < 0.0f) return 0.0f;
     if (x > 1.0f) return 1.0f;
     return (Normal)x;
@@ -79,7 +79,7 @@ inline Normal Normal_clamp(float x) {
 /**
  * @brief clamp a float to the NormalSigned (-1 to +1) range
  */
-inline NormalSigned NormalSigned_clamp(float x) {
+static inline NormalSigned NormalSigned_clamp(float x) {
     if (x < -1.0f) return -1.0f;
     if (x > 1.0f) return 1.0f;
     return (NormalSigned)x;
@@ -375,6 +375,7 @@ typedef struct hub75_display {
      * set to true to show the FPS on the screen
      */
     bool show_fps;
+    bool video_preserve_aspect; // Fit video with centered black bars; default false
 
     /**
      * When true, enable extra verbose debug prints in CPU rendering paths
@@ -887,6 +888,10 @@ hub75gpu_t hub75_api(hub75_display_t *s);
 /* -------- Python/FFI-friendly helper API -------- */
 camera_t *api_new_camera(void);
 transform_t *api_new_transform(void);
+void hub75_camera_free(camera_t *camera);
+void hub75_transform_free(transform_t *transform);
+/* Recoverable allocation status of the last scene render on this thread. */
+hub75_error_t hub75_api_render_status(void);
 
 scene3d_lighting_t *api_lighting_new(uint16_t num_lights, RGBF ambient);
 void api_lighting_free(scene3d_lighting_t *l);

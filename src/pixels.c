@@ -45,6 +45,7 @@ void *main_thread_mapper(void *arg)
         spsc_pop_ptr_commit(scene->ring_buf_mapper);
     }
 
+    hub75_mapper_cache_clear();
     debug(" [-] BCM mapper thread exiting.\n");
     return NULL;
 }
@@ -394,7 +395,7 @@ uint64_t byte_to_bcm64(const uint8_t input, const uint8_t bit_depth) {
 
 
 // build at init
-static int32_t mid_dn_tbl[258], mid_up_tbl[258];  // +2  to handle the +1W access, +1 more for good measure
+static _Thread_local int32_t mid_dn_tbl[258], mid_up_tbl[258];  // +2  to handle the +1W access, +1 more for good measure
 
 /**
  * @brief build the mid-point tables for fast dithering
@@ -480,12 +481,12 @@ static inline uint8_t sd_weight_step_fast(const uint8_t v,
 
 
 // build once per process
-static uint32_t PORT0_LUT[64], PORT1_LUT[64], PORT2_LUT[64];
-static int      port_lut_built = 0;
+static _Thread_local uint32_t PORT0_LUT[64], PORT1_LUT[64], PORT2_LUT[64];
+static _Thread_local int port_lut_built = 0;
 
 // Cache all remaps once if you like, 6 * 64 bytes total.
-static uint8_t IDX_REMAP[6][64];
-static int idx_remap_built_mask = 0;
+static _Thread_local uint8_t IDX_REMAP[6][64];
+static _Thread_local int idx_remap_built_mask = 0;
 
 
 /**
@@ -745,12 +746,13 @@ void dither_spatial_hash_low(uint8_t *img, int width, int height,
  * @param phase 
  */
 __attribute__((hot))
-void update_bcm_signal_64_rgb(
+static void update_bcm_signal_64_rgb_offset(
     const hub75_display_t *scene,
     const void *__restrict__ void_bits,
     uint32_t *__restrict__ bcm_signal,
     const uint8_t *image,
-    uint8_t phase
+    uint8_t phase,
+    size_t pixel_offset
 ) {
 
     const uint8_t bit_depth = scene->bit_depth;
@@ -771,26 +773,27 @@ void update_bcm_signal_64_rgb(
 
     // 3) helper macros for pointer/index math
     #define PIX_PTR(px_index)   (image + (size_t)(px_index) * stride_bytes)
-    #define ACC_IDX(px_index,c) ((px_index) * 3 + (c))   /* c: 0=R,1=G,2=B */
+    #define ACC_IDX(px_index,c) (((px_index) + pixel_offset) * 3 + (c))   /* c: 0=R,1=G,2=B */
 
 
 
     // p*_px are pixel indices, not byte offsets // we advance in units of pixels from one output signal to the next 
     const unsigned int p0t_px = 0;
     const unsigned int p0b_px = p0t_px + panel_stride_px;
-    const unsigned int p1t_px = p0b_px + panel_stride_px;
-    const unsigned int p1b_px = p1t_px + panel_stride_px;
-    const unsigned int p2t_px = p1b_px + panel_stride_px;
-    const unsigned int p2b_px = p2t_px + panel_stride_px;
+    const unsigned int p1t_px = scene->num_ports > 1 ? 2u * panel_stride_px : 0;
+    const unsigned int p1b_px = scene->num_ports > 1 ? 3u * panel_stride_px : 0;
+    const unsigned int p2t_px = scene->num_ports > 2 ? 4u * panel_stride_px : 0;
+    const unsigned int p2b_px = scene->num_ports > 2 ? 5u * panel_stride_px : 0;
 
 
     // 5) locate the six pixel base pointers once
     const uint8_t *p0t_ptr = PIX_PTR(p0t_px);
     const uint8_t *p0b_ptr = PIX_PTR(p0b_px);
-    const uint8_t *p1t_ptr = PIX_PTR(p1t_px);
-    const uint8_t *p1b_ptr = PIX_PTR(p1b_px);
-    const uint8_t *p2t_ptr = PIX_PTR(p2t_px);
-    const uint8_t *p2b_ptr = PIX_PTR(p2b_px);
+    const uint8_t black[4] = {0, 0, 0, 255};
+    const uint8_t *p1t_ptr = scene->num_ports > 1 ? PIX_PTR(p1t_px) : black;
+    const uint8_t *p1b_ptr = scene->num_ports > 1 ? PIX_PTR(p1b_px) : black;
+    const uint8_t *p2t_ptr = scene->num_ports > 2 ? PIX_PTR(p2t_px) : black;
+    const uint8_t *p2b_ptr = scene->num_ports > 2 ? PIX_PTR(p2b_px) : black;
 
     int32_t *accum = scene->accum;
 
@@ -803,21 +806,21 @@ void update_bcm_signal_64_rgb(
     const uint8_t g0b = scene->quant_dither ? sd_weight_step_fast(p0b_ptr[1], &accum[ACC_IDX(p0b_px,1)], Wg) : p0b_ptr[1];
     const uint8_t b0b = scene->quant_dither ? sd_weight_step_fast(p0b_ptr[2], &accum[ACC_IDX(p0b_px,2)], Wb) : p0b_ptr[2];
 
-    const uint8_t r1t = scene->quant_dither ? sd_weight_step_fast(p1t_ptr[0], &accum[ACC_IDX(p1t_px,0)], Wr) : p1t_ptr[0];
-    const uint8_t g1t = scene->quant_dither ? sd_weight_step_fast(p1t_ptr[1], &accum[ACC_IDX(p1t_px,1)], Wg) : p1t_ptr[1];
-    const uint8_t b1t = scene->quant_dither ? sd_weight_step_fast(p1t_ptr[2], &accum[ACC_IDX(p1t_px,2)], Wb) : p1t_ptr[2];
+    const uint8_t r1t = scene->quant_dither && scene->num_ports > 1 ? sd_weight_step_fast(p1t_ptr[0], &accum[ACC_IDX(p1t_px,0)], Wr) : p1t_ptr[0];
+    const uint8_t g1t = scene->quant_dither && scene->num_ports > 1 ? sd_weight_step_fast(p1t_ptr[1], &accum[ACC_IDX(p1t_px,1)], Wg) : p1t_ptr[1];
+    const uint8_t b1t = scene->quant_dither && scene->num_ports > 1 ? sd_weight_step_fast(p1t_ptr[2], &accum[ACC_IDX(p1t_px,2)], Wb) : p1t_ptr[2];
 
-    const uint8_t r1b = scene->quant_dither ? sd_weight_step_fast(p1b_ptr[0], &accum[ACC_IDX(p1b_px,0)], Wr) : p1b_ptr[0];
-    const uint8_t g1b = scene->quant_dither ? sd_weight_step_fast(p1b_ptr[1], &accum[ACC_IDX(p1b_px,1)], Wg) : p1b_ptr[1];
-    const uint8_t b1b = scene->quant_dither ? sd_weight_step_fast(p1b_ptr[2], &accum[ACC_IDX(p1b_px,2)], Wb) : p1b_ptr[2];
+    const uint8_t r1b = scene->quant_dither && scene->num_ports > 1 ? sd_weight_step_fast(p1b_ptr[0], &accum[ACC_IDX(p1b_px,0)], Wr) : p1b_ptr[0];
+    const uint8_t g1b = scene->quant_dither && scene->num_ports > 1 ? sd_weight_step_fast(p1b_ptr[1], &accum[ACC_IDX(p1b_px,1)], Wg) : p1b_ptr[1];
+    const uint8_t b1b = scene->quant_dither && scene->num_ports > 1 ? sd_weight_step_fast(p1b_ptr[2], &accum[ACC_IDX(p1b_px,2)], Wb) : p1b_ptr[2];
 
-    const uint8_t r2t = scene->quant_dither ? sd_weight_step_fast(p2t_ptr[0], &accum[ACC_IDX(p2t_px,0)], Wr) : p2t_ptr[0];
-    const uint8_t g2t = scene->quant_dither ? sd_weight_step_fast(p2t_ptr[1], &accum[ACC_IDX(p2t_px,1)], Wg) : p2t_ptr[1];
-    const uint8_t b2t = scene->quant_dither ? sd_weight_step_fast(p2t_ptr[2], &accum[ACC_IDX(p2t_px,2)], Wb) : p2t_ptr[2];
+    const uint8_t r2t = scene->quant_dither && scene->num_ports > 2 ? sd_weight_step_fast(p2t_ptr[0], &accum[ACC_IDX(p2t_px,0)], Wr) : p2t_ptr[0];
+    const uint8_t g2t = scene->quant_dither && scene->num_ports > 2 ? sd_weight_step_fast(p2t_ptr[1], &accum[ACC_IDX(p2t_px,1)], Wg) : p2t_ptr[1];
+    const uint8_t b2t = scene->quant_dither && scene->num_ports > 2 ? sd_weight_step_fast(p2t_ptr[2], &accum[ACC_IDX(p2t_px,2)], Wb) : p2t_ptr[2];
 
-    const uint8_t r2b = scene->quant_dither ? sd_weight_step_fast(p2b_ptr[0], &accum[ACC_IDX(p2b_px,0)], Wr) : p2b_ptr[0];
-    const uint8_t g2b = scene->quant_dither ? sd_weight_step_fast(p2b_ptr[1], &accum[ACC_IDX(p2b_px,1)], Wg) : p2b_ptr[1];
-    const uint8_t b2b = scene->quant_dither ? sd_weight_step_fast(p2b_ptr[2], &accum[ACC_IDX(p2b_px,2)], Wb) : p2b_ptr[2];
+    const uint8_t r2b = scene->quant_dither && scene->num_ports > 2 ? sd_weight_step_fast(p2b_ptr[0], &accum[ACC_IDX(p2b_px,0)], Wr) : p2b_ptr[0];
+    const uint8_t g2b = scene->quant_dither && scene->num_ports > 2 ? sd_weight_step_fast(p2b_ptr[1], &accum[ACC_IDX(p2b_px,1)], Wg) : p2b_ptr[1];
+    const uint8_t b2b = scene->quant_dither && scene->num_ports > 2 ? sd_weight_step_fast(p2b_ptr[2], &accum[ACC_IDX(p2b_px,2)], Wb) : p2b_ptr[2];
 
     const uint64_t *bits_r = (const uint64_t*)void_bits + 0;
     const uint64_t *bits_g = (const uint64_t*)void_bits + 256;
@@ -838,7 +841,9 @@ void update_bcm_signal_64_rgb(
 
 
 
-    const uint32_t frame_size = scene->width * (scene->height / 2);
+    /* Parallel ports share one GPIO word; each plane has one panel half's
+     * rows, not one stacked logical image half. Keep mapper/scanner packed. */
+    const uint32_t frame_size = panel_stride_px;
 
     // unroll by 2 to cut loop overhead, requires bit_depth even, which it is
     // this is the innermost loop of the mapper thread converting sRGB to BCM GPIO
@@ -925,6 +930,11 @@ void update_bcm_signal_64_rgb(
 /**
  * @brief helper posix_memalign avoids "aligned_alloc size must be multiple of alignment"
  */
+void update_bcm_signal_64_rgb(const hub75_display_t *scene, const void *bits,
+                              uint32_t *bcm, const uint8_t *image, uint8_t phase) {
+    update_bcm_signal_64_rgb_offset(scene, bits, bcm, image, phase, 0);
+}
+
 static inline void *aligned_alloc64(size_t size) {
     void *p = NULL;
     size_t rounded = (size + 63u) & ~((size_t)63u);
@@ -956,7 +966,7 @@ static inline void *aligned_alloc64(size_t size) {
  */
 void *tone_map_rgb_bits(const hub75_display_t *scene, const uint8_t bit_depth, uint16_t *quant_errors) {
     if (bit_depth > 64 || bit_depth < 8) {
-        die("bit depth must be between 8 and 64\n");
+        return NULL;
     }
 
     // one unified buffer, 64B aligned
@@ -964,7 +974,7 @@ void *tone_map_rgb_bits(const hub75_display_t *scene, const uint8_t bit_depth, u
     const size_t bytes   = entries * sizeof(uint64_t);
     uint64_t *bits = (uint64_t *)aligned_alloc64(bytes);
     if (UNLIKELY(!bits)) {
-        die("tone_map_rgb_bits: out of memory\n");
+        return NULL;
     }
     memset(bits, 0, bytes);
 
@@ -1228,35 +1238,41 @@ static inline void apply_panel_brightness_q8(uint8_t * pixels, uint8_t *mapped_p
 
 
 
+/* Scratch/LUT ownership follows the mapper thread, never the process. */
+static _Thread_local void *mapper_bits;
+static _Thread_local uint8_t *mapper_image, *mapper_image2;
+static _Thread_local const hub75_display_t *mapper_owner;
+static _Thread_local size_t mapper_size;
+
+void hub75_mapper_cache_clear(void) {
+    free(mapper_bits); free(mapper_image); free(mapper_image2);
+    mapper_bits = NULL; mapper_image = mapper_image2 = NULL;
+    mapper_owner = NULL; mapper_size = 0;
+}
+
 __attribute__((hot))
 hub75_error_t hub75_display_map_image_to_bcm(const hub75_display_t *scene, uint8_t *image) {
 
     // tone map the bits for the current scene, update if the lookup table if scene tone mapping changes....
     // TODO: create per panel tone mapping tables if panels have different characteristics
-    static void     *bits = NULL;
-    static uint8_t  *mapped_image = NULL;
-    static uint8_t  *mapped_image2 = NULL;
-    static uint8_t  phase = 1;
-    phase = phase + 1;
-
-    if (phase >= 64) { phase = 0; }
-    phase = 0;
-
-    if (UNLIKELY(bits == NULL)) {
-        const size_t image_sz = (size_t)(scene->width * scene->height * 4); // always allocate for RGBA8
-        if (mapped_image == NULL) {
-            mapped_image = (uint8_t*)calloc(image_sz, sizeof(uint8_t));
+    if (!scene) return HUB75_ERR_NULL_PARAM;
+    const size_t image_sz = (size_t)scene->width * scene->height * 4u;
+    if (mapper_owner != scene || mapper_size != image_sz)
+        hub75_mapper_cache_clear();
+    if (!mapper_bits) {
+        mapper_image = calloc(image_sz, 1);
+        mapper_image2 = calloc(image_sz, 1);
+        mapper_bits = tone_map_rgb_bits(scene, scene->bit_depth, scene->quant_errors_lut);
+        if (!mapper_image || !mapper_image2 || !mapper_bits) {
+            hub75_mapper_cache_clear();
+            return HUB75_ERR_OUT_OF_MEMORY;
         }
-        if (mapped_image2 == NULL) {
-            mapped_image2 = (uint8_t*)calloc(image_sz, sizeof(uint8_t));
-        }
-        if (bits != NULL) {
-            SAFE_FREE(bits);
-        }
-        bits = (uint64_t*)tone_map_rgb_bits(scene, scene->bit_depth, scene->quant_errors_lut);
-        build_port_luts(); // once
-        debug(" [*] tone mapped bits created\n");
+        mapper_owner = scene; mapper_size = image_sz;
+        build_port_luts();
     }
+    void *bits = mapper_bits;
+    uint8_t *mapped_image = mapper_image, *mapped_image2 = mapper_image2;
+    const uint8_t phase = 0;
 
     // select our image source (use frame_buffer.data as the primary source)
     uint8_t *image_ptr = (image == NULL) ? (uint8_t*)scene->frame_buffer.data : image;
@@ -1307,7 +1323,7 @@ hub75_error_t hub75_display_map_image_to_bcm(const hub75_display_t *scene, uint8
 
             // create the bcm signal for the current pixel, 
             // writes bit_depth *(sizeof(uint32_t)) bytes to bcm_signal
-            update_bcm_signal_64_rgb(scene, bits, bcm_signal, image_ptr, phase);
+            update_bcm_signal_64_rgb_offset(scene, bits, bcm_signal, image_ptr, phase, (size_t)y * width + x);
 
             //bcm_signal += bit_depth;// + 1;
             bcm_signal++;
@@ -1359,9 +1375,8 @@ void hub_clear(hub75_display_t *scene) {
 inline void draw_pixel(hub75_display_t *scene, const int x, const int y, const RGBA pixel) {
     const int32_t w = scene->frame_buffer.dimensions.x;
     const int32_t h = scene->frame_buffer.dimensions.y;
-    const int32_t fx = MIN(x, w - 1);
-    const int32_t fy = MIN(y, h - 1);
-    const int32_t idx = fy * w + fx;
+    if (x < 0 || y < 0 || x >= w || y >= h) return;
+    const int32_t idx = y * w + x;
 
     if (pixel.a == 255) {
         scene->frame_buffer.data[idx] = pixel;
@@ -1387,9 +1402,8 @@ inline void draw_pixel(hub75_display_t *scene, const int x, const int y, const R
 inline void draw_pixel_alpha(hub75_display_t *scene, const int x, const int y, const RGBA pixel) {
     const int32_t w = scene->frame_buffer.dimensions.x;
     const int32_t h = scene->frame_buffer.dimensions.y;
-    const int32_t fx = MIN(x, w - 1);
-    const int32_t fy = MIN(y, h - 1);
-    const int32_t idx = fy * w + fx;
+    if (x < 0 || y < 0 || x >= w || y >= h) return;
+    const int32_t idx = y * w + x;
     
     RGBA *dst = &scene->frame_buffer.data[idx];
     
@@ -1534,8 +1548,8 @@ void draw_line_aa(hub75_display_t *scene, const uint16_t x0, const uint16_t y0, 
 
     float fx0 = clampf((float)x0, 0, scene->width-1);
     float fx1 = clampf((float)x1, 0, scene->width-1);
-    float fy0 = clampf((float)y0, 0, scene->width-1);
-    float fy1 = clampf((float)y1, 0, scene->width-1);
+    float fy0 = clampf((float)y0, 0, scene->height-1);
+    float fy1 = clampf((float)y1, 0, scene->height-1);
 
     // Convert RGBA to RGB for draw_pixel_factor calls
     RGBA rgb_color = {color.r, color.g, color.b, 255};

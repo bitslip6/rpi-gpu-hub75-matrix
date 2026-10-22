@@ -305,8 +305,12 @@ int parse_panel_offsets(const char *arg,
 
 image_buffer_t *image_buffer_new(int32_t width, int32_t height) {
     image_buffer_t *buffer;
-    size_t buf_size = sizeof(image_buffer_t) + (size_t)(width * height * 4);
+    if (width <= 0 || height <= 0 || (size_t)width > UINT32_MAX / 4u ||
+        (size_t)height > (SIZE_MAX - sizeof(image_buffer_t)) / ((size_t)width * 4u))
+        return NULL;
+    size_t buf_size = sizeof(image_buffer_t) + (size_t)width * (size_t)height * 4u;
     buffer = calloc(buf_size, 1);
+    if (!buffer) return NULL;
     buffer->dimensions.x = (int32_t)width;
     buffer->dimensions.y = (int32_t)height;
     buffer->row_stride = (uint32_t)width * 4;
@@ -320,8 +324,8 @@ image_buffer_t *image_buffer_new(int32_t width, int32_t height) {
  */
 hub75_display_t *hub75_display_new() {
     // setup all scene configuration info
-    hub75_display_t *scene = (hub75_display_t*)malloc(sizeof(hub75_display_t));
-    memset(scene, 0, sizeof(hub75_display_t));
+    hub75_display_t *scene = (hub75_display_t*)calloc(1, sizeof(hub75_display_t));
+    if (!scene) return NULL;
     scene->width = IMG_WIDTH;
     scene->height = IMG_HEIGHT;
     scene->panel_height = PANEL_HEIGHT;
@@ -421,13 +425,16 @@ hub75_display_t *hub75_display_parse_args(int argc, char **argv) {
     // Parse command-line options
     int opt = 0;
     int num_scales = 0;
-    while ((opt = getopt(argc, argv, "S:O:T:P:o:x:y:X:Y:s:f:p:c:g:d:m:b:a:t:l:i:e:E:k:F:R:W:jzvqh?")) != -1) {
+    while ((opt = getopt(argc, argv, "S:O:T:P:o:x:y:X:Y:s:f:p:c:g:d:m:b:a:t:l:i:e:E:k:F:R:W:Ajzvqh?")) != -1) {
         switch (opt) {
         case 'r':
             scene->rising_edge = false;
             break;
         case 'S':
             scene->time_scale = atoff(optarg);
+            break;
+        case 'A':
+            scene->video_preserve_aspect = true;
             break;
         case 's':
             scene->shader_file = optarg;
@@ -1696,7 +1703,7 @@ void configure_gpio_4(uint32_t *PERIBase, int version) {
 	uint32_t sel_reg = (pin_num / 10);
 	uint32_t sel_shift = ((pin_num % 10) * 3);
 
-	PERIBase[sel_reg] = (PERIBase[sel_reg] & (uint32_t)~(0b111 << sel_shift)) | (0b001 << sel_shift);
+	PERIBase[sel_reg] = (PERIBase[sel_reg] & ~(0b111u << sel_shift)) | (0b001u << sel_shift);
 	// set pin to output mode
 	//PERIBase[sel_reg] &= ~(0b111 << sel_shift);
 	//PERIBase[sel_reg] |= (0b111 << sel_shift);
@@ -1710,16 +1717,16 @@ void configure_gpio_4(uint32_t *PERIBase, int version) {
 	uint32_t pdn_reg   = (57 + (pin_num / 16));
 	uint32_t pdn_shift = ((pin_num % 16) * 2);
 
-	PERIBase[pdn_reg] &= (uint32_t)~(0b11 << pdn_shift);
-	PERIBase[pdn_reg] |= (uint32_t) (0b10 << pdn_shift);
-	printf("%d pull down enabled\n", pin_num);
+	PERIBase[pdn_reg] &= ~(0b11u << pdn_shift);
+	PERIBase[pdn_reg] |= (0b10u << pdn_shift);
+	debug("%u pull down enabled\n", pin_num);
 
 	uint32_t drive_reg   = (129 + (pin_num / 16));
 	uint32_t drive_shift = ((pin_num % 16) * 2);
 
-	PERIBase[drive_reg] &= (uint32_t)~(0b11 << drive_shift);
-	PERIBase[drive_reg] |= (uint32_t)(0b11 << drive_shift);
-	printf("%d pull down enabled\n", pin_num);
+	PERIBase[drive_reg] &= ~(0b11u << drive_shift);
+	PERIBase[drive_reg] |= (0b11u << drive_shift);
+	debug("%u drive strength configured\n", pin_num);
 
 
 
@@ -1775,6 +1782,7 @@ void usage(__attribute__((unused))int argc, char **argv) {
     die(
         "Usage: %s\n"
         "     -s <file>         GPU fragment shader, or mp4 file to render\n"
+        "     -A                Preserve video aspect ratio (centered black bars)\n"
         "     -S <scale>        shader time scale factor  (0.01-1.0) - default 1.0 (lower = slower)\n"
         "     -x <width>        total image width         (16-512)\n"
         "     -y <height>       total image height        (16-512)\n"

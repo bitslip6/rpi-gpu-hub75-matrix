@@ -109,10 +109,10 @@ spsc_semring_t *spsc_create(size_t capacity, size_t item_size_bytes)
     }
 
     // Calculate total allocation size: structure + buffer data
-    size_t total_size = (capacity* item_size_bytes) + sizeof(spsc_semring_t);
-    // there is a bug here where there isn't memory alocated for the last frame,
-    // so we add one more frame to the allocation ....
-    spsc_semring_t *q = (spsc_semring_t *)malloc(total_size + item_size_bytes);
+    if (capacity > (SIZE_MAX - sizeof(spsc_semring_t)) / item_size_bytes)
+        return NULL;
+    size_t total_size = capacity * item_size_bytes + sizeof(spsc_semring_t);
+    spsc_semring_t *q = (spsc_semring_t *)malloc(total_size);
     if (!q) {
         printf("unable to allocate ring buffer of size %zu\n", total_size);
         return NULL;
@@ -128,7 +128,7 @@ spsc_semring_t *spsc_create(size_t capacity, size_t item_size_bytes)
     // Set buffer parameters
     q->capacity = capacity;
     q->item_size = item_size_bytes;
-    q->buff_size = item_size_bytes + (capacity * item_size_bytes);
+    q->buff_size = capacity * item_size_bytes;
 
     // Point the buffer to the memory immediately after the struct
     // Using (q + 1) advances by sizeof(spsc_semring_t) bytes
@@ -146,9 +146,12 @@ spsc_semring_t *spsc_create(size_t capacity, size_t item_size_bytes)
     // Initialize semaphores for blocking operations
     // can_push: initially equal to capacity (can push up to capacity items)
     // can_pop: initially 0 (cannot pop from empty buffer)
-    if (sem_init(&q->can_push, 0, (unsigned)capacity) != 0 ||
-        sem_init(&q->can_pop,  0, 0) != 0) {
-        printf("failed to init semaphores\n");
+    if (sem_init(&q->can_push, 0, (unsigned)capacity) != 0) {
+        free(q);
+        return NULL;
+    }
+    if (sem_init(&q->can_pop, 0, 0) != 0) {
+        sem_destroy(&q->can_push);
         free(q);
         return NULL;
     }
@@ -363,7 +366,10 @@ size_t spsc_count(const spsc_semring_t *q)
     
     // The difference gives us the number of items
     // This works correctly even with wraparound due to unsigned arithmetic
-    return (size_t)(h - t);
+    size_t count = (size_t)(h - t);
+    /* Third-party observers can sample across a producer/consumer advance.
+     * Occupancy is approximate, but must never escape the bounded capacity. */
+    return count > q->capacity ? q->capacity : count;
 }
 
 
@@ -379,7 +385,7 @@ size_t spsc_count(const spsc_semring_t *q)
  * Note: This should only be called if spsc_push_ptr_begin() succeeded but you
  *       decide not to commit the data (e.g., due to an error condition).
  */
-static inline void spsc_push_ptr_cancel(spsc_semring_t *q) {
+void spsc_push_ptr_cancel(spsc_semring_t *q) {
     if (!q) return;
     // We consumed one can_push token during begin(), return it
     // This restores the semaphore state as if the begin() never happened

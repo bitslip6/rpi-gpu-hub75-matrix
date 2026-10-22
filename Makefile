@@ -15,7 +15,7 @@
 .DEFAULT_GOAL := all
 .DELETE_ON_ERROR:
 
-VERSION        ?= 0.2.0
+VERSION        ?= 0.3.0
 CC             ?= gcc
 AR             ?= ar
 PKG_CONFIG     ?= pkg-config
@@ -96,11 +96,12 @@ endif
 PREFIX      ?= /usr/local
 INCLUDEDIR  ?= $(PREFIX)/include/rpihub75
 LIBDIR      ?= $(PREFIX)/lib
+INSTALL_HEADERS = include/hub75gpu.h include/hub75_runtime.h include/spsc.h include/pixels.h include/util.h include/rpihub75.h include/lists.h include/debug.h
 # (BUILDDIR set per BUILD above)
 
 # Sources
-SRC_COMMON = src/util.c src/spsc.c src/lowlevel.c src/pixels.c src/rpihub75.c src/api.c src/scene.c src/transformers.c src/3d.c src/gradient.c src/text_sdf.c src/functions.c src/compositor.c
-SRC_GPU    = src/gpu.c src/video.c
+SRC_COMMON = src/util.c src/spsc.c src/lowlevel.c src/pixels.c src/rpihub75.c src/api.c src/scene.c src/transformers.c src/3d.c src/gradient.c src/text_sdf.c src/functions.c src/compositor.c src/runtime.c src/render_commands.c
+SRC_GPU    = src/gpu.c src/video.c src/runtime_media.c
 
 # Library names
 LIB_BASENAME = rpihub75
@@ -137,7 +138,7 @@ else
 endif
 
 lib: $(LIB_NO_GPU)
-libgpu: $(LIB_GPU)
+libgpu: check-libs $(LIB_GPU)
 static: $(STATIC_LIB)
 
 print-vars:
@@ -162,36 +163,18 @@ $(BUILDDIR):
 	$(Q)mkdir -p $(BUILDDIR)
 
 check-libs:
-ifeq ($(GLESV2_FOUND),no)
-  $(error Missing glesv2 (sudo apt-get install libgles2-mesa-dev))
-endif
-ifeq ($(GBM_FOUND),no)
-  $(error Missing gbm (sudo apt-get install libgbm-dev))
-endif
-ifeq ($(EGL_FOUND),no)
-  $(error Missing egl (sudo apt-get install libegl1-mesa-dev))
-endif
-ifeq ($(AVCODEC_FOUND),no)
-  $(error Missing libavcodec (sudo apt-get install libavcodec-dev))
-endif
-ifeq ($(AVFORMAT_FOUND),no)
-  $(error Missing libavformat (sudo apt-get install libavformat-dev))
-endif
-ifeq ($(SWSCALE_FOUND),no)
-  $(error Missing libswscale (sudo apt-get install libswscale-dev))
-endif
-ifeq ($(AVUTIL_FOUND),no)
-  $(error Missing libavutil (sudo apt-get install libavutil-dev))
-endif
+	$(Q)for pkg in $(PKG_GPU) $(PKG_FFMPEG); do \
+		$(PKG_CONFIG) --exists $$pkg || { echo "Missing GPU dependency: $$pkg" >&2; exit 1; }; \
+	done
 
 # Shared libs
 $(LIB_NO_GPU): $(OBJ_COMMON) | $(BUILDDIR)
 	@echo "[LINK] $@ (CPU)"
-	$(Q)$(CC) -shared -o $@ $(OBJ_COMMON) $(LDLIBS_COMMON) $(LDLIBS_PNG) $(LDLIBS_JPEG)
+	$(Q)$(CC) $(LDFLAGS) -shared -o $@ $(OBJ_COMMON) $(LDLIBS_COMMON) $(LDLIBS_PNG) $(LDLIBS_JPEG)
 
 $(LIB_GPU): $(OBJ_COMMON) $(OBJ_GPU) | $(BUILDDIR)
 	@echo "[LINK] $@ (GPU+FFmpeg)"
-	$(Q)$(CC) -shared -o $@ $(OBJ_COMMON) $(OBJ_GPU) $(LDLIBS_COMMON) $(LDLIBS_FFMPEG) $(LDLIBS_GPU) $(LDLIBS_PNG) $(LDLIBS_JPEG)
+	$(Q)$(CC) $(LDFLAGS) -shared -o $@ $(OBJ_COMMON) $(OBJ_GPU) $(LDLIBS_COMMON) $(LDLIBS_FFMPEG) $(LDLIBS_GPU) $(LDLIBS_PNG) $(LDLIBS_JPEG)
 
 # Static lib (CPU part only)
 $(STATIC_LIB): $(OBJ_COMMON)
@@ -207,12 +190,12 @@ example-fast:
 
 ifeq ($(USE_SYSTEM_LIBS),1)
 SYSTEM_LIBDIR ?= $(LIBDIR)
-example: example.c
+example: example.c examples/runtime_demo.h
 	@echo "[CC ] $@ (system libs)"
 	$(Q)$(CC) $(CFLAGS) -Wl,-rpath,$(SYSTEM_LIBDIR) -o $@ $< \
 		-l$(LIB_BASENAME)_gpu$(VARIANT_SUFFIX) $(LDLIBS_COMMON) $(LDLIBS_FFMPEG) $(LDLIBS_GPU) $(LDLIBS_PNG) $(LDLIBS_JPEG)
 else
-example: example.c $(LIB_GPU)
+example: example.c examples/runtime_demo.h $(LIB_GPU)
 	@echo "[CC ] $@ (local libs)"
 	$(Q)$(CC) $(CFLAGS) -L. -Wl,-rpath,'$$ORIGIN' -o $@ $< \
 		-l$(LIB_BASENAME)_gpu$(VARIANT_SUFFIX) $(LDLIBS_COMMON) $(LDLIBS_FFMPEG) $(LDLIBS_GPU) $(LDLIBS_PNG) $(LDLIBS_JPEG)
@@ -236,20 +219,44 @@ scratch: tests/scratch.c $(LIB_GPU)
 	@echo "[CC ] $@"
 	$(Q)$(CC) $(CFLAGS) -L. -Wl,-rpath,'$$ORIGIN' -o $@ $< -l$(LIB_BASENAME)_gpu $(LDLIBS_COMMON) $(LDLIBS_FFMPEG) $(LDLIBS_GPU) || echo "scratch build skipped (missing file)"
 
-# Install / Uninstall
-install: all
+# Install / Uninstall (prefix/link settings can change without source timestamps)
+.PHONY: force-pkgconfig
+force-pkgconfig:
+$(BUILDDIR)/rpihub75.pc: rpihub75.pc.in Makefile force-pkgconfig | $(BUILDDIR)
+	$(Q)sed -e 's|@PREFIX@|$(PREFIX)|g' -e 's|@LIBDIR@|$(LIBDIR)|g' \
+		-e 's|@INCLUDEDIR@|$(INCLUDEDIR)|g' -e 's|@VERSION@|$(VERSION)|g' \
+		-e 's|@NAME@|rpihub75|g' -e 's|@LIBRARY@|$(LIB_BASENAME)$(VARIANT_SUFFIX)|g' \
+		-e 's|@PRIVATE_LIBS@|$(LDLIBS_COMMON) $(LDLIBS_PNG) $(LDLIBS_JPEG)|g' $< > $@
+
+$(BUILDDIR)/rpihub75_gpu.pc: rpihub75.pc.in Makefile force-pkgconfig | $(BUILDDIR)
+	$(Q)sed -e 's|@PREFIX@|$(PREFIX)|g' -e 's|@LIBDIR@|$(LIBDIR)|g' \
+		-e 's|@INCLUDEDIR@|$(INCLUDEDIR)|g' -e 's|@VERSION@|$(VERSION)|g' \
+		-e 's|@NAME@|rpihub75_gpu|g' -e 's|@LIBRARY@|$(LIB_BASENAME)_gpu$(VARIANT_SUFFIX)|g' \
+		-e 's|@PRIVATE_LIBS@|$(LDLIBS_COMMON) $(LDLIBS_FFMPEG) $(LDLIBS_GPU) $(LDLIBS_PNG) $(LDLIBS_JPEG)|g' $< > $@
+
+.PHONY: install-cpu
+install-cpu: lib $(BUILDDIR)/rpihub75.pc
+	$(Q)mkdir -p $(DESTDIR)$(INCLUDEDIR) $(DESTDIR)$(LIBDIR)/pkgconfig
+	$(Q)cp $(INSTALL_HEADERS) $(DESTDIR)$(INCLUDEDIR)
+	$(Q)cp $(LIB_NO_GPU) $(DESTDIR)$(LIBDIR)
+	$(Q)cp $(BUILDDIR)/rpihub75.pc $(DESTDIR)$(LIBDIR)/pkgconfig
+
+install: all $(BUILDDIR)/rpihub75.pc $(BUILDDIR)/rpihub75_gpu.pc
 	@echo "[INSTALL] headers -> $(DESTDIR)$(INCLUDEDIR)"
 	$(Q)mkdir -p $(DESTDIR)$(INCLUDEDIR)
 	@echo "[INSTALL] libs -> $(DESTDIR)$(LIBDIR)"
 	$(Q)mkdir -p $(DESTDIR)$(LIBDIR)
-	#$(Q)cp include/rpihub75.h include/util.h include/gpu.h include/spsc.h include/pixels.h include/video.h include/scene.h $(DESTDIR)$(INCLUDEDIR) 
-	$(Q)cp include/hub75gpu.h include/spsc.h include/pixels.h include/util.h $(DESTDIR)$(INCLUDEDIR) 
+	$(Q)cp $(INSTALL_HEADERS) $(DESTDIR)$(INCLUDEDIR)
 	$(Q)cp $(LIB_NO_GPU) $(LIB_GPU) $(DESTDIR)$(LIBDIR)
+	$(Q)mkdir -p $(DESTDIR)$(LIBDIR)/pkgconfig
+	$(Q)cp $(BUILDDIR)/rpihub75.pc $(BUILDDIR)/rpihub75_gpu.pc $(DESTDIR)$(LIBDIR)/pkgconfig
 	@echo "Consider running ldconfig (root) if not found at runtime."
 
 uninstall:
 	@echo "[UNINSTALL] removing libs + headers"
 	$(Q)rm -f $(DESTDIR)$(LIBDIR)/$(LIB_NO_GPU) $(DESTDIR)$(LIBDIR)/$(LIB_GPU)
+	$(Q)rm -f $(DESTDIR)$(LIBDIR)/pkgconfig/rpihub75.pc $(DESTDIR)$(LIBDIR)/pkgconfig/rpihub75_gpu.pc
+	$(Q)rm -f $(DESTDIR)$(INCLUDEDIR)/hub75_runtime.h $(DESTDIR)$(INCLUDEDIR)/lists.h $(DESTDIR)$(INCLUDEDIR)/debug.h
 	$(Q)rm -f $(DESTDIR)$(INCLUDEDIR)/rpihub75.h \
 	              $(DESTDIR)$(INCLUDEDIR)/util.h \
 	              $(DESTDIR)$(INCLUDEDIR)/gpu.h \
@@ -274,6 +281,9 @@ $(BUILDDIR)/%.o: src/%.c | $(BUILDDIR)
 	@echo "[CC ] $<"
 	$(Q)$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
+# Validation must not inherit finite-math assumptions from the SIMD renderer.
+$(BUILDDIR)/runtime.o $(BUILDDIR)/render_commands.o $(BUILDDIR)/runtime_media.o $(BUILDDIR)/text_sdf.o: CFLAGS += -fno-fast-math
+
 # Auto-generated dependency files
 -include $(DEPS)
 
@@ -283,18 +293,46 @@ $(BUILDDIR)/%.o: src/%.c | $(BUILDDIR)
 run: example
 	./example -h || true
 
-test: example
-	@echo "No test suite defined yet." 
+test: test-runtime test-rio-scan test-compositor-sine
 
-# Unit test for grayscale bilinear sampler
-tests/test_sampler: tests/unit/test_sampler.c $(LIB_NO_GPU)
-	@echo "[CC ] $@"
-	$(Q)$(CC) $(CFLAGS) -Iinclude -L. -Wl,-rpath,'$$ORIGIN/..' -o $@ $< \
+.PHONY: test-runtime test-python example-runtime
+$(BUILDDIR)/example_runtime: examples/runtime.c examples/runtime_demo.h $(LIB_NO_GPU)
+	$(Q)$(CC) $(CFLAGS) -Iexamples -L$(dir $(LIB_NO_GPU)) -Wl,-rpath,'$$ORIGIN:$$ORIGIN/../..' -o $@ $< \
 		-l$(LIB_BASENAME)$(VARIANT_SUFFIX) $(LDLIBS_COMMON) $(LDLIBS_PNG) $(LDLIBS_JPEG)
 
-test-sampler: tests/test_sampler
+example-runtime: $(BUILDDIR)/example_runtime
+$(BUILDDIR)/test_runtime: tests/unit/test_runtime.c src/runtime.c $(LIB_NO_GPU) include/hub75_runtime.h
+	@echo "[CC ] $@ (pin-free runtime)"
+	$(Q)$(CC) $(CFLAGS) -fno-fast-math -UNDEBUG -DH75_TESTING -L$(dir $(LIB_NO_GPU)) -Wl,-rpath,'$$ORIGIN:$$ORIGIN/../..' -o $@ $< src/runtime.c \
+		-l$(LIB_BASENAME)$(VARIANT_SUFFIX) $(LDLIBS_COMMON) $(LDLIBS_PNG) $(LDLIBS_JPEG)
+
+test-runtime: $(BUILDDIR)/test_runtime
+	$(Q)./$<
+
+# Requires an installed/in-place Python package. Never activates GPIO.
+test-python:
+	$(Q)PYTHONPATH=python $(PYTHON) -X faulthandler -m unittest discover -s python/tests -v
+
+PYTHON ?= python3
+
+# Unit test for grayscale bilinear sampler
+$(BUILDDIR)/test_sampler: tests/unit/test_sampler.c $(LIB_NO_GPU)
+	@echo "[CC ] $@"
+	$(Q)$(CC) $(CFLAGS) -UNDEBUG -L$(dir $(LIB_NO_GPU)) -Wl,-rpath,'$$ORIGIN:$$ORIGIN/../..' -o $@ $< \
+		-l$(LIB_BASENAME)$(VARIANT_SUFFIX) $(LDLIBS_COMMON) $(LDLIBS_PNG) $(LDLIBS_JPEG)
+
+test-sampler: $(BUILDDIR)/test_sampler
 	@echo "[RUN] $<"
-	$(Q)./tests/test_sampler
+	$(Q)./$<
+
+# Video fitting geometry test (no FFmpeg or GPIO required).
+.PHONY: test-video-fit
+test-video-fit: $(BUILDDIR)/test_video_fit
+	$(Q)./$<
+
+$(BUILDDIR)/test_video_fit: tests/test_video_fit.c include/video_fit.h
+	@mkdir -p $(dir $@)
+	$(Q)$(CC) -std=gnu2x -Wall -Wextra -UNDEBUG -Iinclude -o $@ $<
 
 # Sine compositor regression test (no GPIO access).
 .PHONY: test-compositor-sine

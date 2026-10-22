@@ -295,7 +295,7 @@ int cpu_get_pi_model(void) {
         debug("Could not open file /proc/cpuinfo\n");
         return -1;
     }
-    while (getline(&line, &line_sz, file)) {
+    while (getline(&line, &line_sz, file) >= 0) {
         if (strstr(line, "Pi 5") != NULL) {
             cpu_model = 5;
             break;
@@ -314,6 +314,7 @@ int cpu_get_pi_model(void) {
         }
     }
  
+    free(line);
     fclose(file);
 
     return cpu_model;

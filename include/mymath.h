@@ -1,3 +1,5 @@
+#ifndef H75_MYMATH_H
+#define H75_MYMATH_H
 #include <stdint.h>
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -60,7 +62,7 @@ static inline float mixf(const float x, const float y, const Normal a) {
  * @return float 
  */
 __attribute__((pure))
-inline float clampf(const float x, const float lower, const float upper) {
+static inline float clampf(const float x, const float lower, const float upper) {
 	return fmaxf(lower, fminf(x, upper));
 }
 
@@ -120,7 +122,7 @@ static inline int32_t saturating_add(int32_t a, int32_t b) {
 /**
  * helper: lerp between two uint8 channels 
  */
-inline uint8_t lerp_u8(uint8_t a, uint8_t b, Normal t) {
+static inline uint8_t lerp_u8(uint8_t a, uint8_t b, Normal t) {
     float v = (1.0f - t) * (float)a + t * (float)b;
     if (v < 0.0f) v = 0.0f;
     if (v > 255.0f) v = 255.0f;
@@ -128,3 +130,4 @@ inline uint8_t lerp_u8(uint8_t a, uint8_t b, Normal t) {
 }
 
 #define bit_count(x) __builtin_popcount(x)  // GCC/Clang built-in for counting set bits
+#endif

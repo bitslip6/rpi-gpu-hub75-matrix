@@ -30,6 +30,8 @@
 
 
 void *main_thread_mapper(void *arg);
+/* Call on the mapper's own thread after its final conversion. */
+void hub75_mapper_cache_clear(void);
 
 /**
  * @brief function definition to function that maps RGB image data
