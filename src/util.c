@@ -1,6 +1,7 @@
 
 #define _GNU_SOURCE
 #include <termios.h>
+#include <getopt.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -343,6 +344,10 @@ hub75_display_t *hub75_display_new() {
     scene->jitter_brightness = true;
 
     scene->bit_depth = 64;
+    scene->output_mode = H75_OUTPUT_EQUAL_SLOT;
+    scene->pwm_bits = 11;
+    scene->pwm_lsb_ns = 130;
+    scene->color_curve = H75_COLOR_CIE;
     scene->panel_order = PANEL_RGB;
     scene->tone_mapper = copy_tone_mapperF;
     scene->brightness = 200;
@@ -412,6 +417,15 @@ char *get_nth_token(const char *str, char delimiter, int position) {
  * @param argv 
  * @return scene_info* 
  */
+static uint32_t pwm_arg(const char *text, uint32_t max) {
+    char *end;
+    errno = 0;
+    unsigned long long n = strtoull(text, &end, 10);
+    if (!isdigit((unsigned char)*text) || *end || errno || !n || n > max)
+        die("Invalid PWM argument: %s\n", text);
+    return (uint32_t)n;
+}
+
 hub75_display_t *hub75_display_parse_args(int argc, char **argv) {
 
     // initialize the new scene
@@ -425,8 +439,31 @@ hub75_display_t *hub75_display_parse_args(int argc, char **argv) {
     // Parse command-line options
     int opt = 0;
     int num_scales = 0;
-    while ((opt = getopt(argc, argv, "S:O:T:P:o:x:y:X:Y:s:f:p:c:g:d:m:b:a:t:l:i:e:E:k:F:R:W:Ajzvqh?")) != -1) {
+    static const struct option options[] = {
+        {"output-mode", required_argument, NULL, 1000},
+        {"pwm-bits", required_argument, NULL, 1001},
+        {"pwm-lsb-ns", required_argument, NULL, 1002},
+        {"color-curve", required_argument, NULL, 1003},
+        {NULL, 0, NULL, 0}
+    };
+    while ((opt = getopt_long(argc, argv, "S:O:T:P:o:x:y:X:Y:s:f:p:c:g:d:m:b:a:t:l:i:e:E:k:F:R:W:Ajzvqh?", options, NULL)) != -1) {
         switch (opt) {
+        case 1000:
+            if (!strcmp(optarg, "equal-slot")) scene->output_mode = H75_OUTPUT_EQUAL_SLOT;
+            else if (!strcmp(optarg, "weighted-bcm")) scene->output_mode = H75_OUTPUT_WEIGHTED_BCM;
+            else die("Unknown output mode: %s\n", optarg);
+            break;
+        case 1001:
+            scene->pwm_bits = pwm_arg(optarg, 11);
+            break;
+        case 1002:
+            scene->pwm_lsb_ns = pwm_arg(optarg, UINT32_MAX);
+            break;
+        case 1003:
+            if (!strcmp(optarg, "cie")) scene->color_curve = H75_COLOR_CIE;
+            else if (!strcmp(optarg, "gamma")) scene->color_curve = H75_COLOR_GAMMA;
+            else die("Unknown color curve: %s\n", optarg);
+            break;
         case 'r':
             scene->rising_edge = false;
             break;
@@ -1792,6 +1829,10 @@ void usage(__attribute__((unused))int argc, char **argv) {
         "     -f <fps>          target frames per second  (1-255)   - omit to auto scale fps to 95%% CPU\n"
         "     -p <num ports>    number of ports           (1-3)     - omit to auto calcualte from -x\n"
         "     -c <num chains>   number of panels chained  (1-16)    - omit to auto calcualte from -y\n"
+        "     --output-mode <equal-slot|weighted-bcm> (default equal-slot)\n"
+        "     --pwm-bits <1..11> --pwm-lsb-ns <positive uint32> (defaults 11, 130)\n"
+        "     --color-curve <cie|gamma> (weighted only; default cie)\n"
+        "       Weighted BCM requires Pi 5 RIO; jitter/dithering are legacy-only.\n"
         "     -g <gamma>        gamma correction          (1.0-2.8) - default 1.0\n"
         "     -d <bit depth>    bit depth                 (8-64)    - default 64\n"
         "     -b <brightness>   overall brightness level  (1-254)   - default 128\n"

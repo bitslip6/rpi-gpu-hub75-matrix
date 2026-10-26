@@ -6,7 +6,7 @@
  * Resources are retained by scenes, commands and active playback. */
 #include "hub75gpu.h"
 
-#define HUB75_RUNTIME_ABI 1u
+#define HUB75_RUNTIME_ABI 2u
 #define HUB75_CAP_CPU 1u
 #define HUB75_CAP_SHADER 2u
 #define HUB75_CAP_VIDEO 4u
@@ -38,6 +38,12 @@ typedef struct {
     bool offscreen, quant_dither, jitter;
     int32_t gpio_cpu; /* -1: no affinity; scheduling/system tuning is never automatic */
     bool video_preserve_aspect; /* Fit with centered black bars; default false */
+    /* Enum values from h75_output_mode / h75_color_curve; fixed-width ABI fields. */
+    uint32_t output_mode, pwm_bits, pwm_lsb_ns, color_curve;
+    /* Weighted: 1..11 bits, positive uint32 nanoseconds, CIE or existing gamma.
+     * Physical output requires Pi 5 RIO and queue_depth >=2 (held + successor).
+     * Offscreen remains RGBA-only with no encoding/scanning on any host.
+     * jitter/quant_dither/dither are legacy-only; tone mapping is deferred. */
 } h75_config;
 typedef struct h75_runtime h75_runtime;
 typedef struct h75_resource h75_resource;

@@ -9,7 +9,7 @@
 #ifndef __HUB75GPU_H__
 #define __HUB75GPU_H__
 
-#define HUB75_API_VERSION_MAJOR 1
+#define HUB75_API_VERSION_MAJOR 2
 #define HUB75_API_VERSION_MINOR 0
 #define HUB75_API_VERSION ((HUB75_API_VERSION_MAJOR << 16) | HUB75_API_VERSION_MINOR)
 
@@ -256,6 +256,9 @@ typedef uint8_t *(*func_image_mapper_t)(const uint8_t *image_in, uint8_t *image_
  * @brief everything to define the scene and panel configuration 
  * This is a kind of global configuration for the entire system 
  */
+typedef enum { H75_OUTPUT_EQUAL_SLOT = 0, H75_OUTPUT_WEIGHTED_BCM = 1 } h75_output_mode;
+typedef enum { H75_COLOR_CIE = 0, H75_COLOR_GAMMA = 1 } h75_color_curve;
+
 typedef struct hub75_display {
     /** @brief the total width of the image in pixels */
     uint16_t width;
@@ -280,8 +283,14 @@ typedef struct hub75_display {
     /** @brief number of ports connected to the PI (1-3) */
     uint8_t num_ports;
 
-    /** @brief number of bits per color channel (8-64) */
+    /** @brief legacy equal-duration slot count (aligned 32-64), not PWM precision */
     uint8_t bit_depth;
+
+    /** Weighted-only settings; bit_depth remains the legacy equal-slot count. */
+    h75_output_mode output_mode;
+    uint32_t pwm_bits; /* 1..11; default 11 */
+    uint32_t pwm_lsb_ns; /* positive requested exposure; default 130; best effort */
+    h75_color_curve color_curve; /* CIE by default; GAMMA uses gamma */
 
     /** @brief brightness level (0-255) */
     uint8_t brightness;

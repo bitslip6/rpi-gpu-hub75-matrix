@@ -90,7 +90,9 @@ class SourceDistribution(sdist):
             shutil.copytree(ROOT / name, dest / name, dirs_exist_ok=True,
                             ignore=shutil.ignore_patterns("*.o", "*.tmp", "__pycache__"))
         for name in ("examples/runtime.c", "examples/runtime_demo.h",
-                     "tests/unit/test_runtime.c", "tests/unit/test_sampler.c"):
+                     "tests/unit/test_runtime.c", "tests/unit/test_sampler.c",
+                     "tests/unit/test_weighted_bcm.c", "tests/unit/test_weighted_rio.c",
+                     "tests/unit/test_weighted_delivery.c", "tests/unit/test_row_address.c"):
             target = dest / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / name, target)

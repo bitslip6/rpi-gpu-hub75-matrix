@@ -49,6 +49,8 @@
 #include "pixels.h"
 #include "scene.h"
 #include "lowlevel.h"
+#include "weighted_rio.h"
+#include "gpio_lock.h"
 
 
 // delay execution for a number of cycles
@@ -97,57 +99,6 @@ void hub75_display_wait(struct hub75_display *scene) {
 }
 
 
-/**
- * @brief calculate an address line pin mask for row y
- * not used outside this file
- * @param y the panel row number to calculate the mask for
- * @return uint32_t the bitmask for the address lines at row y
- */
-/*
- * Map logical row index y to address line bitmask.
- * Notes:
- * - We assume y is in [0, half_height). Apply modulo just in case.
- * - Some HATs wire A..E in reversed significance. Allow optional bit order flip.
- * - Optionally apply a small row offset for hardware that latches one row late/early.
- */
-uint32_t row_to_address(int y, uint16_t half_height) {
-    if (half_height == 0) return 0;
-
-    // normalize to [0, half_height)
-    uint16_t norm = (uint16_t)(y % half_height);
-    // defend against negative y although callers only pass non-negative
-    if (y < 0) {
-        int yy = y % (int)half_height;
-        if (yy < 0) yy += half_height;
-        norm = (uint16_t)yy;
-    }
-
-    // Optional compile-time row offset to quickly test off-by-one issues
-    #ifndef ROW_ADDRESS_Y_OFFSET
-    #define ROW_ADDRESS_Y_OFFSET -1
-    #endif
-    norm = (uint16_t)((norm + ROW_ADDRESS_Y_OFFSET) % half_height);
-
-    // Allow compile-time reversal of address bit significance if wiring differs
-    #ifndef ADDRESS_LSB_IS_A
-    #define ADDRESS_LSB_IS_A 1
-    #endif
-
-    const uint8_t order[5] =
-    #if ADDRESS_LSB_IS_A
-        { ADDRESS_A, ADDRESS_B, ADDRESS_C, ADDRESS_D, ADDRESS_E };
-    #else
-        { ADDRESS_E, ADDRESS_D, ADDRESS_C, ADDRESS_B, ADDRESS_A };
-    #endif
-
-    uint32_t bitmask = 0u;
-    for (uint8_t i = 0; i < 5; ++i) {
-        if (norm & (1u << i)) bitmask |= (1u << order[i]);
-    }
-    return bitmask;
-}
-
-
 extern hub75_display_t *g_scene;
 /**
  * @brief verify that the scene configuration is valid
@@ -155,6 +106,20 @@ extern hub75_display_t *g_scene;
  * @param scene 
  */
 void hub75_display_bind_scene(hub75_display_t *scene) {
+    size_t weighted_words = 0;
+    if (scene->output_mode == H75_OUTPUT_WEIGHTED_BCM) {
+        if (cpu_get_pi_model() != 5)
+            die("Weighted BCM requires Pi 5 RIO; no fallback is supported\n");
+        h75_weighted_lut lut;
+        if (h75_weighted_word_count(scene, &weighted_words) != H75_OK ||
+            h75_weighted_lut_build(scene, &lut) != H75_OK || !scene->pwm_lsb_ns ||
+            scene->width % 16 || scene->panel_width % 16 ||
+            weighted_words * sizeof(uint32_t) > SPSC_MAX_ITEM_SIZE ||
+            (size_t)scene->width * scene->height * 4 > SPSC_MAX_ITEM_SIZE)
+            die("Invalid weighted BCM configuration/topology\n");
+    } else if (scene->output_mode != H75_OUTPUT_EQUAL_SLOT) {
+        die("Unknown output mode\n");
+    }
     debug("ports: %d, chains: %d, width: %d, height: %d, stride: %d, bit_depth: %d\n", 
         scene->num_ports, scene->num_chains, scene->width, scene->height, scene->stride, scene->bit_depth);
 
@@ -222,18 +187,19 @@ void hub75_display_bind_scene(hub75_display_t *scene) {
 
     // each BCM "frame" is 32 bits (6 bits for addressing, 18 for RGB data)
     const uint16_t half_height = (uint16_t)(scene->panel_height / 2);
-    size_t ring_buf_size = (size_t)(scene->width * half_height * scene->bit_depth * 4);
+    size_t ring_buf_size = scene->output_mode == H75_OUTPUT_WEIGHTED_BCM
+        ? weighted_words * sizeof(uint32_t)
+        : (size_t)scene->width * half_height * scene->bit_depth * sizeof(uint32_t);
     // bcm renderer ring
     if (!(scene->ring_buf_renderer = spsc_create(8, ring_buf_size))) {
         die("failed to create renderer ring buffer\n");
     }
 
-    // allocate memory for the quantization error accumulator (3 beacuse we only have RGB (dont need alpha))
-    scene->accum = (int32_t*)calloc((size_t)(scene->width * scene->height * 4), sizeof(int32_t));
-
-    // allocate memory for LUT for input 8 bit RGB to 16 bit quant error value, forgot what 256 entries for R, G, B.
-    // we could probably use a single LUT for all 3 channels since they are all the same...
-    scene->quant_errors_lut = (uint16_t*)calloc(768*4, sizeof(uint16_t));
+    if (scene->output_mode == H75_OUTPUT_EQUAL_SLOT) {
+        // Legacy-only quantization/dithering state.
+        scene->accum = (int32_t*)calloc((size_t)(scene->width * scene->height * 4), sizeof(int32_t));
+        scene->quant_errors_lut = (uint16_t*)calloc(768*4, sizeof(uint16_t));
+    }
 
     // create RGB -> BCM mapper thread
     if (pthread_create(&scene->mapper_thread, NULL, main_thread_mapper, scene) != 0) {
@@ -380,6 +346,72 @@ static void legacy_scan_release(uint32_t *map,const hub75_display_t *scene,bool 
     free(jitter);munmap(map,64*1024*1024);
 }
 
+/* Same weighted encoder, SPSC boundary handoff and prepared scanner as the
+ * embedding runtime; only entry-point lifecycle/reporting differs. */
+static void *legacy_weighted_run(const hub75_display_t *scene, int model) {
+    if (model != 5 || !scene->ring_buf_renderer) {
+        fprintf(stderr, "weighted output requires Pi 5 RIO and a weighted frame queue\n");
+        return NULL;
+    }
+    int lock_fd = h75_gpio_lock_acquire();
+    if (lock_fd < 0) {
+        fprintf(stderr, "cannot acquire GPIO advisory lock for weighted output\n");
+        return NULL;
+    }
+    uint32_t *map = map_gpio(5);
+    configure_gpio(map, 5);
+    /* Blank before schedule building or any allocation/validation failure. */
+    map[RIO5_OFFSET + 0x2000 / 4] = PIN_OE;
+    io_write_barrier();
+    h75_weighted_rio scan = {0};
+    uint32_t addresses[32];
+    const unsigned rows = scene->panel_height / 2u;
+    if (rows != 16 && rows != 32) {
+        legacy_scan_release(map, scene, true, NULL, NULL);
+        close(lock_fd);
+        return NULL;
+    }
+    for (unsigned row = 0; row < rows; row++)
+        addresses[row] = h75_weighted_row_to_address((int)row, (uint16_t)rows);
+    h75_status status = h75_weighted_rio_init(&scan, scene, model,
+        map + RIO5_OFFSET, addresses, &scene->do_render, true);
+    const uint32_t *held = NULL;
+    if (status != H75_OK)
+        goto done;
+    uint64_t completed_cycles = 0;
+    struct timespec report_start;
+    clock_gettime(CLOCK_MONOTONIC, &report_start);
+    while (atomic_load(&scene->do_render)) {
+        status = h75_weighted_rio_frame_begin(&scan, scene->ring_buf_renderer, &held, 20);
+        if (status == H75_TIMEOUT)
+            continue;
+        if (status != H75_OK)
+            break;
+        status = h75_weighted_rio_cycle(&scan);
+        if (status != H75_OK)
+            break;
+        /* A refresh statistic is one full weighted cycle, repeats included. */
+        completed_cycles++;
+        if (scene->show_fps && completed_cycles >= 128) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            const double seconds = (double)(now.tv_sec - report_start.tv_sec) +
+                (double)(now.tv_nsec - report_start.tv_nsec) * 1e-9;
+            if (seconds > 0.0)
+                debug("Weighted full-cycle refresh: %.1fHz\n", (double)completed_cycles / seconds);
+            completed_cycles = 0;
+            report_start = now;
+        }
+    }
+done:
+    if (status != H75_OK && status != H75_CANCELLED)
+        fprintf(stderr, "weighted RIO scanner failed (%d)\n", status);
+    h75_weighted_rio_destroy(&scan);
+    legacy_scan_release(map, scene, true, NULL, held);
+    close(lock_fd);
+    return NULL;
+}
+
 #ifndef WARMUP_FRAMES
 #define WARMUP_FRAMES 8
 #endif
@@ -387,6 +419,8 @@ static void legacy_scan_release(uint32_t *map,const hub75_display_t *scene,bool 
 void* hub75_display_run_pi4(const hub75_display_t *scene) {
 
     int cpu_model = cpu_get_pi_model();
+    if (scene->output_mode == H75_OUTPUT_WEIGHTED_BCM)
+        return legacy_weighted_run(scene, cpu_model);
 
     // map the gpio address to we can control the GPIO pins
     uint32_t *PERIBase = map_gpio(cpu_model); // for root on pi5 (/dev/mem, offset is 0xD0000)
@@ -599,6 +633,9 @@ void* hub75_display_run(const hub75_display_t *scene) {
     int cpu_model = cpu_get_pi_model();
     debug(" [+] display_run CPU model %d: pinning to CPU 3\n", cpu_model);
     if (getenv("HUB75_LEGACY_RT")) cpu_affinity(3);
+
+    if (scene->output_mode == H75_OUTPUT_WEIGHTED_BCM)
+        return legacy_weighted_run(scene, cpu_model);
 
     if (cpu_model < 2) {
         die(" [!] Unsupported CPU model detected %d\n", cpu_model);

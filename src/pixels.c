@@ -25,12 +25,16 @@
 #include "mymath.h"
 #include "spsc.h"
 #include "compositor.h"
+#include "weighted_bcm.h"
 
 void *main_thread_mapper(void *arg)
 {
     debug(" [+] BCM mapper thread starting\n");
 
     hub75_display_t *scene = (hub75_display_t *)arg;
+    const bool weighted = scene->output_mode == H75_OUTPUT_WEIGHTED_BCM;
+    hub75_error_t (*map_frame)(const hub75_display_t *, uint8_t *) =
+        weighted ? hub75_display_map_image_to_weighted_bcm : hub75_display_map_image_to_bcm;
 
     while (scene->do_render)
     {
@@ -40,7 +44,11 @@ void *main_thread_mapper(void *arg)
         }
 
         // map the linear rgba image to bcm mapping
-        hub75_display_map_image_to_bcm(scene, src);
+        hub75_error_t status = map_frame(scene, src);
+        if (weighted && status != HUB75_OK && status != HUB75_ERR_RING_BUFFER_FULL) {
+            debug("BCM mapping failed (%d); stopping display\n", status);
+            scene->do_render = false;
+        }
 
         spsc_pop_ptr_commit(scene->ring_buf_mapper);
     }
@@ -1244,14 +1252,94 @@ static _Thread_local uint8_t *mapper_image, *mapper_image2;
 static _Thread_local const hub75_display_t *mapper_owner;
 static _Thread_local size_t mapper_size;
 
+static _Thread_local struct {
+    h75_weighted_lut lut;
+    uint8_t *image, *image2;
+    const hub75_display_t *owner;
+    size_t bytes;
+    uint32_t curve, gamma_bits;
+    uint8_t brightness;
+    bool valid;
+} weighted_mapper;
+
 void hub75_mapper_cache_clear(void) {
     free(mapper_bits); free(mapper_image); free(mapper_image2);
     mapper_bits = NULL; mapper_image = mapper_image2 = NULL;
     mapper_owner = NULL; mapper_size = 0;
+    free(weighted_mapper.image); free(weighted_mapper.image2);
+    memset(&weighted_mapper, 0, sizeof(weighted_mapper));
+}
+
+hub75_error_t hub75_display_map_image_to_weighted_bcm(const hub75_display_t *scene, uint8_t *image) {
+    if (!scene || !scene->ring_buf_renderer)
+        return HUB75_ERR_NULL_PARAM;
+    size_t words;
+    if (h75_weighted_word_count(scene, &words) != H75_OK ||
+        scene->ring_buf_renderer->item_size != words * sizeof(uint32_t))
+        return HUB75_ERR_INVALID_COORDS;
+    uint8_t *input = image ? image : (uint8_t *)scene->frame_buffer.data;
+    if (!input)
+        return HUB75_ERR_NULL_PARAM;
+    const size_t bytes = (size_t)scene->width * scene->height * scene->stride;
+    if (weighted_mapper.owner != scene || weighted_mapper.bytes != bytes)
+        hub75_mapper_cache_clear();
+    weighted_mapper.owner = scene;
+    weighted_mapper.bytes = bytes;
+    /* No full-image scratch is needed for the default unremapped path. */
+    if (scene->image_mapper && !weighted_mapper.image)
+        weighted_mapper.image = malloc(bytes);
+    if (scene->num_panel_types > 1 && !weighted_mapper.image2)
+        weighted_mapper.image2 = malloc(bytes);
+    if ((scene->image_mapper && !weighted_mapper.image) ||
+        (scene->num_panel_types > 1 && !weighted_mapper.image2)) {
+        hub75_mapper_cache_clear();
+        return HUB75_ERR_OUT_OF_MEMORY;
+    }
+    /* Use the float32 bit pattern as a cache key: this translation unit also
+     * contains the fast-math legacy encoder, so float comparisons must not
+     * conceal NaN changes from the strict weighted LUT validator. */
+    uint32_t gamma_bits;
+    memcpy(&gamma_bits, &scene->gamma, sizeof(gamma_bits));
+    /* Rebuild only on public curve/brightness changes; never via a corrected byte. */
+    if (!weighted_mapper.valid || weighted_mapper.lut.pwm_bits != scene->pwm_bits ||
+        weighted_mapper.curve != (uint32_t)scene->color_curve ||
+        weighted_mapper.brightness != scene->brightness || weighted_mapper.gamma_bits != gamma_bits) {
+        weighted_mapper.valid = false;
+        if (h75_weighted_lut_build(scene, &weighted_mapper.lut) != H75_OK)
+            return HUB75_ERR_INVALID_COORDS;
+        weighted_mapper.curve = (uint32_t)scene->color_curve;
+        weighted_mapper.brightness = scene->brightness;
+        weighted_mapper.gamma_bits = gamma_bits;
+        weighted_mapper.valid = true;
+    }
+    if (scene->image_mapper) {
+        if (!scene->image_mapper(input, weighted_mapper.image, scene))
+            return HUB75_ERR_INVALID_COORDS;
+        input = weighted_mapper.image;
+    }
+    if (scene->num_panel_types > 1) {
+        /* Preserve pixels on panels with no calibration entry as well. */
+        memcpy(weighted_mapper.image2, input, bytes);
+        apply_panel_brightness_q8(input, weighted_mapper.image2, scene);
+        input = weighted_mapper.image2;
+    }
+    /* No legacy dither/jitter, quantization accumulator or tone mapper. */
+    uint32_t *output = spsc_push_ptr_begin(scene->ring_buf_renderer, 200);
+    if (!output)
+        return HUB75_ERR_RING_BUFFER_FULL;
+    h75_status status = h75_weighted_encode(scene, &weighted_mapper.lut, input, bytes, output, words);
+    if (status != H75_OK) {
+        spsc_push_ptr_cancel(scene->ring_buf_renderer);
+        return HUB75_ERR_INVALID_COORDS;
+    }
+    spsc_push_ptr_commit(scene->ring_buf_renderer);
+    return HUB75_OK;
 }
 
 __attribute__((hot))
 hub75_error_t hub75_display_map_image_to_bcm(const hub75_display_t *scene, uint8_t *image) {
+    if (scene && scene->output_mode == H75_OUTPUT_WEIGHTED_BCM)
+        return hub75_display_map_image_to_weighted_bcm(scene, image);
 
     // tone map the bits for the current scene, update if the lookup table if scene tone mapping changes....
     // TODO: create per panel tone mapping tables if panels have different characteristics

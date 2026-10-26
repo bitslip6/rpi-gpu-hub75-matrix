@@ -84,7 +84,12 @@ static inline uint8_t u8_mul_div255(uint16_t x) {
  * @param scene the scene information
  * @param image the image to map to the scene bcm data. if NULL scene->image will be used
  */
+/* Dispatches by output_mode; worker threads select the mode-specific mapper
+ * once at startup. Both publish a complete immutable frame through SPSC. */
 hub75_error_t hub75_display_map_image_to_bcm(const hub75_display_t *scene, uint8_t *image);
+/* Weighted mapping shares image/panel preprocessing, not the legacy encoder,
+ * tone/dither state or 8-bit curve quantization. Clear TLS scratch on exit. */
+hub75_error_t hub75_display_map_image_to_weighted_bcm(const hub75_display_t *scene, uint8_t *image);
 
 
 /**

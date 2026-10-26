@@ -291,6 +291,10 @@ void *hub75_display_run(const hub75_display_t *scene);
  * @brief initialize the hub75gpu library
  */
 void hub75gpu_init();
+/* Equal-slot address policy: historical -1 default. Weighted defaults to 0.
+ * Both honor ADDRESS_LSB_IS_A and explicit ROW_ADDRESS_Y_OFFSET builds;
+ * WEIGHTED_ROW_ADDRESS_Y_OFFSET takes precedence for weighted mode only. */
 uint32_t row_to_address(int y, uint16_t half_height);
+uint32_t h75_weighted_row_to_address(int y, uint16_t half_height);
 
 #endif

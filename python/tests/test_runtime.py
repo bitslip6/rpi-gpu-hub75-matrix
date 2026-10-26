@@ -177,12 +177,37 @@ class LifecycleTests(unittest.TestCase):
 
 
 class ValidationTests(unittest.TestCase):
+    def test_output_defaults_and_weighted_offscreen(self):
+        c = h.DisplayConfig()
+        self.assertEqual(c.output_mode, h.OutputMode.EQUAL_SLOT)
+        self.assertEqual((c.bit_depth, c.pwm_bits, c.pwm_lsb_ns), (64, 11, 130))
+        self.assertEqual(c.color_curve, h.ColorCurve.CIE)
+        for bits in (1, 11):
+            for curve in h.ColorCurve:
+                with self.subTest(bits=bits, curve=curve):
+                    with h.Display(h.DisplayConfig(width=16, height=16, offscreen=True,
+                                   output_mode=h.OutputMode.WEIGHTED_BCM,
+                                   pwm_bits=bits, color_curve=curve, queue_depth=1)) as d:
+                        with d.frame() as f:
+                            f.clear((3, 17, 91))
+                        self.assertEqual(d.snapshot(), bytes((3, 17, 91, 255)) * 256)
+                        self.assertEqual(d.stats()["mapped"], 0)
+                        self.assertEqual(d.stats()["scanned"], 0)
+
+    def test_weighted_physical_queue_requires_successor_slot(self):
+        # Constructor validation only; never opens GPIO or starts a scanner.
+        with self.assertRaises(ValueError):
+            h.Display(h.DisplayConfig(output_mode=h.OutputMode.WEIGHTED_BCM, queue_depth=1))
+
     def test_config_ranges(self):
         cases = [dict(width=0), dict(height=-1), dict(width=2**64), dict(width=4097),
                  dict(bit_depth=8), dict(bit_depth=31), dict(bit_depth=65), dict(fps=0),
                  dict(brightness=255), dict(queue_depth=3), dict(ports=4), dict(chains=17),
                  dict(panel_order=8), dict(gamma=float("nan")), dict(dither=float("inf")),
-                 dict(offscreen=1), dict(gpio_cpu=-2), dict(mapping=99)]
+                 dict(offscreen=1), dict(gpio_cpu=-2), dict(mapping=99),
+                 dict(output_mode=2), dict(color_curve=2), dict(pwm_bits=0),
+                 dict(pwm_bits=12), dict(pwm_lsb_ns=0), dict(pwm_lsb_ns=-1),
+                 dict(pwm_lsb_ns=2**32), dict(pwm_lsb_ns=1.5)]
         for case in cases:
             with self.subTest(case=case):
                 values = dict(offscreen=True)

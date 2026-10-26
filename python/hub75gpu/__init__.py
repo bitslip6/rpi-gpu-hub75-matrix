@@ -42,6 +42,16 @@ class Mapping(IntEnum):
     U = 4
 
 
+class OutputMode(IntEnum):
+    EQUAL_SLOT = 0
+    WEIGHTED_BCM = 1
+
+
+class ColorCurve(IntEnum):
+    CIE = 0
+    GAMMA = 1
+
+
 class ToneMapping(IntEnum):
     NONE = 0
     ACES = 1
@@ -96,6 +106,10 @@ class DisplayConfig:
     jitter: bool = True
     video_preserve_aspect: bool = False
     gpio_cpu: int = -1
+    output_mode: OutputMode = OutputMode.EQUAL_SLOT
+    pwm_bits: int = 11
+    pwm_lsb_ns: int = 130
+    color_curve: ColorCurve = ColorCurve.CIE
 
 
 def capabilities() -> dict[str, Any]:

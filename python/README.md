@@ -102,14 +102,56 @@ Float settings must be finite; invalid integer ranges are rejected, not truncate
 `Mapping.U` is reserved: the unsafe legacy U mapper is not supported for physical
 runtime output. Flip/mirror mappings and panel color order are supported.
 
+### Optional weighted BCM (Pi 5 RIO)
+
+Equal-slot output remains the default. To select weighted output, add these
+settings to your topology configuration:
+
+```python
+config = h.DisplayConfig(
+    output_mode=h.OutputMode.WEIGHTED_BCM,
+    pwm_bits=11, pwm_lsb_ns=130, color_curve=h.ColorCurve.CIE,
+    queue_depth=4, offscreen=True,  # change only after verifying physical wiring
+)
+```
+
+`ColorCurve.GAMMA` uses the existing `gamma` parameter; CIE is the weighted
+default. `pwm_bits` accepts 1–11; it does not change the meaning of `bit_depth`.
+Brightness 0–254 scales linear drive after the curve. Tone mapping, jitter and
+legacy dithering settings are not applied in weighted mode.
+
+With `offscreen=False`, weighted output requires Pi 5 RIO and queue depth at
+least 2. Unsupported models raise `UnsupportedError` at start/context entry,
+not a fallback to another scanner. Offscreen weighted sessions work on any
+host but still produce RGBA snapshots, not simulated panel exposure. Physical
+frame replacements happen only at full-cycle boundaries; held frames repeat
+when no successor is available. The initial scanner blanks during shifting
+and latching, with best-effort counter-based exposure delays; overlap and
+on-display color/timing evaluation remain follow-up work.
+
+The demo accepts `--output-mode weighted-bcm --pwm-bits 11 --pwm-lsb-ns 130
+--color-curve cie`; it remains offscreen unless `--gpio --acknowledge-wiring`
+is explicitly supplied.
+
 Only one active physical runtime session is allowed per process. Cooperating
 processes also use the advisory lock `/tmp/rpi-hub75-rio-scope.lock`; this cannot
 protect against programs that ignore that lock. Multiple isolated offscreen CPU
 sessions are allowed. At most one EGL shader session runs per process.
 `gpio_cpu=-1` leaves affinity alone; a nonnegative CPU opts into scanner affinity.
+The demo exposes this as `--gpio-cpu CPU` (default -1). It pins only the physical
+GPIO scanner thread, not the shader/decoder or mapper. With an already isolated
+CPU3, use `--gpio-cpu 3`; optionally launch with
+`taskset -c 0-2 env PYTHONPATH=python python3 -m hub75gpu ... --gpio-cpu 3`
+to keep the other threads on CPUs0–2. The scanner explicitly selects CPU3;
+this requires the session's cgroup/cpuset to permit CPU3. Do not pin the whole
+application to CPU3. Offscreen sessions do not start a GPIO thread.
+
 Physical startup waits for scanner initialization/blanking; affinity failures are
-recoverable startup errors, not ignored warnings. No realtime scheduling or
-host-wide tuning is performed by the runtime. Do not inherit live native handles
+recoverable startup errors, not ignored warnings. Affinity reduces migrations
+and userspace contention but cannot mask hard IRQs or guarantee PWM deadlines.
+The tested kernel lacks `CONFIG_NO_HZ_FULL`, so periodic timer interrupts remain
+possible even on isolated CPUs. No realtime scheduling or host-wide tuning is
+performed by the runtime. Do not inherit live native handles
 across `fork()`; use multiprocessing `spawn` and construct resources in the child.
 
 ## Lifecycle, backpressure and errors
@@ -290,6 +332,47 @@ EOF/loop handling and interruptible FFmpeg reads. `fps` paces retained/shader
 content; video uses its timestamps (modified by `time_scale`, range .001–100).
 Stop/join a controller before changing producer modes. A controller from an older
 playback generation cannot control a replacement.
+
+### Video comparison with the demo
+
+The demo supports `--video FILE` (equivalent to `--mode video --file FILE`).
+Playback is native FFmpeg video-only decoding; it loops from the beginning until
+`--seconds` expires, then stops and blanks on context exit. It does not use a
+Python per-frame callback or open an EGL context for video.
+
+Video requires the FFmpeg-enabled build, currently selected by
+`HUB75_BACKEND=gpu`. If you run from the checkout with `PYTHONPATH=python`, rebuild
+the **in-place** extension, not just a separately installed package. From the
+repository root, after installing the optional development dependencies above:
+
+```sh
+(cd python && HUB75_BACKEND=gpu python3 setup.py build_ext --inplace)
+PYTHONPATH=python python3 -c 'import hub75gpu as h; print(h.capabilities())'
+```
+
+Verify `video: True`. For a verified Pi 5 / single 64×64 panel setup:
+
+```sh
+PYTHONPATH=python python3 -m hub75gpu \
+  --video /path/to/clip.mp4 --seconds 30 \
+  --gpio --acknowledge-wiring \
+  --output-mode weighted-bcm --pwm-bits 11 --pwm-lsb-ns 130 \
+  --color-curve cie --brightness 64 --preserve-aspect
+```
+
+Run the same command again with `--output-mode equal-slot` to compare the same
+clip from its beginning. Change the width/height/panel/ports/chains options for
+other topologies. `--brightness` accepts 0–254 and defaults to 64, retaining the
+original demo brightness. `--preserve-aspect` fits with black bars; omit it to
+stretch across the entire display. Video timing follows the file timestamps;
+`--fps` does not override its frame rate. Equal numeric brightness with CIE and
+the legacy curve is not a brightness-matched quality comparison.
+
+The default remains offscreen: omit `--gpio --acknowledge-wiring` for a pin-free
+playback/readback check. Missing video support, invalid file paths, and invalid
+brightness are reported before constructing a display or activating GPIO.
+
+### Text overlays
 
 ```python
 font = h.Font("assets/roboto", size=16)     # external metrics.csv + glyph PNGs

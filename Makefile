@@ -96,11 +96,11 @@ endif
 PREFIX      ?= /usr/local
 INCLUDEDIR  ?= $(PREFIX)/include/rpihub75
 LIBDIR      ?= $(PREFIX)/lib
-INSTALL_HEADERS = include/hub75gpu.h include/hub75_runtime.h include/spsc.h include/pixels.h include/util.h include/rpihub75.h include/lists.h include/debug.h
+INSTALL_HEADERS = include/weighted_bcm.h include/hub75gpu.h include/hub75_runtime.h include/spsc.h include/pixels.h include/util.h include/rpihub75.h include/lists.h include/debug.h
 # (BUILDDIR set per BUILD above)
 
 # Sources
-SRC_COMMON = src/util.c src/spsc.c src/lowlevel.c src/pixels.c src/rpihub75.c src/api.c src/scene.c src/transformers.c src/3d.c src/gradient.c src/text_sdf.c src/functions.c src/compositor.c src/runtime.c src/render_commands.c
+SRC_COMMON = src/util.c src/spsc.c src/lowlevel.c src/pixels.c src/rpihub75.c src/api.c src/scene.c src/transformers.c src/3d.c src/gradient.c src/text_sdf.c src/functions.c src/compositor.c src/runtime.c src/render_commands.c src/weighted_bcm.c src/weighted_rio.c src/gpio_lock.c src/row_address.c
 SRC_GPU    = src/gpu.c src/video.c src/runtime_media.c
 
 # Library names
@@ -282,7 +282,7 @@ $(BUILDDIR)/%.o: src/%.c | $(BUILDDIR)
 	$(Q)$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 # Validation must not inherit finite-math assumptions from the SIMD renderer.
-$(BUILDDIR)/runtime.o $(BUILDDIR)/render_commands.o $(BUILDDIR)/runtime_media.o $(BUILDDIR)/text_sdf.o: CFLAGS += -fno-fast-math
+$(BUILDDIR)/runtime.o $(BUILDDIR)/render_commands.o $(BUILDDIR)/runtime_media.o $(BUILDDIR)/text_sdf.o $(BUILDDIR)/weighted_bcm.o: CFLAGS += -fno-fast-math
 
 # Auto-generated dependency files
 -include $(DEPS)
@@ -293,7 +293,7 @@ $(BUILDDIR)/runtime.o $(BUILDDIR)/render_commands.o $(BUILDDIR)/runtime_media.o 
 run: example
 	./example -h || true
 
-test: test-runtime test-rio-scan test-compositor-sine
+test: test-runtime test-rio-scan test-compositor-sine test-row-address test-weighted-bcm test-weighted-rio test-weighted-delivery
 
 .PHONY: test-runtime test-python example-runtime
 $(BUILDDIR)/example_runtime: examples/runtime.c examples/runtime_demo.h $(LIB_NO_GPU)
@@ -314,6 +314,45 @@ test-python:
 	$(Q)PYTHONPATH=python $(PYTHON) -X faulthandler -m unittest discover -s python/tests -v
 
 PYTHON ?= python3
+
+# Standalone weighted encoder: no library loading, GPIO or GPU activation.
+.PHONY: test-weighted-bcm
+$(BUILDDIR)/test_weighted_bcm: tests/unit/test_weighted_bcm.c src/weighted_bcm.c include/weighted_bcm.h include/hub75_runtime.h include/hub75gpu.h include/rpihub75.h | $(BUILDDIR)
+	$(Q)$(CC) $(CFLAGS) -fno-fast-math -UNDEBUG -o $@ tests/unit/test_weighted_bcm.c src/weighted_bcm.c -lm
+
+test-weighted-bcm: $(BUILDDIR)/test_weighted_bcm
+	$(Q)./$<
+
+# Production row-address policies, including explicit build overrides/wiring.
+.PHONY: test-row-address
+ROW_ADDRESS_TEST_DEPS = tests/unit/test_row_address.c src/row_address.c include/rpihub75.h include/hub75gpu.h
+$(BUILDDIR)/test_row_address: $(ROW_ADDRESS_TEST_DEPS) | $(BUILDDIR)
+	$(Q)$(CC) $(CFLAGS) -UNDEBUG -o $@ tests/unit/test_row_address.c src/row_address.c
+$(BUILDDIR)/test_row_address_global: $(ROW_ADDRESS_TEST_DEPS) | $(BUILDDIR)
+	$(Q)$(CC) $(CFLAGS) -UNDEBUG -DROW_ADDRESS_Y_OFFSET=3 -DTEST_LEGACY_OFFSET=3 -DTEST_WEIGHTED_OFFSET=3 -o $@ tests/unit/test_row_address.c src/row_address.c
+$(BUILDDIR)/test_row_address_weighted: $(ROW_ADDRESS_TEST_DEPS) | $(BUILDDIR)
+	$(Q)$(CC) $(CFLAGS) -UNDEBUG -DWEIGHTED_ROW_ADDRESS_Y_OFFSET=-33 -DTEST_WEIGHTED_OFFSET=-33 -o $@ tests/unit/test_row_address.c src/row_address.c
+$(BUILDDIR)/test_row_address_reversed: $(ROW_ADDRESS_TEST_DEPS) | $(BUILDDIR)
+	$(Q)$(CC) $(CFLAGS) -UNDEBUG -DADDRESS_LSB_IS_A=0 -DTEST_REVERSED=1 -DROW_ADDRESS_Y_OFFSET=-2 -DWEIGHTED_ROW_ADDRESS_Y_OFFSET=1 -DTEST_LEGACY_OFFSET=-2 -DTEST_WEIGHTED_OFFSET=1 -o $@ tests/unit/test_row_address.c src/row_address.c
+
+test-row-address: $(BUILDDIR)/test_row_address $(BUILDDIR)/test_row_address_global $(BUILDDIR)/test_row_address_weighted $(BUILDDIR)/test_row_address_reversed
+	$(Q)for test in $^; do ./$$test || exit $$?; done
+
+# Compile-time RAM register/counter model; production uses direct MMIO stores.
+.PHONY: test-weighted-rio
+$(BUILDDIR)/test_weighted_rio: tests/unit/test_weighted_rio.c src/weighted_rio.c src/weighted_bcm.c $(LIB_NO_GPU) include/weighted_rio.h include/weighted_bcm.h include/hub75_runtime.h include/hub75gpu.h include/rpihub75.h | $(BUILDDIR)
+	$(Q)$(CC) $(CFLAGS) -fno-fast-math -UNDEBUG -DH75_WEIGHTED_RIO_TESTING -L$(dir $(LIB_NO_GPU)) -Wl,-rpath,'$$ORIGIN:$$ORIGIN/../..' -o $@ tests/unit/test_weighted_rio.c src/weighted_rio.c src/weighted_bcm.c -l$(LIB_BASENAME)$(VARIANT_SUFFIX) $(LDLIBS_COMMON)
+
+test-weighted-rio: $(BUILDDIR)/test_weighted_rio
+	$(Q)./$<
+
+# Shared weighted mapping/preprocessing through real SPSC queues; no GPIO.
+.PHONY: test-weighted-delivery
+$(BUILDDIR)/test_weighted_delivery: tests/unit/test_weighted_delivery.c $(LIB_NO_GPU) include/weighted_bcm.h include/pixels.h
+	$(Q)$(CC) $(CFLAGS) -fno-fast-math -UNDEBUG -L$(dir $(LIB_NO_GPU)) -Wl,-rpath,'$$ORIGIN:$$ORIGIN/../..' -o $@ $< -l$(LIB_BASENAME)$(VARIANT_SUFFIX) $(LDLIBS_COMMON)
+
+test-weighted-delivery: $(BUILDDIR)/test_weighted_delivery
+	$(Q)./$<
 
 # Unit test for grayscale bilinear sampler
 $(BUILDDIR)/test_sampler: tests/unit/test_sampler.c $(LIB_NO_GPU)

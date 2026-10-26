@@ -649,6 +649,7 @@ static int parse_config(PyObject *dict, h75_config *c) {
         U(panel_height)
         U(ports)
         U(chains)
+        U(output_mode) U(pwm_bits) U(pwm_lsb_ns) U(color_curve)
         U(bit_depth) U(fps) U(brightness) U(queue_depth) U(panel_order) U(mapping) U(tone_mapping)
 #undef U
 #define F(name)                                                                                    \

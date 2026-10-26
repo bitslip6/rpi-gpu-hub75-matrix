@@ -4,6 +4,8 @@
 #include "pixels.h"
 #include "transformers.h"
 #include "lowlevel.h"
+#include "weighted_rio.h"
+#include "gpio_lock.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -98,7 +100,7 @@ uint32_t hub75_runtime_capabilities(void) {
     return caps;
 }
 const char *hub75_runtime_build(void) {
-    return "hub75-runtime-1;library=0.3.0;rgba8;float32";
+    return "hub75-runtime-2;library=0.3.0;rgba8;float32";
 }
 void h75_config_default(h75_config *c) {
     *c = (h75_config){.size = sizeof(*c),
@@ -109,6 +111,10 @@ void h75_config_default(h75_config *c) {
                       .ports = 1,
                       .chains = 1,
                       .bit_depth = 64,
+                      .output_mode = H75_OUTPUT_EQUAL_SLOT,
+                      .pwm_bits = 11,
+                      .pwm_lsb_ns = 130,
+                      .color_curve = H75_COLOR_CIE,
                       .fps = 60,
                       .brightness = 200,
                       .queue_depth = 4,
@@ -125,6 +131,15 @@ h75_status h75_config_validate(const h75_config *c, h75_error *e) {
     if (c->ports < 1 || c->ports > 3 || c->chains < 1 || c->chains > 16 || !c->panel_width ||
         !c->panel_height || c->panel_width > 4096 || c->panel_height > 4096)
         return h75_fail(e, H75_INVALID, "invalid panel topology");
+    if (c->output_mode > H75_OUTPUT_WEIGHTED_BCM || c->color_curve > H75_COLOR_GAMMA ||
+        c->pwm_bits < 1 || c->pwm_bits > 11 || !c->pwm_lsb_ns)
+        return h75_fail(e, H75_INVALID, "invalid output mode, color curve, PWM bits or LSB duration");
+    /* Widen before multiplying: even UINT32_MAX ns at 11 bits and 2048
+     * scanned rows fits uint64_t. No electrical timing guarantees implied. */
+    uint64_t cycle_ns = (uint64_t)c->pwm_lsb_ns * ((1u << c->pwm_bits) - 1) *
+                        (c->panel_height / 2);
+    if (c->output_mode == H75_OUTPUT_WEIGHTED_BCM && !cycle_ns)
+        return h75_fail(e, H75_INVALID, "weighted cycle requires scanned rows");
     if (c->bit_depth < 32 || c->bit_depth > 64 || c->bit_depth % BIT_DEPTH_ALIGNMENT)
         return h75_fail(e, H75_INVALID, "native BCM mapper supports aligned bit depths 32..64");
     if (c->fps < 1 || c->fps > FPS_MAX || c->brightness > 254 || c->panel_order > 5 ||
@@ -139,10 +154,18 @@ h75_status h75_config_validate(const h75_config *c, h75_error *e) {
         (c->queue_depth & (c->queue_depth - 1)))
         return h75_fail(e, H75_INVALID, "queue depth must be a power of two in 1..32");
     if (!c->offscreen) {
+        if (c->output_mode == H75_OUTPUT_WEIGHTED_BCM && c->queue_depth < 2)
+            return h75_fail(e, H75_INVALID, "physical weighted output requires queue depth >=2 for held-frame replacement");
+#ifdef ADA_HAT
+        if (c->output_mode == H75_OUTPUT_WEIGHTED_BCM && c->ports != 1)
+            return h75_fail(e, H75_UNSUPPORTED, "this HAT wiring supports one weighted port only");
+#endif
         if (c->width != c->panel_width * c->chains || c->height != c->panel_height * c->ports ||
             c->width % 16 || c->panel_width % 16 ||
             (c->panel_height != 32 && c->panel_height != 64) ||
-            (uint64_t)c->width * (c->panel_height / 2) * c->bit_depth * 4 > SPSC_MAX_ITEM_SIZE)
+            (uint64_t)c->width * (c->panel_height / 2) *
+                (c->output_mode == H75_OUTPUT_WEIGHTED_BCM ? c->pwm_bits : c->bit_depth) *
+                sizeof(uint32_t) > SPSC_MAX_ITEM_SIZE)
             return h75_fail(e, H75_INVALID,
                             "physical topology requires width=panel_width*chains, "
                             "height=panel_height*ports; 32/64-row panels and aligned width");
@@ -229,6 +252,10 @@ h75_status h75_runtime_create(const h75_config *c, h75_runtime **out, h75_error 
     d->num_ports = (uint8_t)c->ports;
     d->num_chains = (uint8_t)c->chains;
     d->bit_depth = (uint8_t)c->bit_depth;
+    d->output_mode = c->output_mode;
+    d->pwm_bits = c->pwm_bits;
+    d->pwm_lsb_ns = c->pwm_lsb_ns;
+    d->color_curve = c->color_curve;
     d->fps = (uint16_t)c->fps;
     d->auto_fps = false;
     d->brightness = (uint8_t)c->brightness;
@@ -254,12 +281,17 @@ h75_status h75_runtime_create(const h75_config *c, h75_runtime **out, h75_error 
     if (!d->ring_buf_mapper)
         goto memory_fail;
     if (!c->offscreen) {
+        const uint32_t planes = c->output_mode == H75_OUTPUT_WEIGHTED_BCM ? c->pwm_bits : c->bit_depth;
         d->ring_buf_renderer = spsc_create(
-            c->queue_depth, (size_t)c->width * (c->panel_height / 2) * c->bit_depth * 4);
-        d->accum = calloc((size_t)c->width * c->height * 4, sizeof(int32_t));
-        d->quant_errors_lut = calloc(768 * 4, sizeof(uint16_t));
-        if (!d->ring_buf_renderer || !d->accum || !d->quant_errors_lut)
+            c->queue_depth, (size_t)c->width * (c->panel_height / 2) * planes * sizeof(uint32_t));
+        if (!d->ring_buf_renderer)
             goto memory_fail;
+        if (c->output_mode == H75_OUTPUT_EQUAL_SLOT) {
+            d->accum = calloc((size_t)c->width * c->height * 4, sizeof(int32_t));
+            d->quant_errors_lut = calloc(768 * 4, sizeof(uint16_t));
+            if (!d->accum || !d->quant_errors_lut)
+                goto memory_fail;
+        }
     }
     *out = r;
     return H75_OK;
@@ -279,6 +311,9 @@ mutex_fail:
 static void *sink_main(void *arg) {
     h75_runtime *r = arg;
     hub75_display_t *d = r->display;
+    hub75_error_t (*map_frame)(const hub75_display_t *, uint8_t *) =
+        d->output_mode == H75_OUTPUT_WEIGHTED_BCM ? hub75_display_map_image_to_weighted_bcm
+                                                : hub75_display_map_image_to_bcm;
     while (!atomic_load(&r->stop)) {
 #ifdef H75_TESTING
         if (atomic_load(&sink_paused)) {
@@ -300,14 +335,15 @@ static void *sink_main(void *arg) {
         if (!r->config.offscreen) {
             h75_error e = {0};
             uint64_t map_begin = h75_now_ns();
-            hub75_error_t s = hub75_display_map_image_to_bcm(d, p);
+            hub75_error_t s = map_frame(d, p);
             atomic_fetch_add(&r->map_ns, h75_now_ns() - map_begin);
             if (s == HUB75_OK)
                 atomic_fetch_add(&r->mapped, 1);
             else if (s == HUB75_ERR_RING_BUFFER_FULL)
                 atomic_fetch_add(&r->dropped, 1);
             else {
-                h75_fail(&e, H75_MEMORY, "BCM conversion failed (%d)", s);
+                h75_fail(&e, s == HUB75_ERR_OUT_OF_MEMORY ? H75_MEMORY : H75_INVALID,
+                         "BCM conversion failed (%d)", s);
                 worker_fail(r, &e);
                 h75_runtime_request_stop(r);
             }
@@ -347,6 +383,45 @@ static void gpio_blank(h75_runtime *r) {
         io_barrier();
     }
 }
+/* Selected once, never from the pixel loop. Only complete weighted cycles
+ * contribute to scanned; an interrupted partial cycle does not. */
+static void gpio_weighted_loop(h75_runtime *r, const uint32_t *addresses) {
+    h75_weighted_rio scan = {0};
+    h75_error error = {0};
+    h75_status status = INJECT(11) ? H75_MEMORY : h75_weighted_rio_init(&scan, r->display, r->gpio_model,
+        r->gpio + RIO5_OFFSET, addresses, &r->stop, false);
+    const uint32_t *held = NULL;
+    if (status != H75_OK)
+        goto failed;
+    atomic_store(&r->gpio_ready, true);
+    while (!atomic_load(&r->stop)) {
+        status = h75_weighted_rio_frame_begin(&scan, r->display->ring_buf_renderer, &held, 20);
+        if (status == H75_TIMEOUT)
+            continue;
+        if (status != H75_OK)
+            goto failed;
+        const uint64_t begin = h75_now_ns();
+        status = h75_weighted_rio_cycle(&scan);
+        atomic_fetch_add(&r->scan_ns, h75_now_ns() - begin);
+        if (status == H75_CANCELLED)
+            break;
+        if (status != H75_OK)
+            goto failed;
+        atomic_fetch_add(&r->scanned, 1);
+    }
+    goto done;
+failed:
+    h75_fail(&error, status, "weighted RIO scanner failed (%d)", status);
+    worker_fail(r, &error);
+    h75_runtime_request_stop(r);
+done:
+    /* Blank BEFORE returning a held slot or freeing the staging buffer. */
+    gpio_blank(r);
+    h75_weighted_rio_destroy(&scan);
+    if (held)
+        spsc_pop_ptr_commit(r->display->ring_buf_renderer);
+}
+
 static void *gpio_main(void *arg) {
     h75_runtime *r = arg;
     hub75_display_t *d = r->display;
@@ -370,11 +445,20 @@ static void *gpio_main(void *arg) {
     }
     configure_gpio(r->gpio, r->gpio_model);
     gpio_blank(r);
-    atomic_store(&r->gpio_ready, true);
     uint32_t addresses[32];
     unsigned rows = d->panel_height / 2;
+    /* Select the address policy once; weighted exposes newly latched data,
+     * unlike the legacy equal-slot shift/exposure pipeline. */
+    uint32_t (*address_for_row)(int, uint16_t) =
+        d->output_mode == H75_OUTPUT_WEIGHTED_BCM ? h75_weighted_row_to_address : row_to_address;
     for (unsigned y = 0; y < rows; y++)
-        addresses[y] = row_to_address((int)y, (uint16_t)rows);
+        addresses[y] = address_for_row((int)y, (uint16_t)rows);
+    if (d->output_mode == H75_OUTPUT_WEIGHTED_BCM) {
+        gpio_weighted_loop(r, addresses);
+        atomic_store(&r->gpio_done, true);
+        return NULL;
+    }
+    atomic_store(&r->gpio_ready, true);
     const uint32_t *held = NULL;
     unsigned brightness_acc = 0;
     while (!atomic_load(&r->stop)) {
@@ -466,6 +550,8 @@ static h75_status physical_open(h75_runtime *r, h75_error *e) {
     unsigned model = atomic_load(&gpio_model_mock);
     if (model) {
         r->gpio_model = (int)model;
+        if (r->config.output_mode == H75_OUTPUT_WEIGHTED_BCM && model != 5)
+            return h75_fail(e, H75_UNSUPPORTED, "weighted BCM requires Pi 5 RIO");
         void *memory = INJECT(8) ? MAP_FAILED
                                  : mmap(NULL, 64 * 1024 * 1024, PROT_READ | PROT_WRITE,
                                         MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
@@ -476,23 +562,14 @@ static h75_status physical_open(h75_runtime *r, h75_error *e) {
         return H75_OK;
     }
 #endif
-    const char *path = "/tmp/rpi-hub75-rio-scope.lock";
-    int flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK;
-    r->lock_fd = open(path, flags);
-    if (r->lock_fd < 0 && errno == ENOENT) {
-        r->lock_fd = open(path, flags | O_CREAT | O_EXCL, 0644);
-        if (r->lock_fd >= 0)
-            fchmod(r->lock_fd, 0644);
-        else if (errno == EEXIST)
-            r->lock_fd = open(path, flags);
-    }
-    struct stat st;
-    if (r->lock_fd < 0 || fstat(r->lock_fd, &st) || !S_ISREG(st.st_mode) || st.st_nlink != 1 ||
-        flock(r->lock_fd, LOCK_EX | LOCK_NB))
+    r->lock_fd = h75_gpio_lock_acquire();
+    if (r->lock_fd < 0)
         return h75_fail(e, H75_BUSY, "cannot acquire GPIO advisory lock: %s", strerror(errno));
     r->gpio_model = cpu_get_pi_model();
     if (r->gpio_model < 3 || r->gpio_model > 5)
         return h75_fail(e, H75_UNSUPPORTED, "GPIO requires a supported Raspberry Pi 3/4/5");
+    if (r->config.output_mode == H75_OUTPUT_WEIGHTED_BCM && r->gpio_model != 5)
+        return h75_fail(e, H75_UNSUPPORTED, "weighted BCM requires Pi 5 RIO");
     int fd =
         open(r->gpio_model == 5 ? "/dev/gpiomem0" : "/dev/gpiomem", O_RDWR | O_SYNC | O_CLOEXEC);
     if (fd < 0)

@@ -10,6 +10,144 @@ This is loosely based on the work done by hzeller adding HUB75 support to RPI (w
 as well as the work of Harry Fairhead documenting the peripheral address space for rpi5(https://www.i-programmer.info/programming/148-hardware/16887-raspberry-pi-iot-in-c-pi-5-memory-mapped-gpio.html). Also thanks to nothings stb image loader library which is used
 for loading textures for shaders. https://github.com/nothings/stb/blob/master/stb_image.h
 
+Weighted BCM output (phases 1–4)
+------------------------------------
+The default remains equal-slot output, with `bit_depth` retaining its existing
+32–64 aligned slot-count meaning. New, separate configuration fields are:
+
+| C / Python field | Default | Values |
+| --- | --- | --- |
+| `output_mode` | `H75_OUTPUT_EQUAL_SLOT` / `OutputMode.EQUAL_SLOT` | equal-slot or weighted BCM |
+| `pwm_bits` | 11 | 1–11 |
+| `pwm_lsb_ns` | 130 | positive uint32 nanoseconds (1–4294967295) |
+| `color_curve` | `H75_COLOR_CIE` / `ColorCurve.CIE` | CIE or GAMMA (uses existing `gamma`) |
+
+The weighted encoder, Pi 5 RIO scanner and frame-delivery path are connected.
+Physical output supports Pi 5 RIO only; starting it on other hardware returns
+`H75_UNSUPPORTED` (Python `UnsupportedError`) rather than falling back. Physical
+weighted queues require a power-of-two depth of at least 2, so the held frame
+can remain reserved while a successor is published. Offscreen displays accept
+either mode on any host, but only consume/read back RGBA: they do not encode
+planes, drive GPIO, or claim to evaluate weighted display quality.
+
+C example and Python demo CLI flags are `--output-mode equal-slot|weighted-bcm`,
+`--pwm-bits N`, `--pwm-lsb-ns N`, and `--color-curve cie|gamma`.
+For example, after verifying the Pi 5 wiring/topology, the native runtime demo
+can use `build/release/example_runtime --gpio --output-mode weighted-bcm
+--pwm-bits 11 --pwm-lsb-ns 130 --color-curve cie`. The legacy `./example` accepts
+the same weighted settings with its existing drawing/media options.
+
+For video comparison, the Python demo accepts `--video /path/to/clip.mp4
+--seconds 30 --brightness 64 --preserve-aspect`, alongside either output mode.
+This requires the FFmpeg-enabled in-place extension (`HUB75_BACKEND=gpu`), not
+the default CPU-only build. See [video demo build and comparison commands](python/README.md#video-comparison-with-the-demo).
+
+In C, initialize `h75_config c` with `h75_config_default(&c)`, then set
+`c.output_mode = H75_OUTPUT_WEIGHTED_BCM` before creating/starting the runtime.
+In Python, set `output_mode=h.OutputMode.WEIGHTED_BCM` and optionally
+`pwm_bits=11, pwm_lsb_ns=130, color_curve=h.ColorCurve.CIE` on `DisplayConfig`;
+keep `offscreen=True` until you intend to activate hardware.
+
+Requested timing is best effort, not an electrical pulse-width guarantee.
+Plane/cycle duration arithmetic uses 64-bit nanoseconds; output-buffer validation
+uses the selected mode's plane count. Weighted tone mapping is deferred;
+jitter, quantization dithering and legacy dithering settings are legacy-only.
+
+The hardware-free encoder API is in `include/weighted_bcm.h`:
+`h75_weighted_lut_build()`, `h75_weighted_word_count()`, and
+`h75_weighted_encode()`. It accepts already-preprocessed, tightly packed RGB or
+RGBA (alpha ignored), with parallel port images stacked vertically and chained
+panels laid out horizontally. Existing image/panel mapping can run before this
+encoder; it does not invoke those callbacks or mutate their state itself.
+The shared frame-delivery mapper invokes existing image/panel preprocessing
+before the encoder, using scratch buffers only when needed. It caches weighted
+LUTs per mapper thread and rebuilds them when curve, gamma, brightness or PWM
+precision changes. The legacy encoder and its color-processing path are retained.
+It emits only data-pin bits, in LSB-first plane × scanned-row × width order.
+Buffers and LUTs are caller-owned; the encoder has no global mutable state.
+
+CIE uses inverse perceptual L*: `L = byte/255 * 100`, then
+`Y = L * 27/24389` for `L <= 8`, otherwise `Y = ((L+16)/116)^3`.
+GAMMA uses `powf(byte/255, gamma)`. Both use float32 calculations, followed by
+linear drive scaling by `brightness/254`, clamping, and rounding at final PWM
+precision only. Thus brightness 0 is black and 254 is full drive. The three
+logical channel LUTs are built directly at 1–11-bit precision; no corrected
+8-bit intermediate, jitter mask, spatial or quantization dithering is used.
+Legacy processing is unchanged. Per-panel preprocessing, if used, remains
+separate from this high-precision curve conversion.
+
+The internal scanner API is in `include/weighted_rio.h`. It uses the same
+encoder and scanner helpers in the runtime and legacy entry points. Scanner
+selection is once at startup, not inside the pixel loop. Unsupported hardware
+is rejected rather than falling back. Both weighted entry points use the same
+GPIO advisory lock as the existing runtime; stop/error paths blank before
+releasing frame ownership or unmapping registers.
+
+Row-address policies are shared in `src/row_address.c`. Weighted output defaults
+to direct row addressing (offset 0): it latches each row before exposing it.
+Equal-slot retains its historical offset -1 and existing address arithmetic.
+Both retain `ADDRESS_LSB_IS_A` wiring. An explicit build-time
+`ROW_ADDRESS_Y_OFFSET` applies to both modes; `WEIGHTED_ROW_ADDRESS_Y_OFFSET`
+overrides it for weighted output only. No address decisions occur per pixel.
+
+### Weighted scanner memory and hot path
+
+- Compact queue frames remain plane-major. On a **new held frame only**, the
+  scanner copies into a private 64-byte-aligned row-major staging buffer:
+  `[row][plane][pixel]`, matching the actual weighted scan order.
+- Each staged uint32 already contains data, row-address and OE blanking bits,
+  plus a startup snapshot of non-HUB75 output bits. Repeats stream the same
+  buffer without repacking. A typical 64×32×11 scan uses 88 KiB of staging,
+  plus 128 bytes of prefetch padding. There is no expanded pair of clock words.
+- Initialization allocates and touches staging pages; preparation writes all
+  pixel words before the first scan. Row/plane descriptors and counter delays
+  are precomputed once. The scan loop does no allocation or image/LUT access.
+- The pixel kernel prefetches ahead, loads eight consecutive words, and emits
+  two direct RIO Out stores per pixel (clock low/high). Only an OR for CLK is
+  left per pixel. No mode/port/brightness/data branch, stop polling, timer read,
+  callback, or division occurs inside the pixel burst. Loop control is once per
+  eight pixels; widths must be divisible by 16. Device completion barriers are
+  at control boundaries, not per pixel.
+- The initial sequence is blank → shift → latch → expose for every plane of
+  each row. Exposure uses the AArch64 virtual counter and a busy wait, with
+  requested durations rounded up to counter ticks. OE stays blank during
+  address changes and latching, and stop is checked at plane boundaries and
+  during waits. Stop cannot interrupt a single row's shift burst.
+
+Cache hints/first-touch are not a guarantee against Linux preemption, paging,
+or capacity misses on large chains. No automatic `mlockall` or scheduler/host
+tuning is introduced. Requested exposure is best effort; control/MMIO overhead
+and preemption can lengthen it. Shift/exposure **overlap is deliberately deferred**
+until the basic output can be evaluated on a display; it is not simulated by
+leaving OE on beyond the requested exposure.
+
+The output SPSC slot size is `pwm_bits × scanned_rows × width × 4` bytes in
+weighted mode, not the legacy `bit_depth` slot count. Slots remain immutable
+while held. Only at a complete-cycle boundary does the shared handoff adopt a
+published successor; otherwise it repeats the held frame without restaging.
+One `scanned` statistic is one complete cycle, including repeats. Cancelled
+partial cycles do not increment it. Input submission/consumption, conversion,
+and scan statistics remain distinct; `flush()` waits for input consumption,
+not a guarantee that the physical panel has finished showing every submission.
+
+Run pin-free tests with `make test-row-address test-weighted-bcm test-weighted-rio
+test-weighted-delivery test-runtime` (all are also in `make test`). Scanner tests
+use compile-time RAM register/counter substitutions, check data/control ordering,
+duration arithmetic, cancellation, and a successor published mid-cycle. Address
+policy tests cover 16/32 scanned rows, wraparound, both address-bit orders and
+explicit offsets. RGB-to-GPIO row markers cover upper/lower halves and the
+192-wide, three-chain/three-port topology. Delivery
+tests exercise the shared mapper/preprocessing, backpressure and dynamic LUT
+updates. Runtime tests use anonymous RAM instead of MMIO to exercise weighted
+startup, repetition, replacement and unsupported models—not electrical pulse
+widths. Production builds contain no per-store test hooks. No test activates GPIO.
+
+**ABI break:** runtime ABI is now 2 and the public display API version is 2.0
+because configuration/display structures changed. Rebuild all native clients
+and Python extensions against the matching headers and library. Initialize C
+configuration with `h75_config_default()` before changing fields. Existing
+output defaults and legacy color processing are unchanged.
+
 Python and embedded C runtime (implementation preview)
 ------------------------------------------------------
 The typed `hub75gpu` package now provides display/frame contexts, native-owned
