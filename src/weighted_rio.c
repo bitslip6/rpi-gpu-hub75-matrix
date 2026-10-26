@@ -179,39 +179,58 @@ static inline bool running(const h75_weighted_rio *s) {
     return atomic_load_explicit(s->run_flag, memory_order_relaxed) == s->run_value;
 }
 
-static inline bool wait_exposure(uint64_t duration,
+static inline bool wait_exposure(uint64_t start, uint64_t duration,
                                   const volatile atomic_bool *flag, bool run_value) {
-    const uint64_t start = counter_now();
     while (counter_now() - start < duration)
         if (atomic_load_explicit(flag, memory_order_relaxed) != run_value)
             return false;
     return true;
 }
 
+/* Inlined burst shared by blank and illuminated shifting. The blank caller
+ * passes all bits/zero prefix (optimized away). The illuminated caller keeps
+ * only NEXT data, but uses the CURRENT address and OE state: row changes and
+ * latching must not occur until blank. No timers/stop decisions in this burst. */
+static inline __attribute__((always_inline)) void shift_eight(
+        volatile uint32_t *restrict out, const uint32_t *restrict src,
+        uint32_t keep, uint32_t prefix) {
+    __builtin_prefetch(src + 16, 0, 3);
+    /* Load a half-cache-line before hitting Device stores. This allows
+     * RAM reads to complete ahead of the GPIO burst, rather than serially
+     * waiting on a new RAM load between every clock pulse. */
+    const uint32_t v0 = (src[0] & keep) | prefix, v1 = (src[1] & keep) | prefix;
+    const uint32_t v2 = (src[2] & keep) | prefix, v3 = (src[3] & keep) | prefix;
+    const uint32_t v4 = (src[4] & keep) | prefix, v5 = (src[5] & keep) | prefix;
+    const uint32_t v6 = (src[6] & keep) | prefix, v7 = (src[7] & keep) | prefix;
+    /* Compiler-only register operands force these loads ahead of the MMIO
+     * burst. No Device barrier or emitted instruction per eight pixels. */
+    __asm__ __volatile__("" : : "r"(v0), "r"(v1), "r"(v2), "r"(v3),
+                         "r"(v4), "r"(v5), "r"(v6), "r"(v7) : "memory");
+#define PIXEL(v) do { WRITE(out, (v)); WRITE(out, (v) | PIN_CLK); } while (0)
+    PIXEL(v0); PIXEL(v1); PIXEL(v2); PIXEL(v3);
+    PIXEL(v4); PIXEL(v5); PIXEL(v6); PIXEL(v7);
+#undef PIXEL
+}
+
 static inline void shift_row(volatile uint32_t *restrict out,
                              const uint32_t *restrict src, uint32_t width) {
     const uint32_t *end = src + width;
-    /* Width validated once. No scalar tail, mode/port/brightness check, lookup,
-     * counter read, atomic, or per-pixel branch. Each eight-pixel chunk is 32 B.
-     * One cache line ahead (plus hardware sequential prefetch) hides some load
-     * latency; this is a hint, not a promise of cache residency under Linux. */
+    /* Nonzero multiple of eight, validated by caller. Minimal blank kernel. */
     do {
-        __builtin_prefetch(src + 16, 0, 3);
-        /* Load a half-cache-line before hitting Device stores. This allows
-         * RAM reads to complete ahead of the GPIO burst, rather than serially
-         * waiting on a new RAM load between every clock pulse. */
-        const uint32_t v0 = src[0], v1 = src[1], v2 = src[2], v3 = src[3];
-        const uint32_t v4 = src[4], v5 = src[5], v6 = src[6], v7 = src[7];
-        /* Compiler-only register operands force these loads ahead of the MMIO
-         * burst. No Device barrier or emitted instruction per eight pixels. */
-        __asm__ __volatile__("" : : "r"(v0), "r"(v1), "r"(v2), "r"(v3),
-                             "r"(v4), "r"(v5), "r"(v6), "r"(v7) : "memory");
-#define PIXEL(v) do { WRITE(out, (v)); WRITE(out, (v) | PIN_CLK); } while (0)
-        PIXEL(v0); PIXEL(v1); PIXEL(v2); PIXEL(v3);
-        PIXEL(v4); PIXEL(v5); PIXEL(v6); PIXEL(v7);
-#undef PIXEL
+        shift_eight(out, src, UINT32_MAX, 0);
         src += 8;
     } while (src != end);
+}
+
+/* Adaptive admission margin, NOT an electrical timing guarantee. Measure the
+ * same masked eight-pixel burst while blank at each cycle's startup. Increase
+ * the margin if an illuminated burst takes longer. Never overlap a burst when
+ * the remaining exposure is within twice the observed burst cost. Preemption
+ * can still extend exposure, as it can in the non-overlapped busy wait. */
+static uint64_t burst_margin(uint64_t ticks) {
+    if (!ticks)
+        return 1; /* coarse counters must not imply a zero-cost burst */
+    return ticks > UINT64_MAX / 2 ? UINT64_MAX : ticks * 2;
 }
 
 h75_status h75_weighted_rio_cycle(h75_weighted_rio *s) {
@@ -222,13 +241,21 @@ h75_status h75_weighted_rio_cycle(h75_weighted_rio *s) {
     h75_weighted_rio_blank(s);
     const uint32_t *src = s->words;
     const h75_weighted_rio_step *step = s->schedule, *end = step + s->steps;
+    if (!running(s))
+        goto cancelled;
+    WRITE(s->out, step->blank_address);
+    device_complete();
+    const uint64_t calibration_start = counter_now();
+    shift_eight(s->out, src, MASK_DATA, step->blank_address);
+    device_complete();
+    uint64_t margin = burst_margin(counter_now() - calibration_start);
+    shift_row(s->out, src + 8, s->width - 8);
     for (; step != end; step++, src += s->width) {
         if (!running(s))
             goto cancelled;
-        /* Last exposure ended blank. Change address while OE is high. */
-        WRITE(s->out, step->blank_address);
-        device_complete();
-        shift_row(s->out, src, s->width);
+        /* The current row/plane was fully shifted at startup or during the
+         * previous exposure (with any remaining pixels completed while blank).
+         * No pending exposure is carried across the full-frame boundary. */
         WRITE(s->clear, PIN_CLK);
         device_complete();
         WRITE(s->set, PIN_LATCH);
@@ -239,11 +266,45 @@ h75_status h75_weighted_rio_cycle(h75_weighted_rio *s) {
             goto cancelled;
         WRITE(s->clear, PIN_OE);
         device_complete();
-        /* Dedicated counter-based busy wait. Stop remains responsive even for
-         * deliberately very long exposures. No ordinary OS sleeps. */
-        if (!wait_exposure(step->exposure_ticks, s->run_flag, s->run_value))
+        const uint64_t start = counter_now();
+        uint32_t shifted = 0;
+        const bool has_next = step + 1 != end;
+        if (has_next && step->exposure_ticks > margin) {
+            const uint32_t *next = src + s->width;
+            const uint32_t active_prefix = step->blank_address & ~(uint32_t)PIN_OE;
+            while (shifted < s->width) {
+                if (!running(s))
+                    goto cancelled;
+                const uint64_t before = counter_now();
+                const uint64_t elapsed = before - start;
+                if (elapsed >= step->exposure_ticks ||
+                    step->exposure_ticks - elapsed <= margin)
+                    break;
+                shift_eight(s->out, next + shifted, MASK_DATA, active_prefix);
+                /* Drain Device writes before sampling burst duration. This is
+                 * once per eight-pixel burst, never once per pixel. */
+                device_complete();
+                const uint64_t cost = burst_margin(counter_now() - before);
+                if (cost > margin)
+                    margin = cost;
+                shifted += 8;
+            }
+        }
+        /* One deadline from unblanking; do NOT restart a full exposure after
+         * shifting. Short planes and the end-of-frame drain use the same wait. */
+        if (!wait_exposure(start, step->exposure_ticks, s->run_flag, s->run_value))
             goto cancelled;
         h75_weighted_rio_blank(s);
+        if (has_next) {
+            if (!running(s))
+                goto cancelled;
+            WRITE(s->out, (step + 1)->blank_address);
+            device_complete();
+            /* An expired/short exposure never waits illuminated for shifting
+             * to finish. Continue at exactly the first unshifted pixel. */
+            if (shifted < s->width)
+                shift_row(s->out, src + s->width + shifted, s->width - shifted);
+        }
     }
     return H75_OK;
 cancelled:

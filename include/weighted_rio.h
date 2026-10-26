@@ -67,9 +67,15 @@ h75_status h75_weighted_rio_frame_begin(h75_weighted_rio *scan, spsc_semring_t *
 /* One FULL cycle: for each row, all planes LSB-first. Pixel kernel is unrolled,
  * sequential loads + two Out stores per pixel, with no data-dependent branch,
  * timer, stop polling, allocation, lookup or function pointer call per pixel.
- * Stop is checked at plane boundaries and during exposure waits. Returns
- * CANCELLED for partial cycles; OK only after all rows/planes. Always blanks.
- * Initial path: blank -> shift -> latch -> expose, without shift overlap. */
+ * While exposing, preload the next plane in eight-pixel bursts, retaining the
+ * CURRENT address/OE and preserved pins. Counter/stop checks are BETWEEN bursts.
+ * Short/expired exposures finish before any remaining shift proceeds blank.
+ * An adaptive burst-cost margin avoids starting bursts close to the deadline;
+ * this is best-effort Linux timing, not a hard real-time exposure guarantee.
+ * Stop is checked between illuminated bursts, at plane boundaries and during
+ * waits. Returns CANCELLED for partial cycles; OK only after all rows/planes.
+ * Always drains the final exposure and blanks before returning: no shifting or
+ * exposure from another frame crosses the complete-cycle ownership boundary. */
 h75_status h75_weighted_rio_cycle(h75_weighted_rio *scan);
 void h75_weighted_rio_blank(h75_weighted_rio *scan);
 void h75_weighted_rio_destroy(h75_weighted_rio *scan);

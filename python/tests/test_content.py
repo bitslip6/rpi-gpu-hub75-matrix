@@ -189,6 +189,35 @@ class VideoTests(unittest.TestCase):
 @unittest.skipUnless(h.capabilities()["shader"] and os.environ.get("HUB75_TEST_GPU") == "1",
                      "EGL tests require GPU build and explicit HUB75_TEST_GPU=1 (no GPIO)")
 class ShaderTests(unittest.TestCase):
+    def test_motion_diagnostic_dynamic_rows_are_coherent(self):
+        # Exercise the real shader/readback -> RGBA queue -> snapshot path at
+        # the reported topology size, but NEVER initialize GPIO. Accelerated
+        # shader time covers both directions and holds without a 20-second test.
+        shader = Path(__file__).resolve().parents[2] / "shaders" / "motion_coherence.glsl"
+        config = h.DisplayConfig(width=192, height=192, offscreen=True, fps=100)
+        positions = set()
+        with h.Display(config) as d:
+            p = d.play_shader(shader, time_scale=10)
+            p.ready(10)
+            deadline = time.monotonic() + 3
+            while d.stats()["consumed"] == 0:
+                self.assertLess(time.monotonic(), deadline, "no shader frame delivered")
+                time.sleep(.01)
+            end = time.monotonic() + 2
+            while time.monotonic() < end:
+                pixels = d.snapshot()
+                row = pixels[:192 * 4]
+                self.assertEqual(pixels, row * 192)
+                bright = tuple(x for x in range(192) if row[x * 4] == 255)
+                self.assertEqual(len(bright), 6)
+                for x in range(192):
+                    value = 255 if x in bright else 0
+                    self.assertEqual(row[x * 4:x * 4 + 4], bytes((value, value, value, 255)))
+                positions.add(bright)
+                time.sleep(.02)
+            p.stop(3)
+        self.assertGreater(len(positions), 2, "must check multiple moving frames, not one snapshot")
+
     def test_shader_and_cpu_overlay(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "solid.glsl"
