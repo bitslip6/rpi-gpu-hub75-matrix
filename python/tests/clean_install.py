@@ -57,6 +57,7 @@ def main():
 import json, pathlib, sys
 import hub75gpu as h
 caps=h.capabilities()
+assert caps['abi']==3, caps
 with h.Display(h.DisplayConfig(width=8,height=8,offscreen=True)) as d:
     with d.frame() as f:f.clear((13,27,91))
     assert d.snapshot()==bytes((13,27,91,255))*64
@@ -80,7 +81,7 @@ print(json.dumps({'caps':caps,'package':h.__file__,'extension':h._native.__file_
                 assert not any(n in native_dynamic for n in ("libEGL", "libGLES", "libgbm", "libavcodec", "libswscale"))
             # ABI rejection must happen at import, before table-by-value use.
             bad = work / "badabi.c"
-            bad.write_text("unsigned hub75_runtime_abi(void){return 999;}\n")
+            bad.write_text("unsigned hub75_runtime_abi(void){return 2;}\n")
             library = work / "badabi.so"
             run([os.environ.get("CC", "cc"), "-shared", "-fPIC", bad, "-o", library], cwd=work, env=env)
             bad_env = dict(env, LD_PRELOAD=str(library))

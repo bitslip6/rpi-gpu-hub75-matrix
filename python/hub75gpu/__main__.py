@@ -31,9 +31,7 @@ def main() -> None:
     p.add_argument("--preserve-aspect", action="store_true", help="fit video with black bars instead of stretching")
     p.add_argument("--font", type=Path, help="external SDF font directory")
     p.add_argument("--output", type=Path, help="save final raw RGBA8 snapshot")
-    p.add_argument("--gpio", action="store_true", help="activate physical output (default: offscreen)")
-    p.add_argument("--gpio-cpu", type=int, default=-1,
-                   help="pin only the GPIO scanner thread to this CPU; -1 leaves affinity unchanged (default)")
+    p.add_argument("--gpio", action="store_true", help="activate physical output with mandatory CPU3 scanner affinity (default: offscreen)")
     p.add_argument("--acknowledge-wiring", action="store_true")
     args = p.parse_args()
     if args.video is not None:
@@ -53,8 +51,6 @@ def main() -> None:
         p.error("--seconds must be in (0, 86400]")
     if not 0 <= args.brightness <= 254:
         p.error("--brightness must be in 0..254")
-    if args.gpio_cpu < -1:
-        p.error("--gpio-cpu must be -1 or a nonnegative CPU index")
     if args.mode in ("video", "shader") and not args.file.is_file():
         p.error(f"{args.mode} requires an existing local file: {args.file}")
     caps = h.capabilities()
@@ -66,7 +62,6 @@ def main() -> None:
                             chains=args.chains, panel_width=args.panel_width,
                             panel_height=args.panel_height, fps=args.fps,
                             brightness=args.brightness, offscreen=not args.gpio,
-                            gpio_cpu=args.gpio_cpu,
                             video_preserve_aspect=args.preserve_aspect,
                             output_mode=h.OutputMode.WEIGHTED_BCM if args.output_mode == "weighted-bcm" else h.OutputMode.EQUAL_SLOT,
                             pwm_bits=args.pwm_bits, pwm_lsb_ns=args.pwm_lsb_ns,

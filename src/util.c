@@ -1863,8 +1863,10 @@ void usage(__attribute__((unused))int argc, char **argv) {
         "                       waves across display : pixels : radians/sec (0 freezes, negative reverses)\n"
         "                       -k sets the unshifted top edge; leave room above and below\n"
         "     -? -h             this help\n"
-        "     NOTE: Pi 5 users can run 'sudo ./configure-system.py' for better display response (persistent; --restore to undo).\n"
-        "     NOTE: if runing as root, it will automatically use the real-time scheduler which reduces flicker\n"
+        "     Physical scanners require CPU3; startup fails if unavailable or cpuset-prohibited.\n"
+        "     Launch with taskset -c 0-2 to keep producer threads off the scanner CPU.\n"
+        "     CPU3 isolation/IRQ policy is separate deployment setup, not configured here.\n"
+        "     Affinity is mandatory without HUB75_LEGACY_RT; unrelated RT tuning remains opt-in.\n"
         , argv[0], SERVER_PORT);
 }
 

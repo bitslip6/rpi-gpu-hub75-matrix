@@ -6,7 +6,7 @@
  * Resources are retained by scenes, commands and active playback. */
 #include "hub75gpu.h"
 
-#define HUB75_RUNTIME_ABI 2u
+#define HUB75_RUNTIME_ABI 3u
 #define HUB75_CAP_CPU 1u
 #define HUB75_CAP_SHADER 2u
 #define HUB75_CAP_VIDEO 4u
@@ -35,8 +35,9 @@ typedef struct {
     uint32_t size, width, height, panel_width, panel_height, ports, chains;
     uint32_t bit_depth, fps, brightness, queue_depth, panel_order, mapping, tone_mapping;
     float gamma, dither, tone_level;
+    /* Physical scanner startup requires effective affinity exactly {3}.
+     * Offscreen/producer threads are never pinned; no host tuning is automatic. */
     bool offscreen, quant_dither, jitter;
-    int32_t gpio_cpu; /* -1: no affinity; scheduling/system tuning is never automatic */
     bool video_preserve_aspect; /* Fit with centered black bars; default false */
     /* Enum values from h75_output_mode / h75_color_curve; fixed-width ABI fields. */
     uint32_t output_mode, pwm_bits, pwm_lsb_ns, color_curve;

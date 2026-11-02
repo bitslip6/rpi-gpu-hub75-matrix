@@ -440,7 +440,11 @@ void *main_thread_mapper(void *arg);
  * EG:
  * scene->do_render = false; // will cause render_forever to exit from another thread
  */
+/* Physical scanner: mandatory CPU3, restores caller affinity after cleanup.
+ * NULL means normal stop; non-NULL means failure (diagnostic on stdout).
+ * Affinity failures request scene stop; no embedding-process exit. */
 void *hub75_display_run(const hub75_display_t *scene);
+void *hub75_display_run_pi4(const hub75_display_t *scene);
 
 /**
  * @brief render the shader arg->shader_file shader on the GPU

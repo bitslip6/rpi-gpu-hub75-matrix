@@ -199,12 +199,19 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             h.Display(h.DisplayConfig(output_mode=h.OutputMode.WEIGHTED_BCM, queue_depth=1))
 
+    def test_removed_gpio_cpu_is_unknown(self):
+        for value in (-1, 0, 3):
+            with self.assertRaisesRegex(TypeError, "gpio_cpu"):
+                h.DisplayConfig(gpio_cpu=value)
+            with self.assertRaisesRegex(TypeError, "unknown configuration option: gpio_cpu"):
+                h._native.Runtime(dict(offscreen=True, gpio_cpu=value))
+
     def test_config_ranges(self):
         cases = [dict(width=0), dict(height=-1), dict(width=2**64), dict(width=4097),
                  dict(bit_depth=8), dict(bit_depth=31), dict(bit_depth=65), dict(fps=0),
                  dict(brightness=255), dict(queue_depth=3), dict(ports=4), dict(chains=17),
                  dict(panel_order=8), dict(gamma=float("nan")), dict(dither=float("inf")),
-                 dict(offscreen=1), dict(gpio_cpu=-2), dict(mapping=99),
+                 dict(offscreen=1), dict(mapping=99),
                  dict(output_mode=2), dict(color_curve=2), dict(pwm_bits=0),
                  dict(pwm_bits=12), dict(pwm_lsb_ns=0), dict(pwm_lsb_ns=-1),
                  dict(pwm_lsb_ns=2**32), dict(pwm_lsb_ns=1.5)]

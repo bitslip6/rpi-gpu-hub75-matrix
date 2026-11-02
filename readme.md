@@ -142,11 +142,40 @@ updates. Runtime tests use anonymous RAM instead of MMIO to exercise weighted
 startup, repetition, replacement and unsupported models—not electrical pulse
 widths. Production builds contain no per-store test hooks. No test activates GPIO.
 
-**ABI break:** runtime ABI is now 2 and the public display API version is 2.0
-because configuration/display structures changed. Rebuild all native clients
-and Python extensions against the matching headers and library. Initialize C
-configuration with `h75_config_default()` before changing fields. Existing
-output defaults and legacy color processing are unchanged.
+**ABI break:** embedding runtime ABI is now **3** (`hub75-runtime-3`) because
+`h75_config.gpio_cpu` was removed. Rebuild all native clients and Python extensions
+against matching headers/library; the import-time ABI check rejects ABI 2. The
+separate legacy `hub75gpu_t` function-table API remains **2.0**; its layout did not
+change in this affinity update. Initialize C configuration with
+`h75_config_default()` before changing fields. Existing output defaults, color
+processing and fixed-eight-pixel overlap are unchanged.
+
+All physical scanners (equal-slot and weighted, legacy C, embedding C and Python)
+now require their scanning thread's effective affinity to be exactly **CPU3**.
+There is no `gpio_cpu` option or `--gpio-cpu` flag; old settings are rejected.
+Native startup sets and verifies affinity before configuring GPIO. Startup fails
+if CPU3 is absent, offline, excluded by a cpuset/cgroup, or affinity fails; no
+fallback CPU is used. Offscreen rendering, imports, validation and producers do
+not request affinity.
+
+Continue launching applications with `taskset -c 0-2` to keep producers on CPUs0–2;
+the scanner alone explicitly selects CPU3. Taskset is not a cgroup cpuset
+boundary. CPU3 isolation/full-dynticks/IRQ handling remain separate deployment
+prerequisites: affinity neither disables IRQs nor guarantees zero interrupts.
+This library does not configure isolation, IRQs, governors or RT budgets, and
+mandatory pinning does not depend on `HUB75_LEGACY_RT`.
+
+Legacy `hub75_display_run()` and direct `hub75_display_run_pi4()` save the caller's
+original mask and restore it after scanner/output cleanup. NULL means normal
+stop; non-NULL means failure. Affinity errors, including restoration failures,
+reach **stdout**; `./example` waits for producer cleanup and exits nonzero. The
+library does not terminate an embedding process on affinity failure.
+
+Pin-free `make test` uses compile-time fake affinity operations, never real CPU3
+pinning. For user-operated acceptance only, inspect
+`/proc/<pid>/task/<tid>/status`: the scanner's `Cpus_allowed_list` must be `3`,
+while taskset-launched workers retain `0-2`. A sampled processor (`psr`) is not
+proof of affinity. See [the CPU3 plan](GPIO_CPU3_PLAN.md) for physical acceptance.
 
 Python and embedded C runtime (implementation preview)
 ------------------------------------------------------

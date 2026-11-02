@@ -137,21 +137,33 @@ Only one active physical runtime session is allowed per process. Cooperating
 processes also use the advisory lock `/tmp/rpi-hub75-rio-scope.lock`; this cannot
 protect against programs that ignore that lock. Multiple isolated offscreen CPU
 sessions are allowed. At most one EGL shader session runs per process.
-`gpio_cpu=-1` leaves affinity alone; a nonnegative CPU opts into scanner affinity.
-The demo exposes this as `--gpio-cpu CPU` (default -1). It pins only the physical
-GPIO scanner thread, not the shader/decoder or mapper. With an already isolated
-CPU3, use `--gpio-cpu 3`; optionally launch with
-`taskset -c 0-2 env PYTHONPATH=python python3 -m hub75gpu ... --gpio-cpu 3`
-to keep the other threads on CPUs0–2. The scanner explicitly selects CPU3;
-this requires the session's cgroup/cpuset to permit CPU3. Do not pin the whole
-application to CPU3. Offscreen sessions do not start a GPIO thread.
+Physical GPIO scanners **always require effective affinity exactly `{3}`**, enforced
+in native C for Python, the embedding runtime and legacy C entry points. There is
+no CPU-selection setting: the former `gpio_cpu` constructor/native dictionary key
+and `--gpio-cpu` flag are rejected, not ignored. Launch with
+`taskset -c 0-2 env PYTHONPATH=python python3 -m hub75gpu ...`
+to keep producers, shader/decoder and mapper threads on CPUs0–2. Only the scanner
+expands its own mask to CPU3. A taskset mask is not a cpuset boundary; the session's
+cgroup/cpuset must actually permit CPU3. Physical startup fails if CPU3 is absent,
+offline, prohibited, or its exact affinity cannot be set and verified. Do not pin
+the whole application to CPU3. Offscreen/import/validation do not request affinity
+and work normally on hosts without CPU3.
+
+**Migration:** embedding runtime ABI is now **3** (build identity
+`hub75-runtime-3`). Rebuild native clients and Python extensions together; ABI-2
+extensions are not compatible. The separate legacy `hub75gpu_t` function-table
+API stays at 2.0 because its layout has not changed. Legacy scanner calls save
+and restore the calling thread's mask after output cleanup. They return NULL on
+normal stop, non-NULL on failure; affinity errors (including restoration failure)
+are printed to stdout, and `./example` returns a nonzero exit status.
 
 Physical startup waits for scanner initialization/blanking; affinity failures are
 recoverable startup errors, not ignored warnings. Affinity reduces migrations
 and userspace contention but cannot mask hard IRQs or guarantee PWM deadlines.
-The tested kernel lacks `CONFIG_NO_HZ_FULL`, so periodic timer interrupts remain
-possible even on isolated CPUs. No realtime scheduling or host-wide tuning is
-performed by the runtime. Do not inherit live native handles
+CPU3 isolation, full-dynticks and IRQ handling are separate deployment prerequisites,
+not features configured or guaranteed by this library. Affinity alone does not
+disable IRQs or guarantee zero interrupts. No realtime scheduling or host-wide
+tuning is performed by the runtime. Do not inherit live native handles
 across `fork()`; use multiprocessing `spawn` and construct resources in the child.
 
 ## Lifecycle, backpressure and errors

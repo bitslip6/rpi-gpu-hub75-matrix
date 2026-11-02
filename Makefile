@@ -100,7 +100,7 @@ INSTALL_HEADERS = include/weighted_bcm.h include/hub75gpu.h include/hub75_runtim
 # (BUILDDIR set per BUILD above)
 
 # Sources
-SRC_COMMON = src/util.c src/spsc.c src/lowlevel.c src/pixels.c src/rpihub75.c src/api.c src/scene.c src/transformers.c src/3d.c src/gradient.c src/text_sdf.c src/functions.c src/compositor.c src/runtime.c src/render_commands.c src/weighted_bcm.c src/weighted_rio.c src/gpio_lock.c src/row_address.c
+SRC_COMMON = src/util.c src/spsc.c src/lowlevel.c src/pixels.c src/rpihub75.c src/api.c src/scene.c src/transformers.c src/3d.c src/gradient.c src/text_sdf.c src/functions.c src/compositor.c src/runtime.c src/render_commands.c src/weighted_bcm.c src/weighted_rio.c src/gpio_lock.c src/row_address.c src/gpio_affinity.c src/legacy_scan.c
 SRC_GPU    = src/gpu.c src/video.c src/runtime_media.c
 
 # Library names
@@ -293,7 +293,7 @@ $(BUILDDIR)/runtime.o $(BUILDDIR)/render_commands.o $(BUILDDIR)/runtime_media.o 
 run: example
 	./example -h || true
 
-test: test-runtime test-rio-scan test-compositor-sine test-row-address test-weighted-bcm test-weighted-rio test-weighted-delivery
+test: test-gpio-affinity test-legacy-affinity test-runtime test-rio-scan test-compositor-sine test-row-address test-weighted-bcm test-weighted-rio test-weighted-delivery
 
 .PHONY: test-runtime test-python example-runtime
 $(BUILDDIR)/example_runtime: examples/runtime.c examples/runtime_demo.h $(LIB_NO_GPU)
@@ -301,9 +301,27 @@ $(BUILDDIR)/example_runtime: examples/runtime.c examples/runtime_demo.h $(LIB_NO
 		-l$(LIB_BASENAME)$(VARIANT_SUFFIX) $(LDLIBS_COMMON) $(LDLIBS_PNG) $(LDLIBS_JPEG)
 
 example-runtime: $(BUILDDIR)/example_runtime
-$(BUILDDIR)/test_runtime: tests/unit/test_runtime.c src/runtime.c $(LIB_NO_GPU) include/hub75_runtime.h
+AFFINITY_TEST_SOURCES = src/gpio_affinity.c tests/unit/fake_gpio_affinity.c
+AFFINITY_TEST_DEPS = $(AFFINITY_TEST_SOURCES) include/gpio_affinity.h tests/unit/fake_gpio_affinity.h
+AFFINITY_TEST_FLAGS = -UNDEBUG -DH75_AFFINITY_TESTING -Itests/unit
+
+$(BUILDDIR)/test_gpio_affinity: tests/unit/test_gpio_affinity.c $(AFFINITY_TEST_DEPS) | $(BUILDDIR)
+	$(Q)$(CC) $(CFLAGS) $(AFFINITY_TEST_FLAGS) -o $@ $< $(AFFINITY_TEST_SOURCES) $(LDLIBS_COMMON)
+
+# Compile the real scanner dispatch and lifecycle with RAM GPIO/fake affinity.
+$(BUILDDIR)/test_legacy_affinity: tests/unit/test_legacy_affinity.c src/rpihub75.c src/legacy_scan.c $(AFFINITY_TEST_DEPS) $(LIB_NO_GPU)
+	$(Q)$(CC) $(CFLAGS) $(AFFINITY_TEST_FLAGS) -L$(dir $(LIB_NO_GPU)) -Wl,-rpath,'$$ORIGIN:$$ORIGIN/../..' -Wl,--wrap=munmap -o $@ $< src/rpihub75.c src/legacy_scan.c $(AFFINITY_TEST_SOURCES) \
+		-l$(LIB_BASENAME)$(VARIANT_SUFFIX) $(LDLIBS_COMMON) $(LDLIBS_PNG) $(LDLIBS_JPEG)
+
+.PHONY: test-gpio-affinity test-legacy-affinity
+test-gpio-affinity: $(BUILDDIR)/test_gpio_affinity
+	$(Q)./$<
+test-legacy-affinity: $(BUILDDIR)/test_legacy_affinity
+	$(Q)./$<
+
+$(BUILDDIR)/test_runtime: tests/unit/test_runtime.c src/runtime.c $(LIB_NO_GPU) include/hub75_runtime.h $(AFFINITY_TEST_DEPS)
 	@echo "[CC ] $@ (pin-free runtime)"
-	$(Q)$(CC) $(CFLAGS) -fno-fast-math -UNDEBUG -DH75_TESTING -L$(dir $(LIB_NO_GPU)) -Wl,-rpath,'$$ORIGIN:$$ORIGIN/../..' -o $@ $< src/runtime.c \
+	$(Q)$(CC) $(CFLAGS) -fno-fast-math $(AFFINITY_TEST_FLAGS) -DH75_TESTING -L$(dir $(LIB_NO_GPU)) -Wl,-rpath,'$$ORIGIN:$$ORIGIN/../..' -Wl,--wrap=configure_gpio -o $@ $< src/runtime.c $(AFFINITY_TEST_SOURCES) \
 		-l$(LIB_BASENAME)$(VARIANT_SUFFIX) $(LDLIBS_COMMON) $(LDLIBS_PNG) $(LDLIBS_JPEG)
 
 test-runtime: $(BUILDDIR)/test_runtime

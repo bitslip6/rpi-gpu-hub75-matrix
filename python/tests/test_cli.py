@@ -71,26 +71,32 @@ class DemoArguments(unittest.TestCase):
             self.assertEqual(code, 0, error)
             config = display.call_args.args[0]
             self.assertEqual(config.brightness, 64)
-            self.assertEqual(config.gpio_cpu, -1)
+            self.assertFalse(hasattr(config, "gpio_cpu"))
             self.assertFalse(config.video_preserve_aspect)
             display.return_value.__enter__.return_value.play_video.assert_called_once_with(path, loop=True)
 
-    def test_gpio_cpu_forwarded_without_changing_other_settings(self):
-        # Display is mocked: no affinity changes or GPIO activation in this test.
-        for cpu in (-1, 0, 3):
-            with self.subTest(cpu=cpu):
-                code, display, _, error = self.invoke([
-                    "--gpio", "--acknowledge-wiring", "--gpio-cpu", str(cpu),
-                    "--output-mode", "weighted-bcm", "--width", "192", "--height", "192",
-                    "--chains", "3", "--ports", "3",
-                ])
-                self.assertEqual(code, 0, error)
-                config = display.call_args.args[0]
-                self.assertEqual(config.gpio_cpu, cpu)
-                self.assertFalse(config.offscreen)
-                self.assertEqual(config.output_mode, h.OutputMode.WEIGHTED_BCM)
-                self.assertEqual((config.width, config.height, config.chains, config.ports),
-                                 (192, 192, 3, 3))
+    def test_gpio_topology_and_output_settings(self):
+        # Display is mocked: native policy is not implemented in Python.
+        code, display, _, error = self.invoke([
+            "--gpio", "--acknowledge-wiring",
+            "--output-mode", "weighted-bcm", "--width", "192", "--height", "192",
+            "--chains", "3", "--ports", "3",
+        ])
+        self.assertEqual(code, 0, error)
+        config = display.call_args.args[0]
+        self.assertFalse(hasattr(config, "gpio_cpu"))
+        self.assertFalse(config.offscreen)
+        self.assertEqual(config.brightness, 64)
+        self.assertEqual(config.output_mode, h.OutputMode.WEIGHTED_BCM)
+        self.assertEqual((config.width, config.height, config.chains, config.ports),
+                         (192, 192, 3, 3))
+
+    def test_removed_gpio_cpu_is_unknown_before_display_construction(self):
+        for cpu in ("-1", "0", "3"):
+            code, display, _, error = self.invoke(["--gpio-cpu", cpu])
+            self.assertEqual(code, 2)
+            self.assertIn("unrecognized arguments: --gpio-cpu", error)
+            display.assert_not_called()
 
     def test_missing_native_video_support_before_gpio_startup(self):
         with tempfile.TemporaryDirectory() as td:
@@ -126,8 +132,10 @@ class DemoArguments(unittest.TestCase):
     def test_help_describes_video_controls(self):
         code, display, output, _ = self.invoke(["--help"])
         self.assertEqual(code, 0)
-        for option in ("--video", "--brightness", "--preserve-aspect", "--output-mode", "--gpio-cpu"):
+        for option in ("--video", "--brightness", "--preserve-aspect", "--output-mode"):
             self.assertIn(option, output)
+        self.assertNotIn("--gpio-cpu", output)
+        self.assertIn("CPU3", output)
         display.assert_not_called()
 
 

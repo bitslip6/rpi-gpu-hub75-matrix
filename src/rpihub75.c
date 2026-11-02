@@ -348,15 +348,16 @@ static void legacy_scan_release(uint32_t *map,const hub75_display_t *scene,bool 
 
 /* Same weighted encoder, SPSC boundary handoff and prepared scanner as the
  * embedding runtime; only entry-point lifecycle/reporting differs. */
+static char legacy_scan_failed;
 static void *legacy_weighted_run(const hub75_display_t *scene, int model) {
     if (model != 5 || !scene->ring_buf_renderer) {
-        fprintf(stderr, "weighted output requires Pi 5 RIO and a weighted frame queue\n");
-        return NULL;
+        puts("weighted output requires Pi 5 RIO and a weighted frame queue");
+        return &legacy_scan_failed;
     }
     int lock_fd = h75_gpio_lock_acquire();
     if (lock_fd < 0) {
-        fprintf(stderr, "cannot acquire GPIO advisory lock for weighted output\n");
-        return NULL;
+        puts("cannot acquire GPIO advisory lock for weighted output");
+        return &legacy_scan_failed;
     }
     uint32_t *map = map_gpio(5);
     configure_gpio(map, 5);
@@ -369,7 +370,8 @@ static void *legacy_weighted_run(const hub75_display_t *scene, int model) {
     if (rows != 16 && rows != 32) {
         legacy_scan_release(map, scene, true, NULL, NULL);
         close(lock_fd);
-        return NULL;
+        puts("weighted output requires 32/64-row panels");
+        return &legacy_scan_failed;
     }
     for (unsigned row = 0; row < rows; row++)
         addresses[row] = h75_weighted_row_to_address((int)row, (uint16_t)rows);
@@ -404,19 +406,22 @@ static void *legacy_weighted_run(const hub75_display_t *scene, int model) {
         }
     }
 done:
-    if (status != H75_OK && status != H75_CANCELLED)
-        fprintf(stderr, "weighted RIO scanner failed (%d)\n", status);
+    bool failed = status != H75_OK && status != H75_CANCELLED &&
+                  !(status == H75_TIMEOUT && !atomic_load(&scene->do_render));
+    if (failed)
+        printf("weighted RIO scanner failed (%d)\n", status);
     h75_weighted_rio_destroy(&scan);
     legacy_scan_release(map, scene, true, NULL, held);
     close(lock_fd);
-    return NULL;
+    return failed ? &legacy_scan_failed : NULL;
 }
 
 #ifndef WARMUP_FRAMES
 #define WARMUP_FRAMES 8
 #endif
 
-void* hub75_display_run_pi4(const hub75_display_t *scene) {
+__attribute__((visibility("hidden")))
+void* h75_legacy_run_pi4(const hub75_display_t *scene) {
 
     int cpu_model = cpu_get_pi_model();
     if (scene->output_mode == H75_OUTPUT_WEIGHTED_BCM)
@@ -628,21 +633,22 @@ void* hub75_display_run_pi4(const hub75_display_t *scene) {
 }
 
 
-void* hub75_display_run(const hub75_display_t *scene) {
+__attribute__((visibility("hidden")))
+void* h75_legacy_run(const hub75_display_t *scene) {
 
     int cpu_model = cpu_get_pi_model();
-    debug(" [+] display_run CPU model %d: pinning to CPU 3\n", cpu_model);
-    if (getenv("HUB75_LEGACY_RT")) cpu_affinity(3);
+    debug(" [+] display_run CPU model %d: mandatory CPU3 affinity verified\n", cpu_model);
 
     if (scene->output_mode == H75_OUTPUT_WEIGHTED_BCM)
         return legacy_weighted_run(scene, cpu_model);
 
     if (cpu_model < 2) {
-        die(" [!] Unsupported CPU model detected %d\n", cpu_model);
+        printf(" [!] Unsupported CPU model detected %d\n", cpu_model);
+        return &legacy_scan_failed;
     }
 
     if (cpu_model < 5 ) {
-        return hub75_display_run_pi4(scene);
+        return h75_legacy_run_pi4(scene);
     }
 
     // map the gpio address to we can control the GPIO pins

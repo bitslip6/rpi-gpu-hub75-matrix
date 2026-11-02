@@ -105,7 +105,6 @@ class DisplayConfig:
     quant_dither: bool = False
     jitter: bool = True
     video_preserve_aspect: bool = False
-    gpio_cpu: int = -1
     output_mode: OutputMode = OutputMode.EQUAL_SLOT
     pwm_bits: int = 11
     pwm_lsb_ns: int = 130

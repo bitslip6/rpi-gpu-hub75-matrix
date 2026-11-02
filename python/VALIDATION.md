@@ -34,6 +34,35 @@ in the checkout (that planning document is not the installed API reference).
   lock process memory, or tune host-wide settings. Legacy CLI RT tuning now needs
   `HUB75_LEGACY_RT`; it is not used by the new runtime.
 
+## Mandatory CPU3 update (runtime ABI 3)
+
+Physical scanner affinity is now enforced in native startup for runtime and both
+legacy entry points; CPU selection configuration has been removed. No producer,
+import, validation or offscreen path is pinned. The legacy caller mask is saved
+and restored after scanner cleanup; restoration failures reach stdout and the
+example's nonzero exit status without exiting an embedding process.
+
+Validation for this update (no physical GPIO or real CPU3 affinity tests):
+- `make test libgpu example example-runtime CFLAGS_CPU= -j2`: passed, including
+  new fake-syscall helper and legacy lifecycle tests and runtime Pi3/4/5 RAM models.
+- GPU private Python library rebuilt and confirmed loaded from `.libs` in
+  `/proc/self/maps`, with ABI 3 and shader/video capabilities retained.
+- Python suite: 79 run, 8 skipped; opt-in offscreen GPU/content suite: 13 passed.
+- Helper/runtime/legacy/weighted-scanner ASan+UBSan tests passed using a separate
+  instrumented CPU library, anonymous GPIO RAM and fake affinity operations.
+- Sdist includes the new helper/test inputs; extracted helper, legacy lifecycle
+  and runtime tests passed. Full clean wheel/venv installation checks were not
+  rerun for this update.
+- ABI/offscreen guard tests also passed with EGL enabled: import, CPU and real
+  shader/video tests run under a subprocess guard that rejects any call to the
+  scanner-affinity helper.
+
+ABI-2 import rejection is checked before config/table-by-value use, and removed
+constructor/native dictionary/CLI CPU-selection options are rejected explicitly.
+Physical mask inspection and display acceptance remain user-operated; this
+change does not establish isolation or change IRQ/kernel/RT-budget settings.
+See `../GPIO_CPU3_PLAN.md` for the plan and acceptance procedure.
+
 ## Local environment
 
 Linux aarch64, Raspberry Pi 5-class host; GCC 14; regular CPython 3.13.5.

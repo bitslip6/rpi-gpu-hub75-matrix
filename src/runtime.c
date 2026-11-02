@@ -6,6 +6,7 @@
 #include "lowlevel.h"
 #include "weighted_rio.h"
 #include "gpio_lock.h"
+#include "gpio_affinity.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -100,7 +101,7 @@ uint32_t hub75_runtime_capabilities(void) {
     return caps;
 }
 const char *hub75_runtime_build(void) {
-    return "hub75-runtime-2;library=0.3.0;rgba8;float32";
+    return "hub75-runtime-3;library=0.3.0;rgba8;float32";
 }
 void h75_config_default(h75_config *c) {
     *c = (h75_config){.size = sizeof(*c),
@@ -119,8 +120,7 @@ void h75_config_default(h75_config *c) {
                       .brightness = 200,
                       .queue_depth = 4,
                       .gamma = 1,
-                      .jitter = true,
-                      .gpio_cpu = -1};
+                      .jitter = true};
 }
 h75_status h75_config_validate(const h75_config *c, h75_error *e) {
     if (!c || c->size != sizeof(*c))
@@ -148,8 +148,8 @@ h75_status h75_config_validate(const h75_config *c, h75_error *e) {
                         "invalid fps, brightness, panel order, mapper or tone mapper");
     if (!isfinite(c->gamma) || c->gamma <= 0 || c->gamma > 8 || !isfinite(c->dither) ||
         c->dither < 0 || c->dither > 10 || !isfinite(c->tone_level) || c->tone_level < 0 ||
-        c->tone_level > 100 || c->gpio_cpu < -1 || c->gpio_cpu >= CPU_SETSIZE)
-        return h75_fail(e, H75_INVALID, "invalid gamma, dithering, tone level or affinity");
+        c->tone_level > 100)
+        return h75_fail(e, H75_INVALID, "invalid gamma, dithering or tone level");
     if (!c->queue_depth || c->queue_depth > SPSC_MAX_CAPACITY ||
         (c->queue_depth & (c->queue_depth - 1)))
         return h75_fail(e, H75_INVALID, "queue depth must be a power of two in 1..32");
@@ -425,23 +425,32 @@ done:
 static void *gpio_main(void *arg) {
     h75_runtime *r = arg;
     hub75_display_t *d = r->display;
+    if (INJECT(12))
+        h75_runtime_request_stop(r);
     if (atomic_load(&r->stop)) {
         atomic_store(&r->gpio_done, true);
         return NULL;
     }
-    if (r->config.gpio_cpu >= 0) {
-        cpu_set_t cpus;
-        CPU_ZERO(&cpus);
-        CPU_SET((size_t)r->config.gpio_cpu, &cpus);
-        int rc = INJECT(10) ? EINVAL : pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus);
-        if (rc) {
-            h75_error e = {0};
-            h75_fail(&e, H75_IO, "setting GPIO affinity: %s", strerror(rc));
-            worker_fail(r, &e);
-            h75_runtime_request_stop(r);
-            atomic_store(&r->gpio_done, true);
-            return NULL;
-        }
+#ifdef H75_TESTING
+    extern void h75_test_affinity_fail_set(int rc);
+    if (INJECT(10))
+        h75_test_affinity_fail_set(EINVAL);
+#endif
+    char message[512];
+    if (h75_gpio_affinity_require(message, sizeof(message))) {
+        h75_error e = {0};
+        h75_fail(&e, H75_IO, "%s", message);
+        worker_fail(r, &e);
+        h75_runtime_request_stop(r);
+        atomic_store(&r->gpio_done, true);
+        return NULL;
+    }
+    /* Cancellation during affinity setup must not configure/expose GPIO. */
+    if (INJECT(13))
+        h75_runtime_request_stop(r);
+    if (atomic_load(&r->stop)) {
+        atomic_store(&r->gpio_done, true);
+        return NULL;
     }
     configure_gpio(r->gpio, r->gpio_model);
     gpio_blank(r);

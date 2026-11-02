@@ -673,17 +673,6 @@ static int parse_config(PyObject *dict, h75_config *c) {
     }
                 B(offscreen) B(quant_dither) B(jitter) B(video_preserve_aspect)
 #undef B
-                    if (!strcmp(k, "gpio_cpu")) {
-            long x = PyLong_AsLong(val);
-            if (PyErr_Occurred())
-                return 0;
-            if (x < -1 || x > INT32_MAX) {
-                PyErr_SetString(PyExc_ValueError, "invalid gpio_cpu");
-                return 0;
-            }
-            c->gpio_cpu = (int32_t)x;
-            continue;
-        }
         PyErr_Format(PyExc_TypeError, "unknown configuration option: %s", k);
         return 0;
     }
