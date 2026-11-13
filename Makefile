@@ -190,12 +190,12 @@ example-fast:
 
 ifeq ($(USE_SYSTEM_LIBS),1)
 SYSTEM_LIBDIR ?= $(LIBDIR)
-example: example.c examples/runtime_demo.h
+example: example.c examples/runtime_demo.h examples/runtime_dashboard_metrics.h
 	@echo "[CC ] $@ (system libs)"
 	$(Q)$(CC) $(CFLAGS) -Wl,-rpath,$(SYSTEM_LIBDIR) -o $@ $< \
 		-l$(LIB_BASENAME)_gpu$(VARIANT_SUFFIX) $(LDLIBS_COMMON) $(LDLIBS_FFMPEG) $(LDLIBS_GPU) $(LDLIBS_PNG) $(LDLIBS_JPEG)
 else
-example: example.c examples/runtime_demo.h $(LIB_GPU)
+example: example.c examples/runtime_demo.h examples/runtime_dashboard_metrics.h $(LIB_GPU)
 	@echo "[CC ] $@ (local libs)"
 	$(Q)$(CC) $(CFLAGS) -L. -Wl,-rpath,'$$ORIGIN' -o $@ $< \
 		-l$(LIB_BASENAME)_gpu$(VARIANT_SUFFIX) $(LDLIBS_COMMON) $(LDLIBS_FFMPEG) $(LDLIBS_GPU) $(LDLIBS_PNG) $(LDLIBS_JPEG)
@@ -293,14 +293,33 @@ $(BUILDDIR)/runtime.o $(BUILDDIR)/render_commands.o $(BUILDDIR)/runtime_media.o 
 run: example
 	./example -h || true
 
-test: test-gpio-affinity test-legacy-affinity test-runtime test-rio-scan test-compositor-sine test-row-address test-weighted-bcm test-weighted-rio test-weighted-delivery
+# Native library tests are pin-free, but exercise ARM SIMD on an ARM64 runner.
+test: test-runtime-dashboard test-gpio-affinity test-legacy-affinity test-runtime test-rio-scan test-compositor-sine test-row-address test-weighted-bcm test-weighted-rio test-weighted-delivery test-sampler test-video-fit
 
-.PHONY: test-runtime test-python example-runtime
-$(BUILDDIR)/example_runtime: examples/runtime.c examples/runtime_demo.h $(LIB_NO_GPU)
-	$(Q)$(CC) $(CFLAGS) -Iexamples -L$(dir $(LIB_NO_GPU)) -Wl,-rpath,'$$ORIGIN:$$ORIGIN/../..' -o $@ $< \
-		-l$(LIB_BASENAME)$(VARIANT_SUFFIX) $(LDLIBS_COMMON) $(LDLIBS_PNG) $(LDLIBS_JPEG)
+# Portable host/controller tests: fake files, RAM registers and synthetic tools.
+# These do not load the display library or change the host configuration.
+.PHONY: test-host test-kernel-package test-runtime-cli
+test-host: test-rio-scan test-rio-scope test-video-fit test-kernel-package
 
-example-runtime: $(BUILDDIR)/example_runtime
+test-kernel-package:
+	$(Q)$(PYTHON) -m unittest discover -s tests/unit -p 'test_kernel_package.py' -v
+
+# Builds GPU/FFmpeg support, but runs offscreen (EGL remains explicitly opt-in).
+test-runtime-cli: example-runtime
+	$(Q)$(PYTHON) -m unittest discover -s tests -p 'test_runtime_demo_cli.py' -v
+
+.PHONY: test-runtime test-python example-runtime test-runtime-dashboard
+$(BUILDDIR)/test_runtime_dashboard: tests/unit/test_runtime_dashboard.c examples/runtime_dashboard_metrics.h | $(BUILDDIR)
+	$(Q)$(CC) $(CFLAGS) -UNDEBUG -Iexamples -o $@ $< $(LDLIBS_COMMON)
+
+test-runtime-dashboard: $(BUILDDIR)/test_runtime_dashboard
+	$(Q)./$<
+
+$(BUILDDIR)/example_runtime: examples/runtime.c examples/runtime_demo.h examples/runtime_dashboard_metrics.h $(LIB_GPU) Makefile
+	$(Q)$(CC) $(CFLAGS) -Iexamples -L$(dir $(LIB_GPU)) -Wl,-rpath,'$$ORIGIN:$$ORIGIN/../..' -o $@ $< \
+		-l$(LIB_BASENAME)_gpu$(VARIANT_SUFFIX) $(LDLIBS_COMMON) $(LDLIBS_FFMPEG) $(LDLIBS_GPU) $(LDLIBS_PNG) $(LDLIBS_JPEG)
+
+example-runtime: check-libs $(BUILDDIR)/example_runtime
 AFFINITY_TEST_SOURCES = src/gpio_affinity.c tests/unit/fake_gpio_affinity.c
 AFFINITY_TEST_DEPS = $(AFFINITY_TEST_SOURCES) include/gpio_affinity.h tests/unit/fake_gpio_affinity.h
 AFFINITY_TEST_FLAGS = -UNDEBUG -DH75_AFFINITY_TESTING -Itests/unit
@@ -339,6 +358,14 @@ $(BUILDDIR)/test_weighted_bcm: tests/unit/test_weighted_bcm.c src/weighted_bcm.c
 	$(Q)$(CC) $(CFLAGS) -fno-fast-math -UNDEBUG -o $@ tests/unit/test_weighted_bcm.c src/weighted_bcm.c -lm
 
 test-weighted-bcm: $(BUILDDIR)/test_weighted_bcm
+	$(Q)./$<
+
+# Measures the real encoder, unlike offscreen runtime FPS (which skips mapping).
+.PHONY: bench-weighted-spatial
+$(BUILDDIR)/bench_weighted_spatial: tests/bench_weighted_spatial.c src/weighted_bcm.c include/weighted_bcm.h include/hub75_runtime.h include/hub75gpu.h include/rpihub75.h | $(BUILDDIR)
+	$(Q)$(CC) $(CFLAGS) -fno-fast-math -o $@ tests/bench_weighted_spatial.c src/weighted_bcm.c -lm
+
+bench-weighted-spatial: $(BUILDDIR)/bench_weighted_spatial
 	$(Q)./$<
 
 # Production row-address policies, including explicit build overrides/wiring.

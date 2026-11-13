@@ -44,7 +44,8 @@ typedef struct {
     /* Weighted: 1..11 bits, positive uint32 nanoseconds, CIE or existing gamma.
      * Physical output requires Pi 5 RIO and queue_depth >=2 (held + successor).
      * Offscreen remains RGBA-only with no encoding/scanning on any host.
-     * jitter/quant_dither/dither are legacy-only; tone mapping is deferred. */
+     * dither enables fixed spatial noise in either mode (0..10; default off).
+     * jitter/quant_dither are legacy-only; tone mapping is deferred. */
 } h75_config;
 typedef struct h75_runtime h75_runtime;
 typedef struct h75_resource h75_resource;

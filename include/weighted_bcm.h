@@ -16,7 +16,7 @@ typedef struct {
  * CIE interprets byte/255 as normalized perceptual L* (inverse CIE L*).
  * GAMMA uses powf(byte/255, gamma). Brightness is linear drive * brightness/254
  * AFTER the curve; clamp and round (nearest, ties up) only at PWM precision.
- * Tone mapping, jitter and all dithering are intentionally ignored. */
+ * Tone mapping, jitter and dithering do not affect LUT construction. */
 h75_status h75_weighted_lut_build(const hub75_display_t *display, h75_weighted_lut *lut);
 
 /* Geometry: width=panel_width*num_chains; height=panel_height*num_ports;
@@ -37,5 +37,22 @@ h75_status h75_weighted_encode(const hub75_display_t *display,
                                const h75_weighted_lut *lut,
                                const uint8_t *image, size_t image_bytes,
                                uint32_t *output, size_t output_words);
+
+/* Optional fixed spatial pattern, caller-owned RGB int8 offsets (3*width*height
+ * bytes). Build once per geometry/strength change using dither in [0,10]. The
+ * coordinate hash and dark-pixel cutoff match legacy spatial dithering; no
+ * frame number/random state is used. No allocation or GPIO access occurs. */
+h75_status h75_weighted_spatial_build(const hub75_display_t *display,
+                                      int8_t *offsets, size_t offset_bytes);
+
+/* Fused spatial variant of encode: applies cached offsets to source channels
+ * below 80 (clamped 0..254), then uses the final-precision PWM LUT. Source pixels,
+ * alpha, LUT and offsets are never modified. The plain encode above retains its
+ * original non-dithered behavior regardless of display->dither. */
+h75_status h75_weighted_encode_spatial(const hub75_display_t *display,
+                                      const h75_weighted_lut *lut,
+                                      const uint8_t *image, size_t image_bytes,
+                                      uint32_t *output, size_t output_words,
+                                      const int8_t *offsets, size_t offset_bytes);
 
 #endif

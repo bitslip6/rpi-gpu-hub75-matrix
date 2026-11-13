@@ -1255,9 +1255,11 @@ static _Thread_local size_t mapper_size;
 static _Thread_local struct {
     h75_weighted_lut lut;
     uint8_t *image, *image2;
+    int8_t *spatial;
     const hub75_display_t *owner;
-    size_t bytes;
+    size_t bytes, spatial_capacity;
     uint32_t curve, gamma_bits;
+    uint32_t spatial_width, spatial_height, spatial_strength_bits;
     uint8_t brightness;
     bool valid;
 } weighted_mapper;
@@ -1266,7 +1268,7 @@ void hub75_mapper_cache_clear(void) {
     free(mapper_bits); free(mapper_image); free(mapper_image2);
     mapper_bits = NULL; mapper_image = mapper_image2 = NULL;
     mapper_owner = NULL; mapper_size = 0;
-    free(weighted_mapper.image); free(weighted_mapper.image2);
+    free(weighted_mapper.image); free(weighted_mapper.image2); free(weighted_mapper.spatial);
     memset(&weighted_mapper, 0, sizeof(weighted_mapper));
 }
 
@@ -1323,11 +1325,42 @@ hub75_error_t hub75_display_map_image_to_weighted_bcm(const hub75_display_t *sce
         apply_panel_brightness_q8(input, weighted_mapper.image2, scene);
         input = weighted_mapper.image2;
     }
-    /* No legacy dither/jitter, quantization accumulator or tone mapper. */
+    /* Spatial noise is cached per geometry/strength, never per refresh or frame.
+     * Use raw bits so this fast-math translation unit cannot hide NaN controls
+     * from the strict pattern builder. Both signed zeros disable the effect. */
+    uint32_t strength_bits;
+    memcpy(&strength_bits, &scene->dither, sizeof(strength_bits));
+    const size_t spatial_bytes = (size_t)scene->width * scene->height * 3;
+    const int8_t *spatial = NULL;
+    if (strength_bits & 0x7fffffffu) {
+        if (weighted_mapper.spatial_capacity < spatial_bytes) {
+            int8_t *resized = realloc(weighted_mapper.spatial, spatial_bytes);
+            if (!resized) {
+                hub75_mapper_cache_clear();
+                return HUB75_ERR_OUT_OF_MEMORY;
+            }
+            weighted_mapper.spatial = resized;
+            weighted_mapper.spatial_capacity = spatial_bytes;
+        }
+        if (weighted_mapper.spatial_width != scene->width ||
+            weighted_mapper.spatial_height != scene->height ||
+            weighted_mapper.spatial_strength_bits != strength_bits) {
+            if (h75_weighted_spatial_build(scene, weighted_mapper.spatial, spatial_bytes) != H75_OK)
+                return HUB75_ERR_INVALID_COORDS;
+            weighted_mapper.spatial_width = scene->width;
+            weighted_mapper.spatial_height = scene->height;
+            weighted_mapper.spatial_strength_bits = strength_bits;
+        }
+        spatial = weighted_mapper.spatial;
+    }
+    /* No legacy temporal accumulator, jitter mask or tone mapper. */
     uint32_t *output = spsc_push_ptr_begin(scene->ring_buf_renderer, 200);
     if (!output)
         return HUB75_ERR_RING_BUFFER_FULL;
-    h75_status status = h75_weighted_encode(scene, &weighted_mapper.lut, input, bytes, output, words);
+    h75_status status = spatial ?
+        h75_weighted_encode_spatial(scene, &weighted_mapper.lut, input, bytes, output, words,
+                                    spatial, spatial_bytes) :
+        h75_weighted_encode(scene, &weighted_mapper.lut, input, bytes, output, words);
     if (status != H75_OK) {
         spsc_push_ptr_cancel(scene->ring_buf_renderer);
         return HUB75_ERR_INVALID_COORDS;

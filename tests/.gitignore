@@ -1,0 +1,6 @@
+# Generated measurement captures and test reports (may be owned by root).
+/results/
+
+# Python interpreter caches.
+__pycache__/
+*.py[cod]
