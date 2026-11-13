@@ -1832,7 +1832,7 @@ void usage(__attribute__((unused))int argc, char **argv) {
         "     --output-mode <equal-slot|weighted-bcm> (default equal-slot)\n"
         "     --pwm-bits <1..11> --pwm-lsb-ns <positive uint32> (defaults 11, 130)\n"
         "     --color-curve <cie|gamma> (weighted only; default cie)\n"
-        "       Weighted BCM requires Pi 5 RIO; jitter/dithering are legacy-only.\n"
+        "       Weighted BCM requires Pi 5 RIO; spatial dither is supported; jitter/-q are legacy-only.\n"
         "     -g <gamma>        gamma correction          (1.0-2.8) - default 1.0\n"
         "     -d <bit depth>    bit depth                 (8-64)    - default 64\n"
         "     -b <brightness>   overall brightness level  (1-254)   - default 128\n"

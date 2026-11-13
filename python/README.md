@@ -117,8 +117,11 @@ config = h.DisplayConfig(
 
 `ColorCurve.GAMMA` uses the existing `gamma` parameter; CIE is the weighted
 default. `pwm_bits` accepts 1–11; it does not change the meaning of `bit_depth`.
-Brightness 0–254 scales linear drive after the curve. Tone mapping, jitter and
-legacy dithering settings are not applied in weighted mode.
+Brightness 0–254 scales linear drive after the curve. `dither=0` (default)
+leaves spatial dithering off; `dither=1..10` enables cached fixed-pattern spatial
+noise for dark source channels, as in the legacy mapper. This is applied only
+while encoding physical output, not offscreen RGBA reads. Tone mapping, jitter
+and temporal quantization dithering are not applied in weighted mode.
 
 With `offscreen=False`, weighted output requires Pi 5 RIO and queue depth at
 least 2. Unsupported models raise `UnsupportedError` at start/context entry,

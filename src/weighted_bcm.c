@@ -73,9 +73,37 @@ h75_status h75_weighted_word_count(const hub75_display_t *d, size_t *words) {
     return H75_OK;
 }
 
-h75_status h75_weighted_encode(const hub75_display_t *d, const h75_weighted_lut *lut,
-                               const uint8_t *image, size_t image_bytes,
-                               uint32_t *output, size_t output_words) {
+h75_status h75_weighted_spatial_build(const hub75_display_t *d,
+                                      int8_t *offsets, size_t offset_bytes) {
+    size_t words, pixels, bytes;
+    h75_status status = h75_weighted_word_count(d, &words);
+    if (status != H75_OK) return status;
+    if (!offsets || !isfinite(d->dither) || d->dither < 0.f || d->dither > 10.f ||
+        !multiply_size(d->width, d->height, &pixels) ||
+        !multiply_size(pixels, 3, &bytes) || offset_bytes < bytes)
+        return H75_INVALID;
+    int8_t amplitudes[64];
+    for (unsigned i = 0; i < 64; ++i)
+        amplitudes[i] = (int8_t)((float)((int)i - 31) * (d->dither / 31.f) + .5f);
+    for (uint32_t y = 0; y < d->height; ++y) {
+        for (uint32_t x = 0; x < d->width; ++x) {
+            /* Same fixed coordinate hash and channel decorrelation as
+             * dither_spatial_hash_low(); compute only when cache is rebuilt. */
+            uint32_t hash = x * 0x9E3779B1u ^ (y + 0x7F4A7C15u);
+            hash ^= hash >> 16; hash *= 0x7FEB352Du;
+            hash ^= hash >> 15; hash *= 0x846CA68Bu;
+            hash ^= hash >> 16;
+            const size_t pixel = ((size_t)y * d->width + x) * 3;
+            for (unsigned c = 0; c < 3; ++c)
+                offsets[pixel + c] = amplitudes[(hash >> (c * 6)) & 63u];
+        }
+    }
+    return H75_OK;
+}
+
+static h75_status validate_encode(const hub75_display_t *d, const h75_weighted_lut *lut,
+                                  const uint8_t *image, size_t image_bytes,
+                                  uint32_t *output, size_t output_words) {
     size_t words, pixels, bytes;
     h75_status status = h75_weighted_word_count(d, &words);
     if (status != H75_OK)
@@ -91,6 +119,15 @@ h75_status h75_weighted_encode(const hub75_display_t *d, const h75_weighted_lut 
             if (lut->channel[c][i] > max_pwm)
                 return H75_INVALID;
 
+    return H75_OK;
+}
+
+/* Specialize both entry points: disabled mode retains the original hot loop,
+ * with no per-channel dither branch, scratch allocation or extra image pass. */
+static inline __attribute__((always_inline))
+void encode_pixels(const hub75_display_t *d, const h75_weighted_lut *lut,
+                    const uint8_t *image, uint32_t *output,
+                    const int8_t *offsets, bool spatial) {
     /* source[order][wire] matches legacy build_idx_remap(), including the
      * non-self-inverse GBR/BRG permutations. No shared mutable LUT cache. */
     static const uint8_t source[6][3] = {
@@ -112,10 +149,16 @@ h75_status h75_weighted_encode(const hub75_display_t *d, const h75_weighted_lut 
             for (unsigned port = 0; port < d->num_ports; port++) {
                 for (unsigned half = 0; half < 2; half++) {
                     const size_t image_y = (size_t)port * d->panel_height + half * rows + y;
-                    const uint8_t *pixel = image + (image_y * d->width + x) * d->stride;
+                    const size_t pixel_index = image_y * d->width + x;
+                    const uint8_t *pixel = image + pixel_index * d->stride;
                     for (unsigned wire = 0; wire < 3; wire++) {
                         const unsigned channel = source[d->panel_order][wire];
-                        const uint16_t value = lut->channel[channel][pixel[channel]];
+                        unsigned input = pixel[channel];
+                        if (spatial && input < 80) {
+                            int adjusted = (int)input + offsets[pixel_index * 3 + channel];
+                            input = (unsigned)(adjusted < 0 ? 0 : adjusted > 254 ? 254 : adjusted);
+                        }
+                        const uint16_t value = lut->channel[channel][input];
                         const uint32_t mask = 1u << pin[port][half][wire];
                         for (unsigned plane = 0; plane < d->pwm_bits; plane++)
                             if (value & (1u << plane))
@@ -127,5 +170,27 @@ h75_status h75_weighted_encode(const hub75_display_t *d, const h75_weighted_lut 
                 output[plane * plane_words + y * d->width + x] = packed[plane];
         }
     }
+}
+
+h75_status h75_weighted_encode(const hub75_display_t *d, const h75_weighted_lut *lut,
+                               const uint8_t *image, size_t image_bytes,
+                               uint32_t *output, size_t output_words) {
+    h75_status status = validate_encode(d, lut, image, image_bytes, output, output_words);
+    if (status != H75_OK) return status;
+    encode_pixels(d, lut, image, output, NULL, false);
+    return H75_OK;
+}
+
+h75_status h75_weighted_encode_spatial(const hub75_display_t *d, const h75_weighted_lut *lut,
+                                      const uint8_t *image, size_t image_bytes,
+                                      uint32_t *output, size_t output_words,
+                                      const int8_t *offsets, size_t offset_bytes) {
+    h75_status status = validate_encode(d, lut, image, image_bytes, output, output_words);
+    if (status != H75_OK) return status;
+    size_t pixels, bytes;
+    if (!offsets || !multiply_size(d->width, d->height, &pixels) ||
+        !multiply_size(pixels, 3, &bytes) || offset_bytes < bytes)
+        return H75_INVALID;
+    encode_pixels(d, lut, image, output, offsets, true);
     return H75_OK;
 }

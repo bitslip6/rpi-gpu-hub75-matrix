@@ -1,5 +1,8 @@
 This library implements HUB75 protocol on the rpi5
 ==================================================
+
+Testing and CI: [test suites, GitHub Actions, and protecting `main`](TESTING.md).
+
 Library for rendering advanced GPU graphics and video on HUB75 panels on Raspberry 5 with a 9600Hz refresh for a single panel. Supports up to 6 chained panels on 3 ports for 18 panels, 384x192 pixels. 64bit BCM for 64 color levels, = 262144 colors. 255 levels of brightness control. GLSL shader support. Many tone mappings and gamma correction combinations are possible for complete HDR image control.
 
 Support for Raspberry Pi 4 is provided with significantly degraded performance. The GPIO rise time on Pi4 is 1.5x slower than Pi5 (24ns vs 16ns) and does not have the ability to force bit settings, only to clear OR enable bit settings. This means it takes 2 operations on Pi4 (1 to set and 1 to clear) vs a single operation on Pi5 (1 to set and clear) and both operations are 1.5x slower. This results in a maximum clock speed of <10Mhz. Unfortunately because of the long "settle" time on the GPIO lines, we can only achieve stable operation of about 1-1.5Mhz. Honestly, just upgrade to a pi5 if frame rate or color performance is important for your project at all. Also 64bit color depth results in significant flickering and brightness control is only available via BCM control.
@@ -51,18 +54,23 @@ keep `offscreen=True` until you intend to activate hardware.
 Requested timing is best effort, not an electrical pulse-width guarantee.
 Plane/cycle duration arithmetic uses 64-bit nanoseconds; output-buffer validation
 uses the selected mode's plane count. Weighted tone mapping is deferred;
-jitter, quantization dithering and legacy dithering settings are legacy-only.
+jitter and temporal quantization dithering are legacy-only. Optional fixed
+spatial dithering (`dither` / `--dither N`, default 0) works in either mode.
 
 The hardware-free encoder API is in `include/weighted_bcm.h`:
 `h75_weighted_lut_build()`, `h75_weighted_word_count()`, and
-`h75_weighted_encode()`. It accepts already-preprocessed, tightly packed RGB or
+`h75_weighted_encode()`, plus `h75_weighted_spatial_build()` and
+`h75_weighted_encode_spatial()` for optional cached spatial noise. It accepts
+already-preprocessed, tightly packed RGB or
 RGBA (alpha ignored), with parallel port images stacked vertically and chained
 panels laid out horizontally. Existing image/panel mapping can run before this
 encoder; it does not invoke those callbacks or mutate their state itself.
 The shared frame-delivery mapper invokes existing image/panel preprocessing
 before the encoder, using scratch buffers only when needed. It caches weighted
 LUTs per mapper thread and rebuilds them when curve, gamma, brightness or PWM
-precision changes. The legacy encoder and its color-processing path are retained.
+precision changes. Spatial offsets are cached separately by geometry and dither
+strength; they do not depend on frame number or scan refresh. The legacy encoder
+and its color-processing path are retained.
 It emits only data-pin bits, in LSB-first plane × scanned-row × width order.
 Buffers and LUTs are caller-owned; the encoder has no global mutable state.
 
@@ -72,7 +80,9 @@ GAMMA uses `powf(byte/255, gamma)`. Both use float32 calculations, followed by
 linear drive scaling by `brightness/254`, clamping, and rounding at final PWM
 precision only. Thus brightness 0 is black and 254 is full drive. The three
 logical channel LUTs are built directly at 1–11-bit precision; no corrected
-8-bit intermediate, jitter mask, spatial or quantization dithering is used.
+8-bit intermediate, jitter mask or temporal quantization dithering is used.
+Optional spatial noise perturbs dark source bytes before LUT lookup, matching
+the original mapper's effect; it does not quantize the corrected curve to 8 bits.
 Legacy processing is unchanged. Per-panel preprocessing, if used, remains
 separate from this high-precision curve conversion.
 
@@ -191,6 +201,131 @@ activation and verified wiring. Import/construction do not activate pins or tune
 the host. The additive C contract is `include/hub75_runtime.h`; `make example-runtime`
 and `./example --runtime` exercise it with safe offscreen defaults. The existing
 legacy CLI remains available.
+
+### Native runtime dashboard
+
+Build with `make example-runtime`, then add `-v` / `--verbose` for a live dashboard:
+
+```bash
+# Safe offscreen preview; Ctrl+C stops it.
+./build/release/example_runtime --retained --verbose
+
+# Physical output: only after verifying Pi 5 wiring and CPU affinity setup.
+taskset -c 0-2 ./build/release/example_runtime --gpio --width 192 --height 192 \
+  --file shaders/whisper.glsl --verbose
+```
+
+The native demo defaults to 60 FPS, CIE, weighted BCM, and unlimited duration
+(`--seconds -1` or `--seconds forever`). Use `--seconds N` or `--frames N` to
+limit a run. Omitted chains/ports are inferred from width/height and the final
+panel dimensions (64x64 by default).
+
+Use `--brightness N` to set physical output brightness: **0..254**, default **200**;
+0 is off and 254 is maximum. For example, append `--brightness 32` to the shader
+command above. The dashboard shows the selected value as `Brightness N/254`.
+This is the mapper's brightness setting, not a percentage or a shader parameter;
+offscreen RGBA output is unchanged. Invalid/missing arguments produce a message
+on stderr and exit with status 2.
+
+Use `--file PATH` for native shader or video playback (GPU build required).
+The file extension selects the playback type, **case-insensitively**:
+
+- Shaders: `.glsl`, `.frag`, `.fs`.
+- Videos: `.mp4`, `.m4v`, `.mkv`, `.webm`, `.mov`, `.avi`, `.mpg`, `.mpeg`, `.ts`.
+
+For example, `--file shaders/grafeq.glsl` plays a shader, while
+`--file /path/to/clip.MP4 --loop` repeats a local video. Unknown or missing
+extensions are rejected with a clear error and exit status 2 before runtime
+startup. The native CLI no longer accepts `--shader` or `--video` (the separate
+Python demo's options are unchanged).
+
+Use `--speed N` with `--file` to scale playback time independently of FPS.
+The default is **1** (normal speed); **0.5** is half speed and **2** is double speed. The supported range is **0.001..100** (finite numbers only).
+For shaders this scales both `iTime` and `iTimeDelta`; it does not change the
+configured frame rate or GPIO refresh rate. For videos it scales presentation
+timing (audio is not played). The dashboard shows the selected playback speed.
+
+```bash
+./build/release/example_runtime --gpio --width 192 --height 192 --fps 48 \
+  --brightness 32 --speed 0.5 --file shaders/grafeq.glsl --verbose
+```
+
+The native CLI exposes both original dithering controls:
+
+- `--quant-dither` / `-q`: temporal quantization dithering, **equal-slot only**
+  (off by default).
+- `--dither N` / `-l N`: fixed spatial hash dithering of dark pixels, in **both
+  weighted-BCM and equal-slot modes**, with integer strength **0..10** (default
+  **0**, disabled). Start with **1 or 2**.
+
+For weighted BCM, add `--dither 2` to the shader command above; no output-mode
+change is needed. Both options can be combined in equal-slot mode:
+
+```bash
+./build/release/example_runtime --gpio --width 192 --height 192 --fps 48 \
+  --output-mode equal-slot --quant-dither --dither 2 \
+  --brightness 32 --speed 0.5 --file shaders/grafeq.glsl --verbose
+```
+
+Weighted spatial dithering uses the same coordinate hash, per-channel offsets,
+dark cutoff (source channel <80), strength scaling and clamping as the original
+spatial algorithm. Offsets are generated once per geometry/strength change,
+then reused for every source frame; they never change with time. The encoder
+applies them during its existing RGB-to-bitplane pass. There is no extra image
+pass, input mutation, temporal noise, or per-GPIO-refresh work. As in the original
+effect, stronger settings can lift black pixels; brightness 0 still outputs black.
+
+Temporal dithering (`-q`) still requires `--output-mode equal-slot`; weighted
+mode rejects it explicitly. Offscreen mode does not encode BCM, so spatial
+settings do not affect RGBA/dumps. The dashboard reports these settings and
+whether they are applied. Both remain disabled by default.
+
+For pin-free encoder performance checks, run `make bench-weighted-spatial`;
+see [implementation and benchmark notes](tests/README-weighted-spatial.md).
+
+The dashboard updates every **500 ms (2 Hz) on stderr**, leaving the final JSON statistics on
+stdout unchanged. On an interactive terminal it uses a fixed-position alternate
+screen, hides the cursor, and restores both on normal exit, errors, or Ctrl+C.
+Rows are clipped to terminal dimensions to avoid wrapping. **Labels and values
+have independent colors.** Labels retain the existing cyan/green/dim palette;
+low-FPS/full-queue/high-latency labels turn yellow and new-drop labels turn red.
+Values use one consistent **bright-blue** color, independent of whether they
+rise or fall; there are no trend colors or animated color changes. CPU above 100%
+is normal multicore usage, not itself a warning.
+
+Set `NO_COLOR=1` to disable colors while retaining the fixed-position dashboard.
+Redirected output and `TERM=dumb` receive plain-text snapshots without colors or
+cursor controls.
+
+Metrics are deltas over the displayed sample window, independent of benchmark
+warmup resets:
+
+- **Content FPS**: logical frames consumed per second, alongside configured target
+  and submission rate. Direct draw/upload benchmarking is throughput-driven;
+  target FPS is the playback pacing setting, not a measured rate.
+- **Panel refresh Hz**: completed GPIO scan cycles per second, including repeats
+  of a held frame; distinct from content FPS. Also shows mean scan-cycle time and
+  mapper throughput. Offscreen mode reports refresh as unavailable.
+- **CPU / RSS**: process-wide CPU across all threads (100% = one fully busy core,
+  so multicore usage can exceed 100%) and current resident memory. CPU is a
+  time-weighted rolling average of the last four updates (about two seconds at
+  2 Hz); startup uses only available samples. This smooths tickless-core CPU-clock
+  accounting bursts without clamping or changing the underlying counter. Other
+  rates remain current-sample measurements. GPU utilization
+  is not measured; CPU time is not a GPU load estimate.
+- **Input queue / map drops**: current RGBA queue occupancy/capacity and interval
+  plus lifetime mapping drops; this is not renderer-queue occupancy.
+- **Latency**: interval mean and latest submit-to-logical-consumption time, not
+  photon/display latency. Mean stage times show render/readback, acquisition wait,
+  mapping and copying. These are coarse, overlapping wall-time measurements, not
+  GPU timer queries or additive CPU costs; zero means no counted work in a sample.
+- **Configuration / totals**: uptime, runtime state, source, topology, output mode,
+  color curve, bit depth, and lifetime submitted/consumed/scan counters.
+
+Dashboard averaging unit tests: `make test-runtime-dashboard`.
+Offscreen CLI regression tests: `python3 tests/test_runtime_demo_cli.py`.
+Include the optional shader time/speed test on an EGL-capable host with
+`H75_TEST_GPU=1 python3 tests/test_runtime_demo_cli.py` (still no GPIO output).
 
 This preview is not electrical/production qualification: local tests and measured
 benchmarks are pin-free. Hardware timing and the proposed long-duration release
