@@ -1,0 +1,11 @@
+prefix=@PREFIX@
+exec_prefix=${prefix}
+libdir=@LIBDIR@
+includedir=@INCLUDEDIR@
+
+Name: @NAME@
+Description: Native HUB75 display runtime and rendering
+Version: @VERSION@
+Libs: -L${libdir} -l@LIBRARY@
+Libs.private: @PRIVATE_LIBS@
+Cflags: -I${includedir}
